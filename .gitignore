@@ -1,0 +1,13 @@
+# 产物与临时目录
+dist/
+*.ipa
+*.dylib
+!dylib/
+
+# 解包中间产物
+_work/
+Payload/
+
+# 系统
+.DS_Store
+Thumbs.db
