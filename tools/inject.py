@@ -151,6 +151,38 @@ def verify(binary_path):
 
 # ---------------------------------------------------------------- package
 
+def _rpaths(binary_path):
+    """读 LC_RPATH。"""
+    with open(binary_path, "rb") as f:
+        data = f.read()
+    ncmds, _ = _parse_header(data)
+    out = []
+    p = 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, p)
+        if cmd == 0x8000001C:  # LC_RPATH
+            off = struct.unpack_from("<I", data, p + 8)[0]
+            out.append(data[p + off:p + cmdsize].split(b"\0")[0].decode("utf-8", "replace"))
+        p += cmdsize
+    return out
+
+
+def resolve_frameworks_dir(appex, binary_path):
+    """按 LC_RPATH 决定 dylib 应该放在哪个 Frameworks 目录。
+
+    Gboard.appex 的 rpath 是 @executable_path/../../Frameworks，
+    即主 App 的 Frameworks；放错到 appex 自己的 Frameworks 会 dyld 找不到。
+    """
+    app_root = os.path.dirname(os.path.dirname(appex))  # Payload/Gboard.app
+    for rp in _rpaths(binary_path):
+        if "../../Frameworks" in rp:
+            return os.path.join(app_root, "Frameworks"), rp
+        if rp.rstrip("/").endswith("@executable_path/Frameworks") or rp == "@executable_path/Frameworks":
+            return os.path.join(appex, "Frameworks"), rp
+    # 兜底：主 App 的 Frameworks
+    return os.path.join(app_root, "Frameworks"), "<no rpath>"
+
+
 def strip_signatures(root):
     removed = []
     for dirpath, dirnames, _files in os.walk(root):
@@ -225,12 +257,12 @@ def main():
         if not ok:
             raise SystemExit("加载命令未写入，注入失败")
 
-        fw = os.path.join(appex, "Frameworks")
+        fw, used_rpath = resolve_frameworks_dir(appex, exe)
         os.makedirs(fw, exist_ok=True)
         dst = os.path.join(fw, DYLIB_NAME)
         shutil.copy2(args.dylib, dst)
         os.chmod(dst, 0o755)
-        print("        已放置 %s" % os.path.relpath(dst, workdir))
+        print("        rpath=%s -> 落点 %s" % (used_rpath, os.path.relpath(dst, workdir)))
 
     print("[3/5] 清理旧签名")
     removed = strip_signatures(workdir)
