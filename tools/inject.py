@@ -28,6 +28,64 @@ LC_SEGMENT_64 = 0x19
 LC_LOAD_DYLIB = 0xC
 MH_MAGIC_64 = 0xFEEDFACF
 
+# Gboard 里请求的 app group；自签描述文件不会授权它们，容器返回 nil 会让
+# -[NSFileManager contentsOfDirectoryAtURL:] 抛异常，主 App 启动即崩。
+GROUP_CANDIDATES = [
+    b"group.com.google.keyboard",
+    b"group.com.google.common",
+    b"group.com.google.gsuite",
+    b"group.com.google.GoogleMobile",
+    b"group.com.google.keyboard.enterprise",
+    b"group.com.google.common.enterprise",
+    b"group.com.google.gsuite.enterprise",
+    b"group.com.google.GoogleMobile.enterprise",
+]
+
+
+def _is_macho(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+    except OSError:
+        return False
+    return len(head) == 4 and struct.unpack("<I", head)[0] in (MH_MAGIC_64, 0xFEEDFACE)
+
+
+def patch_app_groups(root, target):
+    """把 Gboard 请求的 app group 字符串原地改写成描述文件授权的那个。
+
+    目标字符串更短，所以直接在原位置写入并以 NUL 补齐剩余字节，
+    不移动任何数据，section 偏移保持有效。
+    """
+    tb = target.encode("utf-8")
+    changed = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if not _is_macho(path):
+                continue
+            with open(path, "rb") as f:
+                data = bytearray(f.read())
+            hits = 0
+            for cand in GROUP_CANDIDATES:
+                if len(tb) > len(cand):
+                    continue  # 目标更长，无法原地替换
+                start = 0
+                while True:
+                    idx = data.find(cand, start)
+                    if idx < 0:
+                        break
+                    if idx + len(cand) < len(data) and data[idx + len(cand)] == 0:
+                        span = len(cand) + 1  # 含原 NUL
+                        data[idx:idx + span] = (tb + b"\0" * (span - len(tb)))
+                        hits += 1
+                    start = idx + 1
+            if hits:
+                with open(path, "wb") as f:
+                    f.write(data)
+                changed.append((os.path.relpath(path, root), hits))
+    return changed
+
 
 def sha256(path):
     h = hashlib.sha256()
@@ -223,6 +281,7 @@ def main():
     ap.add_argument("--ipa", required=True)
     ap.add_argument("--dylib", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--app-group", help="把 Gboard 的 app group 改写成这个（描述文件授权的那个）")
     ap.add_argument("--keep", help="保留解包目录（调试用）")
     args = ap.parse_args()
 
@@ -267,6 +326,14 @@ def main():
     print("[3/5] 清理旧签名")
     removed = strip_signatures(workdir)
     print("      删除 %d 个签名目录" % len(removed))
+
+    if args.app_group:
+        print("[3.5/5] 改写 app group -> %s" % args.app_group)
+        changed = patch_app_groups(payload, args.app_group)
+        if not changed:
+            print("      警告：没有命中任何 app group 字符串")
+        for rel, hits in changed:
+            print("      %s (%d 处)" % (rel, hits))
 
     print("[4/5] 重新打包")
     out = repack(workdir, args.out)
