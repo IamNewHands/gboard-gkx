@@ -1,109 +1,172 @@
 // gkx.m — Gboard iOS 增强 dylib
-// Phase 0.5: 诊断版。键盘顶部显示运行时状态，用来定位「黑色键盘 + 看不到标记」的原因。
+// v0.3.0: 修复黑色键盘。
 //
-// 构建：clang -dynamiclib -arch arm64 -miphoneos-version-min=12.0
-// 注入：tools/inject.py 给 Gboard.appex/Gboard 加 LC_LOAD_DYLIB @rpath/libgkx.dylib
+// 结论依据（v0.2.0-diag 截图 + 二进制取证）:
+//   1. vc.view 的直接子视图是 UIImageView + 两个 UIInputViewContent + UIView
+//   2. UIInputViewContent 是 UIKit 私有键盘背景层，按 traitCollection 绘制，
+//      不读 Gboard 的 KeyboardThemeId
+//   3. GKBGboardAppResources.bundle/theme.plist 只定义 theme_default / theme_dark，
+//      没有"浅色主题"这个可选值 -> Gboard 设置里切不出白键盘
+// 因此修复点不在主题键，而在强制浅色外观 + 背景层兜底。
+//
+// 构建: clang -dynamiclib -arch arm64 -miphoneos-version-min=12.0
+// 注入: tools/inject.py 给 Gboard.appex/Gboard 加 LC_LOAD_DYLIB @rpath/libgkx.dylib
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <dispatch/dispatch.h>
 
-#define GXK_TAG 0x47584B32  // 'GXK2'
+#define GXK_TAG 0x47584B33  // 'GXK3'
 
 // 本构建里 framework 的 app group 字符串已被改写为该名字
 static NSString *const GXKGroup = @"group.zunbengege.top";
-// Gboard 主题键（来自 gboard_framework 的 kGKBKeyboardThemeId）
-static NSString *const GXKThemeKey = @"KeyboardThemeId";
-static NSString *const GXKDefaultTheme = @"theme_default";
+// 外观偏好键: "light"(默认) / "dark" / "system"
+static NSString *const GXKAppearanceKey = @"GXKAppearance";
 
 static void (*gOrigViewDidAppear)(id, SEL, BOOL);
 
 static UILabel *gOverlay;
 static __weak UIViewController *gVC;
-static int gRefreshTick;
+static int gTick;
+static NSUInteger gInputBgCount;
 
-static NSString *Short(NSString *s) {
-    if (!s) return @"(nil)";
-    if (s.length <= 34) return s;
-    return [[s substringToIndex:31] stringByAppendingString:@"..."];
-}
+#pragma mark - 外观
 
-static NSString *TreeLine(UIView *root) {
-    NSMutableArray *parts = [NSMutableArray array];
-    NSArray *kids = root.subviews;
-    for (NSUInteger i = 0; i < kids.count && i < 4; i++) {
-        UIView *v = kids[i];
-        [parts addObject:[NSString stringWithFormat:@"%@(%lu)",
-                          NSStringFromClass([v class]),
-                          (unsigned long)v.subviews.count]];
+static NSString *StyleName(UIUserInterfaceStyle s) {
+    switch (s) {
+        case UIUserInterfaceStyleLight: return @"light";
+        case UIUserInterfaceStyleDark:  return @"dark";
+        default: return @"unspec";
     }
-    if (parts.count == 0) return @"<empty>";
-    return [parts componentsJoinedByString:@" "];
 }
 
-static NSString *DefaultsTheme(NSString *suite) {
-    NSUserDefaults *d = suite ? [[NSUserDefaults alloc] initWithSuiteName:suite]
-                              : [NSUserDefaults standardUserDefaults];
-    if (!d) return @"(nosuite)";
-    id v = [d objectForKey:GXKThemeKey];
-    if (!v) return @"(nil)";
-    if ([v isKindOfClass:[NSString class]]) return Short((NSString *)v);
-    return Short([v description]);
+static UIUserInterfaceStyle DesiredStyle(void) {
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+    NSString *v = d ? [d stringForKey:GXKAppearanceKey] : nil;
+    if ([v isEqualToString:@"dark"]) return UIUserInterfaceStyleDark;
+    if ([v isEqualToString:@"system"]) return UIUserInterfaceStyleUnspecified;
+    return UIUserInterfaceStyleLight;
 }
 
-static void RefreshOverlay(void) {
-    UIViewController *vc = gVC;
-    if (!vc) return;
-    UIView *host = vc.view.window;
-    if (!host) host = vc.view;
+// 只对根视图、window 和键盘背景层设置 override，避免改动 Gboard 自己的键帽配色逻辑
+static void ApplyAppearance(UIView *root, UIUserInterfaceStyle style) {
+    if (!root) return;
+    if (@available(iOS 13.0, *)) {
+        if (root.overrideUserInterfaceStyle != style) {
+            root.overrideUserInterfaceStyle = style;
+        }
+        UIWindow *win = root.window;
+        if (win && win.overrideUserInterfaceStyle != style) {
+            win.overrideUserInterfaceStyle = style;
+        }
+    }
+
+    NSUInteger hits = 0;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    int guard = 0;
+    while (stack.count > 0 && guard++ < 4000) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        NSString *cls = NSStringFromClass([v class]);
+        BOOL isBg = [cls containsString:@"InputViewContent"] || [cls isEqualToString:@"UIInputView"];
+        if (isBg) {
+            hits++;
+            if (@available(iOS 13.0, *)) {
+                if (v.overrideUserInterfaceStyle != style) {
+                    v.overrideUserInterfaceStyle = style;
+                }
+            }
+            // 兜底: 若该层没有自己的背景图，直接给浅色底
+            if ([v isKindOfClass:[UIImageView class]]) {
+                UIImageView *iv = (UIImageView *)v;
+                if (!iv.image) {
+                    iv.backgroundColor = [UIColor colorWithWhite:0.94 alpha:1.0];
+                }
+            } else if (!v.backgroundColor) {
+                v.backgroundColor = [UIColor colorWithWhite:0.94 alpha:1.0];
+            }
+        }
+        [stack addObjectsFromArray:v.subviews];
+    }
+    gInputBgCount = hits;
+}
+
+// 诊断用: 键盘背景图是否存在及尺寸（资源缺失会返回 nil）
+static NSString *BgInfo(UIView *root) {
+    if (!root) return @"-";
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    int guard = 0;
+    while (stack.count > 0 && guard++ < 4000) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if ([v isKindOfClass:[UIImageView class]]) {
+            UIImage *img = ((UIImageView *)v).image;
+            if (!img) return @"nil";
+            return [NSString stringWithFormat:@"%.0fx%.0f", img.size.width, img.size.height];
+        }
+        [stack addObjectsFromArray:v.subviews];
+    }
+    return @"-";
+}
+
+#pragma mark - 诊断条
+
+static void ShowOverlay(NSString *text, UIView *host) {
     if (!host) return;
-
-    NSMutableString *t = [NSMutableString string];
-    [t appendFormat:@"GXK v2 OK  %@\n", Short(NSStringFromClass([vc class]))];
-    [t appendFormat:@"theme grp=%@ std=%@\n", DefaultsTheme(GXKGroup), DefaultsTheme(nil)];
-
-    UIView *body = nil, *head = nil;
-    @try {
-        if ([vc respondsToSelector:NSSelectorFromString(@"keyboardBody")]) {
-            body = [vc valueForKey:@"keyboardBody"];
-        }
-        if ([vc respondsToSelector:NSSelectorFromString(@"keyboardHeader")]) {
-            head = [vc valueForKey:@"keyboardHeader"];
-        }
-    } @catch (id e) {}
-
-    [t appendFormat:@"body=%@ n=%lu  head=%@ n=%lu\n",
-     body ? NSStringFromClass([body class]) : @"-",
-     body ? (unsigned long)body.subviews.count : 0UL,
-     head ? NSStringFromClass([head class]) : @"-",
-     head ? (unsigned long)head.subviews.count : 0UL];
-    [t appendFormat:@"tree: %@", TreeLine(vc.view)];
-
     if (!gOverlay || gOverlay.superview != host) {
         [gOverlay removeFromSuperview];
-        gOverlay = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, host.bounds.size.width, 62)];
+        gOverlay = [[UILabel alloc] initWithFrame:CGRectZero];
         gOverlay.tag = GXK_TAG;
-        gOverlay.numberOfLines = 0;
-        gOverlay.font = [UIFont boldSystemFontOfSize:8.0];
-        gOverlay.textColor = [UIColor colorWithRed:0.55 green:1.0 blue:0.60 alpha:1.0];
-        gOverlay.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0.82];
+        gOverlay.numberOfLines = 1;
+        gOverlay.font = [UIFont boldSystemFontOfSize:9.0];
+        gOverlay.textColor = [UIColor whiteColor];
+        gOverlay.backgroundColor = [UIColor colorWithRed:0.0 green:0.45 blue:0.0 alpha:0.92];
+        gOverlay.textAlignment = NSTextAlignmentCenter;
         gOverlay.userInteractionEnabled = NO;
         gOverlay.layer.zPosition = 10000;
         [host addSubview:gOverlay];
     }
-    gOverlay.frame = CGRectMake(0, 0, host.bounds.size.width, 62);
-    gOverlay.text = t;
+    gOverlay.frame = CGRectMake(0, 0, host.bounds.size.width, 24);
+    gOverlay.text = text;
     [host bringSubviewToFront:gOverlay];
 }
 
+static void Refresh(void) {
+    UIViewController *vc = gVC;
+    if (!vc) return;
+    UIView *root = vc.view;
+    UIView *host = root.window ?: root;
+    if (!root || !host) return;
+
+    UIUserInterfaceStyle want = DesiredStyle();
+    ApplyAppearance(root, want);
+
+    UIUserInterfaceStyle sysStyle = UIUserInterfaceStyleUnspecified;
+    if (@available(iOS 13.0, *)) {
+        sysStyle = host.traitCollection.userInterfaceStyle;
+    }
+
+    NSString *line = [NSString stringWithFormat:@"GXK v3 %@->%@ bg=%@ n=%lu",
+                      StyleName(sysStyle), StyleName(want), BgInfo(root),
+                      (unsigned long)gInputBgCount];
+    ShowOverlay(line, host);
+}
+
 static void ScheduleRefresh(void) {
-    static const int64_t delays[] = {0, 200, 700, 1600};
-    if (gRefreshTick >= 4) return;
-    int64_t ms = delays[gRefreshTick++];
+    static const int64_t delays[] = {0, 120, 400, 900, 1500};
+    if (gTick >= (int)(sizeof(delays) / sizeof(delays[0]))) {
+        // 诊断条 6 秒后自动撤掉，不长期遮挡键盘
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [gOverlay removeFromSuperview];
+        });
+        return;
+    }
+    int64_t ms = delays[gTick++];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ms * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
-        RefreshOverlay();
+        Refresh();
         ScheduleRefresh();
     });
 }
@@ -113,26 +176,18 @@ static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
         gOrigViewDidAppear(self, _cmd, animated);
     }
     gVC = (UIViewController *)self;
-    gRefreshTick = 0;
+    gTick = 0;
     ScheduleRefresh();
 }
 
-static void SeedThemeIfMissing(void) {
-    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
-    if (!d) return;
-    if ([d objectForKey:GXKThemeKey]) return;
-    [d setObject:GXKDefaultTheme forKey:GXKThemeKey];
-    [d synchronize];
-}
+#pragma mark - 入口
 
 __attribute__((constructor))
 static void gkx_init(void) {
-    // 只有键盘扩展进程里才有这个类；主 App 里不会挂任何 UI
+    // 只有键盘扩展进程里才有这些类；主 App 里不挂任何 UI
     Class base = NSClassFromString(@"GKBInputViewControllerBase");
     Class principal = NSClassFromString(@"GKBUIInputViewController");
     if (!base && !principal) return;
-
-    SeedThemeIfMissing();
 
     Class target = base ?: principal;
     Method m = class_getInstanceMethod(target, @selector(viewDidAppear:));
