@@ -34,6 +34,7 @@ jobs:
             -install_name @rpath/libgkx.dylib \
             -framework UIKit \
             -framework Foundation \
+            -framework CoreGraphics \
             -o out/libgkx.dylib \
             dylib/gkx.m
           file out/libgkx.dylib
