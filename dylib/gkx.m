@@ -1,26 +1,24 @@
 // gkx.m — Gboard iOS 增强 dylib
-// v0.9.0: 修 v0.8.0 的过度上移（G 图标被顶出屏幕）+ 关闭底部空隙
+// v1.0.0: 停止改尺寸，只折叠候选行，并打印完整视图树
 //
-// v0.8.0 日志暴露的问题（实测）:
-//   collapsed=1  候选行折叠成功（这一项对了）
-//   但 pass1 树里:
-//     UIView 402x22@0,-44    <- header 容器被顶到 -44，G 图标完全出屏
-//     UIView 402x254@0,-22   <- body 容器仍 254，且在 -22
-//     GKBNibView 402x206@0,4 <- 键盘行在 body 内 y=4
-//   CHAIN0 UIInputView 402x232 与 CHAIN1..5 全是 402x276
+// v0.9.0 日志暴露的真相（实测，非推断）:
+//   pass1: UIInputView 402x56@0,220
+//   -> vc.view 原始是 402x276@0,0，被我按 44 连缩了 5 次:
+//      276->232->188->144->100->56, y: 0->44->88->132->176->220
+//   而 window 里底部那条 GKBSoftKeyView 80x50@322,226 (y=226..276)
+//   就在 vc.view 里面 -> 把 vc.view 缩到 56 高，底部条以外全被裁掉。
+//   截图只剩底排、上面全黑，与此完全一致。
 //
-// 根因: 内容总高 22+254=276 大于 vc.view 的 232，而内容在 vc.view 内是
-// 底部对齐（bottom-anchored）的 -> 溢出量 44 全部堆到顶部，
-// header 被推到 -44、body 被推到 -22，底部反而留出 44pt 空隙。
-// 我只缩了 vc.view，没有缩父链，所以溢出与空隙同时出现。
+// v0.7/0.8/0.9 三次失败有同一个共性:
+//   都在改 frame，而 Gboard 自己的布局会重算并覆盖我的改动。
+//   证据: v0.9.0 里 bodyC=402x254 在我赋值之后仍然是 254,
+//         因为 Relayout 末尾调用了 [root layoutIfNeeded]。
 //
-// 本版做法: 让"内容高度 == 容器高度 == 父链高度"，三者一起减 44
-//   1. 候选行保持折叠（已验证有效）
-//   2. body 容器高度 254 -> 210，键盘行 y=4
-//   3. header 容器显式钉在 y=0，body 容器钉在 y=22
-//   4. vc.view 与父链（UIView/_UIDropShadowClippingView/UIDropShadowView）
-//      一起底部锚定地减 44：y += 44, h -= 44 -> 底部空隙随之消失
-//   5. 打印 window 完整子树，定位底部小地球/麦克风行到底归谁
+// 本版策略（零风险 + 拿真数据）:
+//   1. 不改任何高度、不动任何祖先视图
+//   2. 只把候选行 hidden = YES，让 Gboard 自己的布局引擎去回流
+//   3. 打印完整视图树（不筛选，绝对坐标 + 层级缩进 + hidden 标记）
+//   4. 折叠后 900ms 再打一次，看 Gboard 是否自己收起了那 44pt
 //
 // 构建: clang -dynamiclib -arch arm64 -miphoneos-version-min=12.0
 // 注入: tools/inject.py 给 Gboard.appex/Gboard 加 LC_LOAD_DYLIB @rpath/libgkx.dylib
@@ -36,9 +34,7 @@
 static NSString *const GXKGroup = @"group.zunbengege.top";
 static NSString *const GXKAppearanceKey = @"GXKAppearance";
 
-static const CGFloat kDelta      = 44.0;  // 候选行高度
-static const CGFloat kHeaderH    = 22.0;
-static const CGFloat kKeysOffsetY = 4.0;
+static const CGFloat kMaxDumpLines = 400;
 
 static void (*gOrigViewDidAppear)(id, SEL, BOOL);
 
@@ -46,7 +42,7 @@ static UITextView *gPanel;
 static NSMutableString *gReport;
 static __weak UIViewController *gVC;
 static int gPass;
-static BOOL gApplied;
+static BOOL gDumpedBefore;
 
 #pragma mark - 外观
 
@@ -102,15 +98,7 @@ static UIView *FindFirst(UIView *root, NSString *needle) {
     return nil;
 }
 
-#pragma mark - 布局
-
-// 底部锚定收缩：y += d, h -= d（保持底边不动）
-static void ShrinkBottomAnchored(UIView *v, CGFloat d) {
-    if (!v) return;
-    CGRect f = v.frame;
-    if (f.size.height <= d + 1) return;
-    v.frame = CGRectMake(f.origin.x, f.origin.y + d, f.size.width, f.size.height - d);
-}
+#pragma mark - 只做外观类修正（不动几何）
 
 static NSInteger FixLogo(UIView *root) {
     NSInteger n = 0;
@@ -154,106 +142,95 @@ static NSInteger KillTopSoftKeys(UIView *root) {
     return n;
 }
 
-// 核心: 内容、容器、父链三者一起减 44，并显式钉住 header/body 位置
-static void Relayout(UIViewController *vc, UIView *root) {
+// 只折叠候选行，绝不改任何高度
+static NSInteger CollapseCandidates(UIView *root) {
+    NSInteger n = 0;
+    UIView *keysHost = FindFirst(root, @"GKB9KeysSoftKeyboardView") ?: root;
+    for (UIView *v in AllViews(keysHost)) {
+        if (![NSStringFromClass([v class]) isEqualToString:@"GKBNibView"]) continue;
+        CGFloat h = v.frame.size.height, y = v.frame.origin.y;
+        if (h > 30 && h < 60 && y < 12) {
+            if (!v.hidden) { v.hidden = YES; n++; }
+        }
+    }
+    return n;
+}
+
+#pragma mark - 诊断
+
+static NSInteger DepthTo(UIView *v, UIView *base) {
+    NSInteger d = 0;
+    UIView *q = v;
+    while (q && q != base) { q = q.superview; d++; }
+    return q ? d : -1;
+}
+
+static void DumpChain(UIViewController *vc) {
+    UIView *v = vc.view;
+    int lvl = 0;
+    while (v && lvl < 8) {
+        [gReport appendFormat:@"CHAIN%d %@ %.0fx%.0f@%.0f,%.0f%s\n", lvl,
+         NSStringFromClass([v class]), v.frame.size.width, v.frame.size.height,
+         v.frame.origin.x, v.frame.origin.y, v.hidden ? " H" : ""];
+        v = v.superview; lvl++;
+    }
+}
+
+static void DumpFull(UIView *root, const char *tag) {
+    UIWindow *win = root.window;
+    UIView *base = win ? (UIView *)win : root;
+    [gReport appendFormat:@"\n---- %s base=%@ %.0fx%.0f ----\n", tag,
+     NSStringFromClass([base class]), base.bounds.size.width, base.bounds.size.height];
+    int shown = 0, total = 0;
+    for (UIView *v in AllViews(base)) {
+        total++;
+        if (shown >= (int)kMaxDumpLines) continue;
+        CGRect f = [v convertRect:v.bounds toView:base];
+        NSInteger d = DepthTo(v, base);
+        if (d < 0) d = 0;
+        NSMutableString *pad = [NSMutableString string];
+        for (NSInteger i = 0; i < d && i < 10; i++) [pad appendString:@"."];
+        [gReport appendFormat:@"%@%@ %.0fx%.0f@%.0f,%.0f%s\n",
+         pad, NSStringFromClass([v class]),
+         f.size.width, f.size.height, f.origin.x, f.origin.y,
+         v.hidden ? " H" : ""];
+        shown++;
+    }
+    [gReport appendFormat:@"total=%d shown=%d\n", total, shown];
+}
+
+// keyboardHeader / keyboardBody 及其容器链（真实容器关系）
+static void DumpContainers(UIViewController *vc, UIView *root) {
     UIView *hdr = nil, *body = nil;
     @try {
         hdr  = [vc valueForKey:@"keyboardHeader"];
         body = [vc valueForKey:@"keyboardBody"];
     } @catch (id e) {}
-
-    UIView *hdrC  = hdr.superview;          // 22pt 容器
-    UIView *bodyC = body.superview;         // 254pt 容器
-    UIView *bodyP = bodyC.superview;        // 232pt 容器
-
-    // 候选行折叠
-    UIView *candNib = nil;
-    UIView *keysHost = FindFirst(root, @"GKB9KeysSoftKeyboardView") ?: root;
-    UIView *keysNib = nil;
-    for (UIView *v in AllViews(keysHost)) {
-        if (![NSStringFromClass([v class]) isEqualToString:@"GKBNibView"]) continue;
-        CGFloat h = v.frame.size.height, y = v.frame.origin.y;
-        if (h > 30 && h < 60 && y < 12) candNib = v;
-        else if (h > 150 && y > 30) keysNib = v;
-    }
-    if (candNib) candNib.hidden = YES;
-
-    CGFloat W = root.frame.size.width;
-    CGFloat newH = root.frame.size.height - kDelta;
-
-    // 1) vc.view 减 44（底部锚定）
-    if (!gApplied) {
-        ShrinkBottomAnchored(root, kDelta);
-        gApplied = YES;
-    }
-
-    // 2) 父链一起减 44，保持底边不动 -> 底部空隙消失
-    UIView *p = root.superview;
-    int lvl = 0;
-    while (p && lvl < 5) {
-        NSString *cls = NSStringFromClass([p class]);
-        if ([cls containsString:@"Window"]) break;   // 不动窗口
-        ShrinkBottomAnchored(p, kDelta);
-        p = p.superview;
-        lvl++;
-    }
-
-    // 3) 显式钉住 header 与 body，杜绝底部对齐溢出
-    if (hdrC) hdrC.frame = CGRectMake(0, 0, W, kHeaderH);
-    if (bodyP) bodyP.frame = CGRectMake(0, 0, W, newH);
-    if (bodyC) bodyC.frame = CGRectMake(0, kHeaderH, W, newH - kHeaderH);
-    if (body)  body.frame  = CGRectMake(0, 0, W, newH - kHeaderH);
-    if (hdr)   hdr.frame   = CGRectMake(0, 0, W, kHeaderH);
-
-    // 4) 键盘行贴到 body 顶部
-    if (keysNib) {
-        keysNib.frame = CGRectMake(0, kKeysOffsetY, W, keysNib.frame.size.height);
-    }
-
-    [root setNeedsLayout];
-    [root layoutIfNeeded];
-
-    [gReport appendFormat:
-     @"hdrC=%.0fx%.0f@%.0f,%.0f bodyC=%.0fx%.0f@%.0f,%.0f keys=%.0fx%.0f@%.0f,%.0f\n",
-     hdrC.frame.size.width, hdrC.frame.size.height, hdrC.frame.origin.x, hdrC.frame.origin.y,
-     bodyC.frame.size.width, bodyC.frame.size.height, bodyC.frame.origin.x, bodyC.frame.origin.y,
-     keysNib.frame.size.width, keysNib.frame.size.height,
-     keysNib.frame.origin.x, keysNib.frame.origin.y];
-}
-
-#pragma mark - 诊断
-
-static void DumpChain(UIViewController *vc) {
-    UIView *v = vc.view;
-    int lvl = 0;
-    while (v && lvl < 7) {
-        [gReport appendFormat:@"CHAIN%d %@ %.0fx%.0f@%.0f,%.0f\n", lvl,
-         NSStringFromClass([v class]), v.frame.size.width, v.frame.size.height,
-         v.frame.origin.x, v.frame.origin.y];
-        v = v.superview; lvl++;
-    }
-}
-
-// 在 window 全树里找底部小地球/麦克风行（v0.8 日志里它不在 vc.view 内）
-static void FindBottomBar(UIViewController *vc) {
-    UIWindow *win = vc.view.window;
-    if (!win) { [gReport appendString:@"NO WINDOW\n"]; return; }
-    CGFloat winH = win.bounds.size.height;
-    [gReport appendFormat:@"window=%.0fx%.0f\n", win.bounds.size.width, winH];
-    int shown = 0;
-    for (UIView *v in AllViews(win)) {
-        CGRect f = [v convertRect:v.bounds toView:win];
-        NSString *cls = NSStringFromClass([v class]);
-        BOOL interesting =
-            (f.size.height > 20 && f.size.height < 90 && f.origin.y > winH - 140) ||
-            [cls.lowercaseString containsString:@"globe"] ||
-            [cls.lowercaseString containsString:@"dictat"] ||
-            [cls.lowercaseString containsString:@"bottombar"];
-        if (!interesting || shown >= 30) continue;
-        [gReport appendFormat:@"  %@ %.0fx%.0f@%.0f,%.0f%s\n", cls,
-         f.size.width, f.size.height, f.origin.x, f.origin.y, v.hidden ? " H" : ""];
-        shown++;
-    }
+    [gReport appendString:@"\n-- containers --\n"];
+    if (hdr) {
+        CGRect f = [hdr convertRect:hdr.bounds toView:root];
+        [gReport appendFormat:@"hdr   %@ %.0fx%.0f@%.0f,%.0f\n",
+         NSStringFromClass([hdr class]), f.size.width, f.size.height, f.origin.x, f.origin.y];
+        UIView *p = hdr.superview; int i = 0;
+        while (p && i < 3) {
+            CGRect pf = [p convertRect:p.bounds toView:root];
+            [gReport appendFormat:@"  hdrP%d %@ %.0fx%.0f@%.0f,%.0f\n", i,
+             NSStringFromClass([p class]), pf.size.width, pf.size.height, pf.origin.x, pf.origin.y];
+            p = p.superview; i++;
+        }
+    } else [gReport appendString:@"hdr   (nil)\n"];
+    if (body) {
+        CGRect f = [body convertRect:body.bounds toView:root];
+        [gReport appendFormat:@"body  %@ %.0fx%.0f@%.0f,%.0f\n",
+         NSStringFromClass([body class]), f.size.width, f.size.height, f.origin.x, f.origin.y];
+        UIView *p = body.superview; int i = 0;
+        while (p && i < 3) {
+            CGRect pf = [p convertRect:p.bounds toView:root];
+            [gReport appendFormat:@"  bodyP%d %@ %.0fx%.0f@%.0f,%.0f\n", i,
+             NSStringFromClass([p class]), pf.size.width, pf.size.height, pf.origin.x, pf.origin.y];
+            p = p.superview; i++;
+        }
+    } else [gReport appendString:@"body  (nil)\n"];
 }
 
 #pragma mark - 面板
@@ -275,7 +252,7 @@ static void RenderPanel(UIView *host) {
         gPanel.scrollEnabled = YES;
         gPanel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.95];
         gPanel.textColor = [UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:1.0];
-        gPanel.font = [UIFont monospacedSystemFontOfSize:7.5 weight:UIFontWeightRegular];
+        gPanel.font = [UIFont monospacedSystemFontOfSize:7.0 weight:UIFontWeightRegular];
         gPanel.layer.zPosition = 20000;
         gPanel.textContainerInset = UIEdgeInsetsMake(3, 3, 3, 3);
         GXKPanelTap *t = [[GXKPanelTap alloc] init];
@@ -297,25 +274,49 @@ static void Pass(void) {
     if (!vc) return;
     UIView *root = vc.view;
     if (!root) return;
-    ApplyAppearance(root, DesiredStyle());
-    gPass++;
-    NSInteger logo = FixLogo(root);
-    NSInteger mic = KillTopSoftKeys(root);
-    Relayout(vc, root);
 
-    [gReport appendFormat:@"\n== pass%d ==\nlogoW=%ld mic=%ld view=%.0fx%.0f\n",
-     gPass, (long)logo, (long)mic, root.frame.size.width, root.frame.size.height];
+    gPass++;
+
+    // 首次进入: 在任何改动之前抓一份原始树（真·ground truth）
+    if (!gDumpedBefore) {
+        DumpFull(root, "BEFORE-ANY-CHANGE");
+        DumpContainers(vc, root);
+        gDumpedBefore = YES;
+    }
+
+    ApplyAppearance(root, DesiredStyle());
+    NSInteger logo = FixLogo(root);
+    NSInteger mic  = KillTopSoftKeys(root);
+    NSInteger col  = CollapseCandidates(root);
+
+    [gReport appendFormat:@"\n== pass%d ==\nlogoW=%ld mic=%ld collapsed=%ld view=%.0fx%.0f@%.0f,%.0f\n",
+     gPass, (long)logo, (long)mic, (long)col,
+     root.frame.size.width, root.frame.size.height,
+     root.frame.origin.x, root.frame.origin.y];
     DumpChain(vc);
-    if (gPass == 1) FindBottomBar(vc);
+    DumpContainers(vc, root);
+
+    if (gPass == 1) {
+        // 折叠后 900ms 再看: Gboard 是否自己把 44pt 收掉了
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 900 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            UIViewController *c = gVC;
+            if (!c || !c.view) return;
+            [gReport appendString:@"\n#### AFTER-COLLAPSE-900ms ####\n"];
+            DumpChain(c);
+            DumpContainers(c, c.view);
+            RenderPanel(c.view.window ?: c.view);
+        });
+    }
+
     RenderPanel(root.window ?: root);
 }
 
 static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (gOrigViewDidAppear) gOrigViewDidAppear(self, _cmd, animated);
     gVC = (UIViewController *)self;
-    gReport = [NSMutableString stringWithFormat:@"GXK v9  %@\n", NSStringFromClass([self class])];
+    gReport = [NSMutableString stringWithFormat:@"GXK v10  %@\n", NSStringFromClass([self class])];
     gPass = 0;
-    gApplied = NO;
     static const int64_t delays[] = {700, 1500, 2600, 4000};
     for (int i = 0; i < 4; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delays[i] * NSEC_PER_MSEC),
