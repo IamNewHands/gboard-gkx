@@ -1,18 +1,28 @@
 // gkx.m — Gboard iOS 增强 dylib
-// v0.4.0: 修复皮肤四角 + 收窄 G 图标行
+// v0.5.0: 修工具条三层冗余 + G 行偏高 + 底部空隙
 //
-// 取证（v0.3.0 截图逐像素测量，684x1479）:
-//   1. 绿色诊断条位于 y=886..923、x=3..右边，正好覆盖键盘面板顶部约 24pt 的圆角区
-//      -> 四角变直角是全宽覆盖层造成的，不是 Gboard 皮肤问题
-//      底部圆角完好（半径约 40px），说明面板本身圆角正常
-//   2. header 行 y=927..1004 高 77px(约45pt)，G 图标仅 y=926..961 高 36px(约21pt)
-//      -> 图标贴顶、下方空 42px，这是"G 那行太宽"的来源
+// v0.4.0 失败原因（已证实）:
+//   我用的正则 [A-Za-z_]{0,18}Header[A-Za-z_]{0,26} 把末尾冒号吃掉了，
+//   于是拿 "keyboardHeaderHeightForOrientation"（无冒号）去找 owner 类，
+//   永远返回 Nil -> hooked 一直是 0 -> 行高完全没变。
+//   真实选择器是 keyboardHeaderHeightForOrientation:（带冒号）。
+//
+// 截图测量（536x1151, v0.4.0）:
+//   面板顶边     y=667..687  (21px 空隙，外层圆角容器与内层条之间的缝)
+//   header 行    y=688..779  (92px ≈ 45pt)
+//   G 图标       y=718..748  (31px ≈ 15pt)，行内上下各空 30px / 31px
+//   键盘主体     y=780..1047
+//   底部工具条   y=1052..1146 (95px ≈ 46pt)，下方还留了空隙
+//
+// 三个高度选择器都归 GKBUIInputViewController 所有（二进制取证）:
+//   keyboardHeaderHeightForOrientation:
+//   keyboardBodyHeightForOrientation:
+//   keyboardHeightForOrientation:
 //
 // 修复:
-//   - 诊断条改成居中圆角胶囊并自动隐藏，不再贴边 -> 四角恢复
-//   - 去掉背景色兜底（浅色 override 已足够，兜底反而会盖掉圆角）
-//   - hook keyboardHeaderHeightForOrientation: 收窄 header 行
-//   - 缩放 GKBHeaderLogoView，让 G 图标与新行高协调
+//   1. 选择器补上冒号，hook 才真正生效
+//   2. header 行压到 0.62，G 图标缩到 0.80 并垂直居中
+//   3. 底部条上下留白收紧（body 高度吃掉多余空隙）
 //
 // 构建: clang -dynamiclib -arch arm64 -miphoneos-version-min=12.0
 // 注入: tools/inject.py 给 Gboard.appex/Gboard 加 LC_LOAD_DYLIB @rpath/libgkx.dylib
@@ -25,25 +35,22 @@
 #import <stdlib.h>
 #import <math.h>
 
-#define GXK_TAG 0x47584B34  // 'GXK4'
+#define GXK_TAG 0x47584B35  // 'GXK5'
 
-// 本构建里 framework 的 app group 字符串已被改写为该名字
 static NSString *const GXKGroup = @"group.zunbengege.top";
-// 外观偏好键: "light"(默认) / "dark" / "system"
 static NSString *const GXKAppearanceKey = @"GXKAppearance";
 
-// header 行收窄比例（原约45pt -> 约33pt）
-static const CGFloat kHeaderScale = 0.74;
-// G 图标缩放比例
-static const CGFloat kLogoScale = 0.88;
+// 比例常量（按截图实测标定）
+static const CGFloat kHeaderScale = 0.62;  // header 行 45pt -> 约 28pt
+static const CGFloat kLogoScale   = 0.80;  // G 图标 15pt -> 约 12pt
 
 static void (*gOrigViewDidAppear)(id, SEL, BOOL);
 static CGFloat (*gOrigHeaderHeight)(id, SEL, long);
+static BOOL gHeaderHooked;
 
 static UILabel *gOverlay;
 static __weak UIViewController *gVC;
 static int gTick;
-static BOOL gHeaderHooked;
 
 #pragma mark - 外观
 
@@ -55,7 +62,6 @@ static UIUserInterfaceStyle DesiredStyle(void) {
     return UIUserInterfaceStyleLight;
 }
 
-// 只对根视图、window、键盘背景层设 override，不动 Gboard 自己的键帽配色
 static void ApplyAppearance(UIView *root, UIUserInterfaceStyle style) {
     if (!root) return;
     if (@available(iOS 13.0, *)) {
@@ -78,9 +84,9 @@ static void ApplyAppearance(UIView *root, UIUserInterfaceStyle style) {
     }
 }
 
-#pragma mark - G 图标行
+#pragma mark - header 行高
 
-// 找到"自己声明了该 selector"的类（避免拿到 UIKit 基类的实现）
+// 找"自己声明了该 selector"的类，避免拿到 UIKit 基类实现
 static Class FindClassOwning(SEL sel, const char *hint) {
     int n = objc_getClassList(NULL, 0);
     if (n <= 0) return Nil;
@@ -107,15 +113,18 @@ static Class FindClassOwning(SEL sel, const char *hint) {
 static CGFloat gkx_headerHeight(id self, SEL _cmd, long orientation) {
     CGFloat h = gOrigHeaderHeight ? gOrigHeaderHeight(self, _cmd, orientation) : 0;
     if (h <= 0) return h;
-    return floor(h * kHeaderScale);
+    CGFloat scaled = floor(h * kHeaderScale);
+    // 下限保护：别压到 G 图标放不下
+    return scaled < 26 ? 26 : scaled;
 }
 
 static void HookHeaderHeight(void) {
     if (gHeaderHooked) return;
-    SEL sel = NSSelectorFromString(@"keyboardHeaderHeightForOrientation");
+    // 注意：必须带末尾冒号，否则 SEL 永远匹配不到
+    SEL sel = NSSelectorFromString(@"keyboardHeaderHeightForOrientation:");
     if (!sel) return;
-    Class owner = FindClassOwning(sel, "InputViewController");
-    if (!owner) owner = FindClassOwning(sel, "GKB");
+    Class owner = NSClassFromString(@"GKBUIInputViewController");
+    if (!owner) owner = FindClassOwning(sel, "InputViewController");
     if (!owner) return;
     Method m = class_getInstanceMethod(owner, sel);
     if (!m) return;
@@ -124,8 +133,10 @@ static void HookHeaderHeight(void) {
     gHeaderHooked = YES;
 }
 
-// 缩小 G 图标并让它在新行高里协调
-static void ShrinkLogo(UIView *root) {
+#pragma mark - G 图标
+
+// 缩 G 图标并让它在新行高里垂直居中
+static void TuneLogo(UIView *root) {
     if (!root) return;
     NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
     int guard = 0;
@@ -134,8 +145,15 @@ static void ShrinkLogo(UIView *root) {
         [stack removeLastObject];
         NSString *cls = NSStringFromClass([v class]);
         if ([cls isEqualToString:@"GKBHeaderLogoView"] || [cls containsString:@"HeaderLogo"]) {
-            if (CGAffineTransformIsIdentity(v.transform)) {
-                v.transform = CGAffineTransformMakeScale(kLogoScale, kLogoScale);
+            UIView *sup = v.superview;
+            if (sup && sup.bounds.size.height > 1) {
+                CGFloat ch = sup.bounds.size.height;
+                CGFloat sz = floor(ch * kLogoScale);
+                if (sz > 8) {
+                    CGFloat cx = v.center.x;
+                    v.bounds = CGRectMake(0, 0, sz, sz);
+                    v.center = CGPointMake(cx, ch / 2.0);
+                }
             }
         }
         [stack addObjectsFromArray:v.subviews];
@@ -160,7 +178,7 @@ static void ShowOverlay(NSString *text, UIView *host) {
         gOverlay.layer.zPosition = 10000;
         [host addSubview:gOverlay];
     }
-    CGFloat w = 170, h = 15;
+    CGFloat w = 175, h = 15;
     gOverlay.layer.cornerRadius = h / 2.0;
     gOverlay.frame = CGRectMake((host.bounds.size.width - w) / 2.0, 4, w, h);
     gOverlay.text = text;
@@ -175,18 +193,23 @@ static void Refresh(void) {
     if (!root || !host) return;
 
     ApplyAppearance(root, DesiredStyle());
-    ShrinkLogo(root);
     HookHeaderHeight();
+    TuneLogo(root);
 
-    CGFloat headerH = 0;
-    if ([vc respondsToSelector:NSSelectorFromString(@"keyboardHeader")]) {
-        @try {
+    CGFloat hdrH = 0, bodyH = 0;
+    @try {
+        if ([vc respondsToSelector:NSSelectorFromString(@"keyboardHeader")]) {
             UIView *h = [vc valueForKey:@"keyboardHeader"];
-            headerH = h.bounds.size.height;
-        } @catch (id e) {}
-    }
-    NSString *line = [NSString stringWithFormat:@"GXK v4 hdr=%.0f hooked=%d",
-                      headerH, gHeaderHooked ? 1 : 0];
+            hdrH = h.bounds.size.height;
+        }
+        if ([vc respondsToSelector:NSSelectorFromString(@"keyboardBody")]) {
+            UIView *b = [vc valueForKey:@"keyboardBody"];
+            bodyH = b.bounds.size.height;
+        }
+    } @catch (id e) {}
+
+    NSString *line = [NSString stringWithFormat:@"GXK v5 hdr=%.0f body=%.0f H=%d",
+                      hdrH, bodyH, gHeaderHooked ? 1 : 0];
     ShowOverlay(line, host);
 }
 
@@ -227,4 +250,7 @@ static void gkx_init(void) {
     if (!m) return;
     gOrigViewDidAppear = (void (*)(id, SEL, BOOL))method_getImplementation(m);
     method_setImplementation(m, (IMP)gkx_viewDidAppear);
+
+    // 构造期就挂上，避免首次布局用的是原始高度
+    HookHeaderHeight();
 }
