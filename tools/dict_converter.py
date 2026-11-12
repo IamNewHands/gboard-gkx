@@ -249,33 +249,16 @@ def parse_sogou_scel(file_path: str, max_words: int = 150000) -> list:
 
 # 各类词库在 iOS 上的安全词条额度分配 (平衡丰富度与 Extension 内存占用)
 DICT_LIMITS = {
-    "top.dict.yaml": ("万象-Top高频", 175000),
-    "chengyu.txt": ("万象-成语俗语", 40000),
-    "diming.dict.yaml": ("万象-行政地名", 90000),
-    "renming.dict.yaml": ("万象-现代人名", 25000),
-    "mingren.dict.yaml": ("万象-历史名人", 25000),
-    "yiren.dict.yaml": ("万象-演艺名人", 20000),
-    "abbrev.dict.yaml": ("万象-缩写简语", 35000),
-    "t9_abbrev.dict.yaml": ("万象-T9缩写", 35000),
-    "huaxue.dict.yaml": ("万象-化学物质", 20000),
-    "yixue.dict.yaml": ("万象-医学词汇", 20000),
-    "yaopin.dict.yaml": ("万象-医药药品", 15000),
-    "wuzhong.dict.yaml": ("万象-生物物种", 30000),
-    "shici.dict.yaml": ("万象-经典诗词", 30000),
-    "lianxiang.dict.yaml": ("万象-联想词组", 40000),
-    "jichu.dict.yaml": ("万象-核心基础", 100000),
-    "zi.dict.yaml": ("万象-单字全集", 55000),
-    "en.dict.yaml": ("万象-英文词汇", 30000),
-    "duoyin.dict.yaml": ("万象-多音字表", 10000),
-    "cn&en.dict.yaml": ("万象-中英混输", 5000),
-    "mixed.dict.yaml": ("万象-混合词表", 5000),
-    "fangyan.dict.yaml": ("万象-方言俗话", 2000),
-    "taifeng.dict.yaml": ("万象-台风命名", 1000),
-    "cuoyin.dict.yaml": ("万象-错音纠错", 1000),
+    "top.dict.yaml": ("万象-Top高频", 45000),
+    "chengyu.txt": ("万象-成语俗语", 10000),
+    "diming.dict.yaml": ("万象-行政地名", 3000),
+    "abbrev.dict.yaml": ("万象-缩写简语", 2000),
+    "cn&en.dict.yaml": ("万象-中英混输", 1000),
+    "renming.dict.yaml": ("万象-现代人名", 1000),
 }
 
 
-def build_from_directory(dir_path: str, output_db: str, max_total_words: int = 500000):
+def build_from_directory(dir_path: str, output_db: str, max_total_words: int = 60000):
     """扫描目录下的所有万象词库文件并按类别打包成多词库 Protobuf。"""
     if not os.path.isdir(dir_path):
         print(f"[!] 目录不存在: {dir_path}")
@@ -293,8 +276,10 @@ def build_from_directory(dir_path: str, output_db: str, max_total_words: int = 5
     total_words = 0
     global_seen = set()
 
-    # 优先处理高频核心词库
-    file_order = sorted(files, key=lambda x: 0 if "top" in x or "chengyu" in x else (1 if "jichu" not in x else 2))
+    # 严格按优先级处理: top > chengyu > diming > abbrev
+    priority_keys = ["top.dict.yaml", "chengyu.txt", "diming.dict.yaml", "abbrev.dict.yaml", "cn&en.dict.yaml", "renming.dict.yaml"]
+    file_order = [f for f in priority_keys if f in files]
+    file_order += [f for f in files if f not in priority_keys]
 
     for fname in file_order:
         fpath = os.path.join(dir_path, fname)
