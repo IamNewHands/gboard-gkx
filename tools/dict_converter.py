@@ -8,6 +8,8 @@
      搜狗二进制细胞词库，自动解析 UTF-16LE 拼音表与词条
   3. 标准拼音/短语文本 (*.txt):
      格式如: 拼音<TAB>词条 或 词条<TAB>拼音
+  4. 目录批量导入 (--dir <path>):
+     自动扫描目录下的所有万象词库文件并按类别分组打包。
 
 输出:
   user_dictionary.db (Mozc Protocol Buffers 二进制格式，纯 Python 序列化，无第三方依赖)
@@ -113,7 +115,6 @@ def build_mozc_storage(dictionaries: list) -> bytes:
 # 拼音清洗与标准化
 # ==============================================================================
 
-# 声调字符映射表
 TONE_MAP = {
     'ā': 'a', 'á': 'a', 'ǎ': 'a', 'à': 'a',
     'ō': 'o', 'ó': 'o', 'ǒ': 'o', 'ò': 'o',
@@ -132,7 +133,7 @@ def clean_pinyin(raw: str) -> str:
         elif 'a' <= ch <= 'z':
             res.append(ch)
         elif ch in (' ', "'", '-', '_'):
-            continue  # 忽略分词符
+            continue
     return "".join(res)
 
 
@@ -140,13 +141,16 @@ def clean_pinyin(raw: str) -> str:
 # 词库解析器
 # ==============================================================================
 
-def parse_rime_wanxiang(file_path: str, max_words: int = 100000) -> list:
-    """解析 Rime 万象词库 (*.dict.yaml / *.txt)。"""
+def parse_rime_file(file_path: str, max_words: int = 150000) -> list:
+    """解析单个 Rime 万象词库文件 (*.dict.yaml / *.txt)。
+    
+    返回: list of (weight: int, pinyin: str, word: str)
+    """
     entries = []
     in_yaml_header = False
-    
+
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line_num, line in enumerate(f, 1):
+        for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -159,188 +163,185 @@ def parse_rime_wanxiang(file_path: str, max_words: int = 100000) -> list:
             if in_yaml_header:
                 continue
 
-            # Rime 格式: 词条\t拼音\t权重  或 词条\t拼音
             parts = line.split("\t")
             if len(parts) >= 2:
                 word = parts[0].strip()
-                pinyin_raw = parts[1].strip()
-                pinyin = clean_pinyin(pinyin_raw)
+                pinyin = clean_pinyin(parts[1].strip())
+                weight = int(parts[2].strip()) if len(parts) >= 3 and parts[2].strip().isdigit() else 0
                 if word and pinyin:
-                    entries.append((pinyin, word))
+                    entries.append((weight, pinyin, word))
             else:
-                # 尝试空格分隔
                 sp = line.split()
                 if len(sp) >= 2:
                     word = sp[0].strip()
                     pinyin = clean_pinyin(sp[1].strip())
                     if word and pinyin:
-                        entries.append((pinyin, word))
+                        entries.append((0, pinyin, word))
 
-            if len(entries) >= max_words:
-                print(f"[*] 达到最大词数上限 ({max_words})，截断处理。")
-                break
-                
-    return entries
+    # 按权重降序排序（高频词优先）
+    if any(e[0] > 0 for e in entries):
+        entries.sort(key=lambda x: x[0], reverse=True)
+
+    if len(entries) > max_words:
+        entries = entries[:max_words]
+
+    return [(py, w) for (_, py, w) in entries]
 
 
-def parse_sogou_scel(file_path: str, max_words: int = 100000) -> list:
+def parse_sogou_scel(file_path: str, max_words: int = 150000) -> list:
     """解析搜狗细胞词库 (*.scel 二进制格式)。"""
     with open(file_path, "rb") as f:
         data = f.read()
 
-    # 验证搜狗 scel 文件签名
-    if len(data) < 0x2628 or data[:4] != b"@\x15\x00\x00":
-        # 很多 scel 文件头稍有不同，检查 0x1540 拼音偏移
-        pass
-
-    # 提取拼音索引表 (偏移 0x1540 到 0x2628)
     py_offset = 0x1540
     word_offset = 0x2628
     
     pinyin_table = {}
     pos = py_offset
     while pos < word_offset:
-        if pos + 4 > len(data):
-            break
+        if pos + 4 > len(data): break
         idx = struct.unpack("<H", data[pos:pos+2])[0]
         py_len = struct.unpack("<H", data[pos+2:pos+4])[0]
         pos += 4
-        if pos + py_len > len(data):
-            break
+        if pos + py_len > len(data): break
         pinyin = data[pos:pos+py_len].decode("utf-16le", errors="ignore")
         pinyin_table[idx] = clean_pinyin(pinyin)
         pos += py_len
 
-    # 提取词条 (从 0x2628 开始)
     entries = []
     pos = word_offset
     while pos < len(data):
-        if pos + 4 > len(data):
-            break
+        if pos + 4 > len(data): break
         same_word_count = struct.unpack("<H", data[pos:pos+2])[0]
         py_index_count = struct.unpack("<H", data[pos+2:pos+4])[0]
         pos += 4
         
-        # 读取拼音索引序列
         py_indices = []
         for _ in range(py_index_count // 2):
-            if pos + 2 > len(data):
-                break
+            if pos + 2 > len(data): break
             py_idx = struct.unpack("<H", data[pos:pos+2])[0]
             pos += 2
             if py_idx in pinyin_table:
                 py_indices.append(pinyin_table[py_idx])
         full_pinyin = "".join(py_indices)
 
-        # 读取相同拼音的词条
         for _ in range(same_word_count):
-            if pos + 2 > len(data):
-                break
+            if pos + 2 > len(data): break
             word_len = struct.unpack("<H", data[pos:pos+2])[0]
             pos += 2
-            if pos + word_len > len(data):
-                break
+            if pos + word_len > len(data): break
             word = data[pos:pos+word_len].decode("utf-16le", errors="ignore")
             pos += word_len
-            
-            # 跳过扩展信息 (12 字节)
-            pos += 12
+            pos += 12  # skip ext
             
             if word and full_pinyin:
                 entries.append((full_pinyin, word))
-                if len(entries) >= max_words:
-                    break
+                if len(entries) >= max_words: break
 
-        if len(entries) >= max_words:
-            break
+        if len(entries) >= max_words: break
 
     return entries
 
 
-def parse_standard_txt(file_path: str, max_words: int = 100000) -> list:
-    """解析通用 TXT 词库。
-    
-    兼容格式:
-      拼音<TAB>词条
-      词条<TAB>拼音
-      拼音 词条
-      词条 拼音
-    """
-    entries = []
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("\t")
-            if len(parts) < 2:
-                parts = line.split()
-            if len(parts) >= 2:
-                col1, col2 = parts[0].strip(), parts[1].strip()
-                # 判断哪一列是拼音 (全英文字符)
-                clean1 = clean_pinyin(col1)
-                clean2 = clean_pinyin(col2)
-                if re.match(r'^[a-z]+$', clean1) and not re.match(r'^[a-z]+$', clean2):
-                    entries.append((clean1, col2))
-                elif re.match(r'^[a-z]+$', clean2) and not re.match(r'^[a-z]+$', clean1):
-                    entries.append((clean2, col1))
-                elif clean1 and col2:
-                    entries.append((clean1, col2))
+# ==============================================================================
+# 万象词库目录扫描与分类构建
+# ==============================================================================
 
-            if len(entries) >= max_words:
-                break
-    return entries
+# 各类词库在 iOS 上的安全词条额度分配 (平衡丰富度与 Extension 内存占用)
+DICT_LIMITS = {
+    "top.dict.yaml": ("万象-Top高频", 175000),
+    "chengyu.txt": ("万象-成语俗语", 40000),
+    "diming.dict.yaml": ("万象-行政地名", 90000),
+    "renming.dict.yaml": ("万象-现代人名", 25000),
+    "mingren.dict.yaml": ("万象-历史名人", 25000),
+    "yiren.dict.yaml": ("万象-演艺名人", 20000),
+    "abbrev.dict.yaml": ("万象-缩写简语", 35000),
+    "t9_abbrev.dict.yaml": ("万象-T9缩写", 35000),
+    "huaxue.dict.yaml": ("万象-化学物质", 20000),
+    "yixue.dict.yaml": ("万象-医学词汇", 20000),
+    "yaopin.dict.yaml": ("万象-医药药品", 15000),
+    "wuzhong.dict.yaml": ("万象-生物物种", 30000),
+    "shici.dict.yaml": ("万象-经典诗词", 30000),
+    "lianxiang.dict.yaml": ("万象-联想词组", 40000),
+    "jichu.dict.yaml": ("万象-核心基础", 100000),
+    "zi.dict.yaml": ("万象-单字全集", 55000),
+    "en.dict.yaml": ("万象-英文词汇", 30000),
+    "duoyin.dict.yaml": ("万象-多音字表", 10000),
+    "cn&en.dict.yaml": ("万象-中英混输", 5000),
+    "mixed.dict.yaml": ("万象-混合词表", 5000),
+    "fangyan.dict.yaml": ("万象-方言俗话", 2000),
+    "taifeng.dict.yaml": ("万象-台风命名", 1000),
+    "cuoyin.dict.yaml": ("万象-错音纠错", 1000),
+}
 
 
-def convert_to_mozc_db(input_files: list, output_db: str, dict_name: str = "万象增强词库", max_words: int = 100000):
-    """主转换流程：将多个词库源合并并生成 Mozc user_dictionary.db。"""
-    all_entries = []
-    seen = set()
-
-    for path in input_files:
-        if not os.path.exists(path):
-            print(f"[!] 文件不存在: {path}")
-            continue
-
-        ext = os.path.splitext(path)[1].lower()
-        print(f"[*] 正在解析: {path} (格式: {ext})")
-        if ext == ".scel":
-            items = parse_sogou_scel(path, max_words=max_words)
-        elif ext in (".yaml", ".yml"):
-            items = parse_rime_wanxiang(path, max_words=max_words)
-        else:
-            # 默认按通用文本/Rime 处理
-            items = parse_rime_wanxiang(path, max_words=max_words)
-            if not items:
-                items = parse_standard_txt(path, max_words=max_words)
-
-        for py, word in items:
-            key_pair = (py, word)
-            if key_pair not in seen:
-                seen.add(key_pair)
-                all_entries.append(key_pair)
-
-        print(f"    已提取有效条目: {len(items)} 条，累计去重后: {len(all_entries)} 条")
-
-    if not all_entries:
-        print("[!] 未解析出任何有效词条，终止生成。")
+def build_from_directory(dir_path: str, output_db: str, max_total_words: int = 500000):
+    """扫描目录下的所有万象词库文件并按类别打包成多词库 Protobuf。"""
+    if not os.path.isdir(dir_path):
+        print(f"[!] 目录不存在: {dir_path}")
         return False
 
-    print(f"[*] 正在将 {len(all_entries)} 条词汇编码为 Mozc Protocol Buffers...")
-    proto_entries = []
-    for py, word in all_entries:
-        entry_bytes = build_mozc_entry(key=py, value=word, pos=0, comment="gkx-import")
-        proto_entries.append(entry_bytes)
+    files = [f for f in os.listdir(dir_path) if f.endswith(('.yaml', '.txt', '.scel'))]
+    if not files:
+        print(f"[!] 目录下无有效词库文件: {dir_path}")
+        return False
 
-    dict_bytes = build_mozc_dictionary(dict_id=1001, name=dict_name, entries=proto_entries)
-    storage_bytes = build_mozc_storage(dictionaries=[dict_bytes])
+    print(f"[*] 发现 {len(files)} 个词库源文件，开始分类解析与编码...")
+
+    mozc_dictionaries = []
+    dict_id_counter = 1001
+    total_words = 0
+    global_seen = set()
+
+    # 优先处理高频核心词库
+    file_order = sorted(files, key=lambda x: 0 if "top" in x or "chengyu" in x else (1 if "jichu" not in x else 2))
+
+    for fname in file_order:
+        fpath = os.path.join(dir_path, fname)
+        display_name, limit = DICT_LIMITS.get(fname, (os.path.splitext(fname)[0], 30000))
+
+        if fname.endswith(".scel"):
+            items = parse_sogou_scel(fpath, max_words=limit)
+        else:
+            items = parse_rime_file(fpath, max_words=limit)
+
+        unique_items = []
+        for py, w in items:
+            key_pair = (py, w)
+            if key_pair not in global_seen:
+                global_seen.add(key_pair)
+                unique_items.append(key_pair)
+                if total_words + len(unique_items) >= max_total_words:
+                    break
+
+        if not unique_items:
+            continue
+
+        proto_entries = [build_mozc_entry(py, w, pos=0, comment="wanxiang") for py, w in unique_items]
+        dict_bytes = build_mozc_dictionary(dict_id=dict_id_counter, name=display_name, entries=proto_entries)
+        mozc_dictionaries.append(dict_bytes)
+        dict_id_counter += 1
+        total_words += len(unique_items)
+
+        print(f"  [+] {display_name} ({fname}): 成功加载 {len(unique_items)} 词 (累计: {total_words})")
+
+        if total_words >= max_total_words:
+            print(f"[*] 已达到总词数上限安全红线 ({max_total_words})，停止载入以防 iOS Jetsam 杀扩展。")
+            break
+
+    print(f"[*] 正在生成 Mozc Protocol Buffers 二进制存储结构...")
+    storage_bytes = build_mozc_storage(dictionaries=mozc_dictionaries)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_db)), exist_ok=True)
     with open(output_db, "wb") as f:
         f.write(storage_bytes)
 
-    file_size_kb = len(storage_bytes) / 1024.0
-    print(f"[+] 转换成功！输出路径: {output_db} (大小: {file_size_kb:.2f} KB, 词数: {len(all_entries)})")
+    size_mb = len(storage_bytes) / (1024.0 * 1024.0)
+    print(f"[+] 成功构建综合词库！")
+    print(f"    输出路径: {output_db}")
+    print(f"    词库子类: {len(mozc_dictionaries)} 个")
+    print(f"    词条总数: {total_words} 条")
+    print(f"    文件大小: {size_mb:.2f} MB")
     return True
 
 
@@ -350,13 +351,42 @@ def convert_to_mozc_db(input_files: list, output_db: str, dict_name: str = "万�
 
 def main():
     parser = argparse.ArgumentParser(description="外部词库转 Gboard iOS (Mozc) user_dictionary.db 转换器")
-    parser.add_argument("inputs", nargs="+", help="输入词库文件路径 (支持 .dict.yaml, .scel, .txt)")
+    parser.add_argument("inputs", nargs="*", help="输入词库文件路径 (支持 .dict.yaml, .scel, .txt)")
+    parser.add_argument("--dir", help="输入词库目录路径，自动批量扫描并分类构建")
     parser.add_argument("-o", "--output", default="dist/user_dictionary.db", help="输出路径 (默认 dist/user_dictionary.db)")
-    parser.add_argument("-n", "--name", default="万象搜狗词库", help="词库显示名称")
-    parser.add_argument("--max", type=int, default=80000, help="最大词条数量限制 (默认 80000)")
+    parser.add_argument("-n", "--name", default="万象词库", help="单词库显示名称")
+    parser.add_argument("--max", type=int, default=500000, help="总词条数量安全上限 (默认 500,000)")
 
     args = parser.parse_args()
-    ok = convert_to_mozc_db(args.inputs, args.output, dict_name=args.name, max_words=args.max)
+
+    if args.dir:
+        ok = build_from_directory(args.dir, args.output, max_total_words=args.max)
+    elif args.inputs:
+        # 单文件列表转换
+        all_entries = []
+        seen = set()
+        for p in args.inputs:
+            ext = os.path.splitext(p)[1].lower()
+            if ext == ".scel":
+                items = parse_sogou_scel(p, max_words=args.max)
+            else:
+                items = parse_rime_file(p, max_words=args.max)
+            for py, w in items:
+                if (py, w) not in seen:
+                    seen.add((py, w))
+                    all_entries.append((py, w))
+        proto_entries = [build_mozc_entry(py, w, pos=0, comment="import") for py, w in all_entries[:args.max]]
+        dict_bytes = build_mozc_dictionary(dict_id=1001, name=args.name, entries=proto_entries)
+        storage_bytes = build_mozc_storage(dictionaries=[dict_bytes])
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        with open(args.output, "wb") as f:
+            f.write(storage_bytes)
+        print(f"[+] 转换完成: {args.output} ({len(all_entries)} 词, {len(storage_bytes)/1024:.2f} KB)")
+        ok = True
+    else:
+        parser.print_help()
+        sys.exit(1)
+
     sys.exit(0 if ok else 1)
 
 
