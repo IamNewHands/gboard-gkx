@@ -1,27 +1,14 @@
-// gkx.m — Gboard iOS 增强 dylib
-// v1.0.0: 停止改尺寸，只折叠候选行，并打印完整视图树
+// gkx.m — Gboard iOS 增强扩展 dylib
+// 阶段一 + 阶段二 + 外部词库预置支持
 //
-// v0.9.0 日志暴露的真相（实测，非推断）:
-//   pass1: UIInputView 402x56@0,220
-//   -> vc.view 原始是 402x276@0,0，被我按 44 连缩了 5 次:
-//      276->232->188->144->100->56, y: 0->44->88->132->176->220
-//   而 window 里底部那条 GKBSoftKeyView 80x50@322,226 (y=226..276)
-//   就在 vc.view 里面 -> 把 vc.view 缩到 56 高，底部条以外全被裁掉。
-//   截图只剩底排、上面全黑，与此完全一致。
+// 核心能力:
+//   1. 下滑收起键盘 (Swipe Down to Dismiss)
+//   2. 界面视觉去杂 (去除失效语音入口、G 标缩至 56pt、强制深色/浅色/跟随系统)
+//   3. 英文 QWERTY 上滑大写 (Up-flick Uppercase)
+//   4. 快捷编辑工具条 (全选、复制、剪切、会话内撤销栈、深色切换)
+//   5. 外部词库自动部署 (自动同步 user_dictionary.db 至 App Group 容器)
 //
-// v0.7/0.8/0.9 三次失败有同一个共性:
-//   都在改 frame，而 Gboard 自己的布局会重算并覆盖我的改动。
-//   证据: v0.9.0 里 bodyC=402x254 在我赋值之后仍然是 254,
-//         因为 Relayout 末尾调用了 [root layoutIfNeeded]。
-//
-// 本版策略（零风险 + 拿真数据）:
-//   1. 不改任何高度、不动任何祖先视图
-//   2. 只把候选行 hidden = YES，让 Gboard 自己的布局引擎去回流
-//   3. 打印完整视图树（不筛选，绝对坐标 + 层级缩进 + hidden 标记）
-//   4. 折叠后 900ms 再打一次，看 Gboard 是否自己收起了那 44pt
-//
-// 构建: clang -dynamiclib -arch arm64 -miphoneos-version-min=12.0
-// 注入: tools/inject.py 给 Gboard.appex/Gboard 加 LC_LOAD_DYLIB @rpath/libgkx.dylib
+// 构建: xcrun --sdk iphoneos clang -dynamiclib -arch arm64 -miphoneos-version-min=12.0 -fobjc-arc -O2 ...
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -31,44 +18,50 @@
 #import <stdlib.h>
 #import <math.h>
 
+#define GXK_LOG(fmt, ...) NSLog(@"[GXK] " fmt, ##__VA_ARGS__)
+
 static NSString *const GXKGroup = @"group.zunbengege.top";
 static NSString *const GXKAppearanceKey = @"GXKAppearance";
 
-static const CGFloat kMaxDumpLines = 400;
+#pragma mark - 全局状态
 
+static __weak UIViewController *gCurrentVC;
+static UIView *gToolbarView;
+static BOOL gToolbarExpanded = NO;
+static NSMutableArray<NSNumber *> *gUndoStack;
+
+// 原实现指针
 static void (*gOrigViewDidAppear)(id, SEL, BOOL);
+static void (*gOrigViewWillAppear)(id, SEL, BOOL);
+static void (*gOrigInsertText)(id, SEL, NSString *);
+static void (*gOrigTouchesBegan)(id, SEL, NSSet *, UIEvent *);
+static void (*gOrigTouchesEnded)(id, SEL, NSSet *, UIEvent *);
 
-static UITextView *gPanel;
-static NSMutableString *gReport;
-static __weak UIViewController *gVC;
-static int gPass;
-static BOOL gDumpedBefore;
+#pragma mark - 外观与深色模式控制
 
-#pragma mark - 外观
-
-static UIUserInterfaceStyle DesiredStyle(void) {
+static UIUserInterfaceStyle GXKDesiredStyle(void) {
     NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
     NSString *v = d ? [d stringForKey:GXKAppearanceKey] : nil;
     if ([v isEqualToString:@"dark"]) return UIUserInterfaceStyleDark;
-    if ([v isEqualToString:@"system"]) return UIUserInterfaceStyleUnspecified;
-    return UIUserInterfaceStyleLight;
+    if ([v isEqualToString:@"light"]) return UIUserInterfaceStyleLight;
+    return UIUserInterfaceStyleUnspecified;
 }
 
-static void ApplyAppearance(UIView *root, UIUserInterfaceStyle style) {
+static void GXKApplyAppearance(UIView *root, UIUserInterfaceStyle style) {
     if (!root) return;
     if (@available(iOS 13.0, *)) {
         if (root.overrideUserInterfaceStyle != style) root.overrideUserInterfaceStyle = style;
         UIWindow *win = root.window;
         if (win && win.overrideUserInterfaceStyle != style) win.overrideUserInterfaceStyle = style;
     }
-    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     int guard = 0;
     while (stack.count > 0 && guard++ < 5000) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
-        NSString *cls = NSStringFromClass([v class]);
-        if ([cls containsString:@"InputViewContent"] || [cls isEqualToString:@"UIInputView"]) {
-            if (@available(iOS 13.0, *)) {
+        if (@available(iOS 13.0, *)) {
+            NSString *cls = NSStringFromClass([v class]);
+            if ([cls containsString:@"InputView"] || [cls containsString:@"GKB"]) {
                 if (v.overrideUserInterfaceStyle != style) v.overrideUserInterfaceStyle = style;
             }
         }
@@ -76,264 +69,443 @@ static void ApplyAppearance(UIView *root, UIUserInterfaceStyle style) {
     }
 }
 
-#pragma mark - 遍历
+static void GXKCycleAppearance(void) {
+    UIUserInterfaceStyle cur = GXKDesiredStyle();
+    NSString *nextStr = @"system";
+    if (cur == UIUserInterfaceStyleUnspecified) nextStr = @"dark";
+    else if (cur == UIUserInterfaceStyleDark) nextStr = @"light";
+    else nextStr = @"system";
 
-static NSArray<UIView *> *AllViews(UIView *root) {
-    NSMutableArray *out = [NSMutableArray array];
-    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
-    int guard = 0;
-    while (stack.count > 0 && guard++ < 8000) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        [out addObject:v];
-        [stack addObjectsFromArray:v.subviews];
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+    if (d) {
+        [d setObject:nextStr forKey:GXKAppearanceKey];
+        [d synchronize];
     }
-    return out;
+    if (gCurrentVC && gCurrentVC.view) {
+        GXKApplyAppearance(gCurrentVC.view, GXKDesiredStyle());
+    }
 }
 
-static UIView *FindFirst(UIView *root, NSString *needle) {
-    for (UIView *v in AllViews(root)) {
-        if ([NSStringFromClass([v class]) containsString:needle]) return v;
+#pragma mark - 界面清理 (去除语音键、缩放 G 标)
+
+static void GXKCleanUI(UIView *root) {
+    if (!root) return;
+
+    // 禁用设置中的语音配置
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+    if (d) {
+        [d setObject:@NO forKey:@"GKBKeyboardSettingEnableVoiceInput"];
+    }
+
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    int guard = 0;
+    while (stack.count > 0 && guard++ < 6000) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+
+        NSString *cls = NSStringFromClass([v class]);
+
+        // 1. 缩放 G 标 HeaderLogoView
+        if ([cls isEqualToString:@"GKBHeaderLogoView"]) {
+            CGRect f = v.frame;
+            if (f.size.width > 90) {
+                v.frame = CGRectMake(f.origin.x, f.origin.y, 56.0, f.size.height);
+                for (UIView *sub in v.subviews) {
+                    sub.center = CGPointMake(28.0, f.size.height / 2.0);
+                }
+            }
+        }
+
+        // 2. 隐藏右上角或空格栏旁的语音键 (按类名或标识查找)
+        if ([cls isEqualToString:@"GKBSoftKeyView"]) {
+            NSString *acc = v.accessibilityLabel ?: @"";
+            NSString *ident = v.accessibilityIdentifier ?: @"";
+            if ([acc containsString:@"Voice"] || [acc containsString:@"voice"] ||
+                [acc containsString:@"Mic"] || [acc containsString:@"mic"] ||
+                [ident containsString:@"voice"] || [ident containsString:@"mic"]) {
+                v.hidden = YES;
+            }
+            // 空格键右侧小语音图标通常尺寸在 40x40 且处于顶部右侧区域
+            CGPoint pt = [v convertPoint:CGPointZero toView:root];
+            if (pt.y < 50 && pt.x > (root.bounds.size.width - 60)) {
+                if (v.bounds.size.width < 50 && v.bounds.size.height < 50) {
+                    v.hidden = YES;
+                }
+            }
+        }
+
+        [stack addObjectsFromArray:v.subviews];
+    }
+}
+
+#pragma mark - 下滑收起键盘手势
+
+@interface GXKSwipeDismissDelegate : NSObject <UIGestureRecognizerDelegate>
+@end
+
+@implementation GXKSwipeDismissDelegate
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+    // 允许与候选行水平滚动或点击同时识别
+    return YES;
+}
+@end
+
+static GXKSwipeDismissDelegate *gDismissDelegate;
+
+static void GXKHandlePan(UIPanGestureRecognizer *pan) {
+    if (!gCurrentVC) return;
+    if (pan.state == UIGestureRecognizerStateEnded) {
+        CGPoint translation = [pan translationInView:gCurrentVC.view];
+        CGPoint velocity = [pan velocityInView:gCurrentVC.view];
+
+        // 判定垂直向下滑动超过 45pt，或垂直初速度 > 250 pt/s
+        if (translation.y > 45.0 && fabs(translation.y) > fabs(translation.x) * 1.3) {
+            UIInputViewController *ivc = (UIInputViewController *)gCurrentVC;
+            if ([ivc respondsToSelector:@selector(dismissKeyboard)]) {
+                [ivc dismissKeyboard];
+            }
+        } else if (velocity.y > 300.0 && fabs(velocity.y) > fabs(velocity.x) * 1.5) {
+            UIInputViewController *ivc = (UIInputViewController *)gCurrentVC;
+            if ([ivc respondsToSelector:@selector(dismissKeyboard)]) {
+                [ivc dismissKeyboard];
+            }
+        }
+    }
+}
+
+static void GXKSetupSwipeDismiss(UIViewController *vc) {
+    if (!vc || !vc.view) return;
+    for (UIGestureRecognizer *g in vc.view.gestureRecognizers) {
+        if ([objc_getAssociatedObject(g, "gxk_swipe_dismiss") boolValue]) return;
+    }
+    if (!gDismissDelegate) {
+        gDismissDelegate = [[GXKSwipeDismissDelegate alloc] init];
+    }
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:gDismissDelegate action:@selector(handlePan:)];
+    pan.delegate = gDismissDelegate;
+    objc_setAssociatedObject(pan, "gxk_swipe_dismiss", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [vc.view addGestureRecognizer:pan];
+}
+
+@implementation GXKSwipeDismissDelegate (Handler)
+- (void)handlePan:(UIPanGestureRecognizer *)pan {
+    GXKHandlePan(pan);
+}
+@end
+
+#pragma mark - 英文 QWERTY 上滑大写 (Up-flick Uppercase)
+
+static const char *kTouchStartKey = "gxk_touch_start";
+
+static UILabel *GXKFindKeyLabel(UIView *keyView) {
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:keyView];
+    int guard = 0;
+    while (stack.count > 0 && guard++ < 100) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if ([v isKindOfClass:[UILabel class]]) {
+            UILabel *lbl = (UILabel *)v;
+            NSString *t = lbl.text;
+            if (t.length == 1) {
+                unichar c = [t characterAtIndex:0];
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+                    return lbl;
+                }
+            }
+        }
+        [stack addObjectsFromArray:v.subviews];
     }
     return nil;
 }
 
-#pragma mark - 只做外观类修正（不动几何）
+static void gkx_softKey_touchesBegan(id self, SEL _cmd, NSSet *touches, UIEvent *event) {
+    UITouch *t = [touches anyObject];
+    if (t) {
+        CGPoint pt = [t locationInView:(UIView *)self];
+        NSValue *val = [NSValue valueWithCGPoint:pt];
+        objc_setAssociatedObject(self, kTouchStartKey, val, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (gOrigTouchesBegan) gOrigTouchesBegan(self, _cmd, touches, event);
+}
 
-static NSInteger FixLogo(UIView *root) {
-    NSInteger n = 0;
-    for (UIView *v in AllViews(root)) {
-        if (![NSStringFromClass([v class]) isEqualToString:@"GKBHeaderLogoView"]) continue;
-        CGRect f = v.frame;
-        if (f.size.width > 120) {
-            v.frame = CGRectMake(f.origin.x, f.origin.y, 56.0, f.size.height);
-            f = v.frame;
-            n++;
-        }
-        CGFloat ph = f.size.height, pw = f.size.width;
-        for (UIView *kid in v.subviews) {
-            CGRect kf = kid.frame;
-            BOOL inside = kf.origin.x >= 0 && kf.origin.y >= 0 &&
-                          kf.size.width <= pw && kf.size.height <= ph;
-            if (inside) continue;
-            CGFloat sc = 1.0;
-            if (kf.size.width > pw || kf.size.height > ph) {
-                sc = fmin(pw / kf.size.width, ph / kf.size.height);
+static void gkx_softKey_touchesEnded(id self, SEL _cmd, NSSet *touches, UIEvent *event) {
+    UITouch *t = [touches anyObject];
+    NSValue *startVal = objc_getAssociatedObject(self, kTouchStartKey);
+    objc_setAssociatedObject(self, kTouchStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    if (t && startVal && gCurrentVC) {
+        CGPoint startPt = [startVal CGPointValue];
+        CGPoint endPt = [t locationInView:(UIView *)self];
+        CGFloat dy = endPt.y - startPt.y;
+        CGFloat dx = endPt.x - startPt.x;
+
+        // 判定向上微滑手势: 垂直向上 > 16pt，且垂直分量占主导
+        if (dy < -16.0 && fabs(dy) > fabs(dx) * 1.2) {
+            UILabel *lbl = GXKFindKeyLabel((UIView *)self);
+            if (lbl && lbl.text.length == 1) {
+                NSString *upper = [lbl.text uppercaseString];
+                UIInputViewController *ivc = (UIInputViewController *)gCurrentVC;
+                if (ivc && ivc.textDocumentProxy) {
+                    [ivc.textDocumentProxy insertText:upper];
+                    // 记录撤销栈
+                    if (!gUndoStack) gUndoStack = [NSMutableArray array];
+                    [gUndoStack addObject:@(upper.length)];
+                    return; // 拦截消费，不再调用原始 touchesEnded 防止打出小写
+                }
             }
-            if (sc < 0.999) kid.transform = CGAffineTransformMakeScale(sc, sc);
-            kid.center = CGPointMake(pw / 2.0, ph / 2.0);
         }
     }
-    return n;
+    if (gOrigTouchesEnded) gOrigTouchesEnded(self, _cmd, touches, event);
 }
 
-static NSInteger KillTopSoftKeys(UIView *root) {
-    NSInteger n = 0;
-    for (UIView *v in AllViews(root)) {
-        if (![NSStringFromClass([v class]) isEqualToString:@"GKBSoftKeyView"]) continue;
-        CGRect f = v.frame;
-        if (f.size.width > 60 || f.size.height > 60) continue;
-        CGPoint p = [v convertPoint:CGPointZero toView:root];
-        if (p.y > 70 || p.y < -60) continue;
-        if (v.hidden) continue;
-        v.hidden = YES;
-        n++;
-    }
-    return n;
-}
+#pragma mark - 快捷编辑工具条 (第二阶段)
 
-// 只折叠候选行，绝不改任何高度
-static NSInteger CollapseCandidates(UIView *root) {
-    NSInteger n = 0;
-    UIView *keysHost = FindFirst(root, @"GKB9KeysSoftKeyboardView") ?: root;
-    for (UIView *v in AllViews(keysHost)) {
-        if (![NSStringFromClass([v class]) isEqualToString:@"GKBNibView"]) continue;
-        CGFloat h = v.frame.size.height, y = v.frame.origin.y;
-        if (h > 30 && h < 60 && y < 12) {
-            if (!v.hidden) { v.hidden = YES; n++; }
-        }
-    }
-    return n;
-}
-
-#pragma mark - 诊断
-
-static NSInteger DepthTo(UIView *v, UIView *base) {
-    NSInteger d = 0;
-    UIView *q = v;
-    while (q && q != base) { q = q.superview; d++; }
-    return q ? d : -1;
-}
-
-static void DumpChain(UIViewController *vc) {
-    UIView *v = vc.view;
-    int lvl = 0;
-    while (v && lvl < 8) {
-        [gReport appendFormat:@"CHAIN%d %@ %.0fx%.0f@%.0f,%.0f%s\n", lvl,
-         NSStringFromClass([v class]), v.frame.size.width, v.frame.size.height,
-         v.frame.origin.x, v.frame.origin.y, v.hidden ? " H" : ""];
-        v = v.superview; lvl++;
-    }
-}
-
-static void DumpFull(UIView *root, const char *tag) {
-    UIWindow *win = root.window;
-    UIView *base = win ? (UIView *)win : root;
-    [gReport appendFormat:@"\n---- %s base=%@ %.0fx%.0f ----\n", tag,
-     NSStringFromClass([base class]), base.bounds.size.width, base.bounds.size.height];
-    int shown = 0, total = 0;
-    for (UIView *v in AllViews(base)) {
-        total++;
-        if (shown >= (int)kMaxDumpLines) continue;
-        CGRect f = [v convertRect:v.bounds toView:base];
-        NSInteger d = DepthTo(v, base);
-        if (d < 0) d = 0;
-        NSMutableString *pad = [NSMutableString string];
-        for (NSInteger i = 0; i < d && i < 10; i++) [pad appendString:@"."];
-        [gReport appendFormat:@"%@%@ %.0fx%.0f@%.0f,%.0f%s\n",
-         pad, NSStringFromClass([v class]),
-         f.size.width, f.size.height, f.origin.x, f.origin.y,
-         v.hidden ? " H" : ""];
-        shown++;
-    }
-    [gReport appendFormat:@"total=%d shown=%d\n", total, shown];
-}
-
-// keyboardHeader / keyboardBody 及其容器链（真实容器关系）
-static void DumpContainers(UIViewController *vc, UIView *root) {
-    UIView *hdr = nil, *body = nil;
-    @try {
-        hdr  = [vc valueForKey:@"keyboardHeader"];
-        body = [vc valueForKey:@"keyboardBody"];
-    } @catch (id e) {}
-    [gReport appendString:@"\n-- containers --\n"];
-    if (hdr) {
-        CGRect f = [hdr convertRect:hdr.bounds toView:root];
-        [gReport appendFormat:@"hdr   %@ %.0fx%.0f@%.0f,%.0f\n",
-         NSStringFromClass([hdr class]), f.size.width, f.size.height, f.origin.x, f.origin.y];
-        UIView *p = hdr.superview; int i = 0;
-        while (p && i < 3) {
-            CGRect pf = [p convertRect:p.bounds toView:root];
-            [gReport appendFormat:@"  hdrP%d %@ %.0fx%.0f@%.0f,%.0f\n", i,
-             NSStringFromClass([p class]), pf.size.width, pf.size.height, pf.origin.x, pf.origin.y];
-            p = p.superview; i++;
-        }
-    } else [gReport appendString:@"hdr   (nil)\n"];
-    if (body) {
-        CGRect f = [body convertRect:body.bounds toView:root];
-        [gReport appendFormat:@"body  %@ %.0fx%.0f@%.0f,%.0f\n",
-         NSStringFromClass([body class]), f.size.width, f.size.height, f.origin.x, f.origin.y];
-        UIView *p = body.superview; int i = 0;
-        while (p && i < 3) {
-            CGRect pf = [p convertRect:p.bounds toView:root];
-            [gReport appendFormat:@"  bodyP%d %@ %.0fx%.0f@%.0f,%.0f\n", i,
-             NSStringFromClass([p class]), pf.size.width, pf.size.height, pf.origin.x, pf.origin.y];
-            p = p.superview; i++;
-        }
-    } else [gReport appendString:@"body  (nil)\n"];
-}
-
-#pragma mark - 面板
-
-@interface GXKPanelTap : NSObject
-@end
-@implementation GXKPanelTap
-- (void)handle:(UITapGestureRecognizer *)g {
-    if (gPanel.text.length > 0) [UIPasteboard generalPasteboard].string = gPanel.text;
-    [gPanel removeFromSuperview];
-}
+@interface GXKToolbarTarget : NSObject
 @end
 
-static void RenderPanel(UIView *host) {
-    if (!host) return;
-    if (!gPanel) {
-        gPanel = [[UITextView alloc] initWithFrame:CGRectZero];
-        gPanel.editable = NO;
-        gPanel.scrollEnabled = YES;
-        gPanel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.95];
-        gPanel.textColor = [UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:1.0];
-        gPanel.font = [UIFont monospacedSystemFontOfSize:7.0 weight:UIFontWeightRegular];
-        gPanel.layer.zPosition = 20000;
-        gPanel.textContainerInset = UIEdgeInsetsMake(3, 3, 3, 3);
-        GXKPanelTap *t = [[GXKPanelTap alloc] init];
-        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:t action:@selector(handle:)];
-        [gPanel addGestureRecognizer:tap];
-        objc_setAssociatedObject(gPanel, "gxk_tap", t, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+@implementation GXKToolbarTarget
+
+- (void)onSelectAll {
+    if (!gCurrentVC) return;
+    UIInputViewController *ivc = (UIInputViewController *)gCurrentVC;
+    id<UITextDocumentProxy> proxy = ivc.textDocumentProxy;
+    if ([proxy respondsToSelector:@selector(selectAll:)]) {
+        [proxy performSelector:@selector(selectAll:) withObject:nil];
+    } else {
+        // 尝试移动光标至文档首尾以唤起系统动作
+        [proxy adjustTextPositionByCharacterOffset:9999];
     }
-    gPanel.text = gReport;
-    if (gPanel.superview != host) {
-        [gPanel removeFromSuperview];
-        [host addSubview:gPanel];
-    }
-    gPanel.frame = CGRectMake(0, 0, host.bounds.size.width, host.bounds.size.height * 0.5);
-    [host bringSubviewToFront:gPanel];
 }
 
-static void Pass(void) {
-    UIViewController *vc = gVC;
-    if (!vc) return;
-    UIView *root = vc.view;
-    if (!root) return;
+- (void)onCopy {
+    if (!gCurrentVC) return;
+    UIInputViewController *ivc = (UIInputViewController *)gCurrentVC;
+    NSString *sel = ivc.textDocumentProxy.selectedText;
+    if (sel.length > 0) {
+        [UIPasteboard generalPasteboard].string = sel;
+    }
+}
 
-    gPass++;
+- (void)onCut {
+    if (!gCurrentVC) return;
+    UIInputViewController *ivc = (UIInputViewController *)gCurrentVC;
+    NSString *sel = ivc.textDocumentProxy.selectedText;
+    if (sel.length > 0) {
+        [UIPasteboard generalPasteboard].string = sel;
+        [ivc.textDocumentProxy deleteBackward];
+    }
+}
 
-    // 首次进入: 在任何改动之前抓一份原始树（真·ground truth）
-    if (!gDumpedBefore) {
-        DumpFull(root, "BEFORE-ANY-CHANGE");
-        DumpContainers(vc, root);
-        gDumpedBefore = YES;
+- (void)onUndo {
+    if (!gCurrentVC || !gUndoStack || gUndoStack.count == 0) return;
+    UIInputViewController *ivc = (UIInputViewController *)gCurrentVC;
+    id<UITextDocumentProxy> proxy = ivc.textDocumentProxy;
+    NSInteger count = [gUndoStack.lastObject integerValue];
+    [gUndoStack removeLastObject];
+    for (NSInteger i = 0; i < count; i++) {
+        [proxy deleteBackward];
+    }
+}
+
+- (void)onToggleAppearance {
+    GXKCycleAppearance();
+}
+
+- (void)onDismiss {
+    if (!gCurrentVC) return;
+    UIInputViewController *ivc = (UIInputViewController *)gCurrentVC;
+    if ([ivc respondsToSelector:@selector(dismissKeyboard)]) {
+        [ivc dismissKeyboard];
+    }
+}
+
+@end
+
+static GXKToolbarTarget *gToolbarTarget;
+
+static UIButton *GXKCreateToolButton(NSString *title, SEL action) {
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [btn setTitle:title forState:UIControlStateNormal];
+    btn.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
+    [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor colorWithWhite:0.5 alpha:0.15];
+    btn.layer.cornerRadius = 6.0;
+    btn.layer.masksToBounds = YES;
+    btn.contentEdgeInsets = UIEdgeInsetsMake(4, 8, 4, 8);
+    [btn addTarget:gToolbarTarget action:action forControlEvents:UIControlEventTouchUpInside];
+    return btn;
+}
+
+static void GXKSetupToolbar(UIViewController *vc) {
+    if (!vc || !vc.view) return;
+    if (gToolbarView && gToolbarView.superview == vc.view) return;
+
+    if (!gToolbarTarget) gToolbarTarget = [[GXKToolbarTarget alloc] init];
+
+    CGFloat width = vc.view.bounds.size.width;
+    gToolbarView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 36.0)];
+    gToolbarView.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.08];
+    gToolbarView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleBottomMargin;
+
+    UIStackView *stack = [[UIStackView alloc] initWithFrame:gToolbarView.bounds];
+    stack.axis = UILayoutConstraintAxisHorizontal;
+    stack.distribution = UIStackViewDistributionEqualSpacing;
+    stack.alignment = UIStackViewAlignmentCenter;
+    stack.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    stack.layoutMargins = UIEdgeInsetsMake(0, 10, 0, 10);
+    stack.layoutMarginsRelativeArrangement = YES;
+
+    [stack addArrangedSubview:GXKCreateToolButton(@"全选", @selector(onSelectAll))];
+    [stack addArrangedSubview:GXKCreateToolButton(@"复制", @selector(onCopy))];
+    [stack addArrangedSubview:GXKCreateToolButton(@"剪切", @selector(onCut))];
+    [stack addArrangedSubview:GXKCreateToolButton(@"撤销", @selector(onUndo))];
+    [stack addArrangedSubview:GXKCreateToolButton(@"深色", @selector(onToggleAppearance))];
+    [stack addArrangedSubview:GXKCreateToolButton(@"收起", @selector(onDismiss))];
+
+    [gToolbarView addSubview:stack];
+    [vc.view addSubview:gToolbarView];
+}
+
+#pragma mark - 撤销记录 Hook (insertText)
+
+static void gkx_proxy_insertText(id self, SEL _cmd, NSString *text) {
+    if (text.length > 0) {
+        if (!gUndoStack) gUndoStack = [NSMutableArray array];
+        [gUndoStack addObject:@(text.length)];
+        // 限制栈深
+        if (gUndoStack.count > 100) [gUndoStack removeObjectAtIndex:0];
+    }
+    if (gOrigInsertText) gOrigInsertText(self, _cmd, text);
+}
+
+#pragma mark - 外部词库自动预置与部署 (Mozc user_dictionary.db)
+
+static void GXKEnsureUserDictionaryDeployed(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSURL *containerURL = [fm containerURLForSecurityApplicationGroupIdentifier:GXKGroup];
+    if (!containerURL) {
+        GXK_LOG(@"无法定位 App Group 容器: %@", GXKGroup);
+        return;
     }
 
-    ApplyAppearance(root, DesiredStyle());
-    NSInteger logo = FixLogo(root);
-    NSInteger mic  = KillTopSoftKeys(root);
-    NSInteger col  = CollapseCandidates(root);
+    NSURL *targetDBURL = [containerURL URLByAppendingPathComponent:@"user_dictionary.db"];
 
-    [gReport appendFormat:@"\n== pass%d ==\nlogoW=%ld mic=%ld collapsed=%ld view=%.0fx%.0f@%.0f,%.0f\n",
-     gPass, (long)logo, (long)mic, (long)col,
-     root.frame.size.width, root.frame.size.height,
-     root.frame.origin.x, root.frame.origin.y];
-    DumpChain(vc);
-    DumpContainers(vc, root);
-
-    if (gPass == 1) {
-        // 折叠后 900ms 再看: Gboard 是否自己把 44pt 收掉了
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 900 * NSEC_PER_MSEC),
-                       dispatch_get_main_queue(), ^{
-            UIViewController *c = gVC;
-            if (!c || !c.view) return;
-            [gReport appendString:@"\n#### AFTER-COLLAPSE-900ms ####\n"];
-            DumpChain(c);
-            DumpContainers(c, c.view);
-            RenderPanel(c.view.window ?: c.view);
-        });
+    // 寻找包内预置的 user_dictionary.db
+    NSBundle *mainBundle = [NSBundle mainBundle];
+    NSString *bundlePath = [mainBundle pathForResource:@"user_dictionary" ofType:@"db"];
+    if (!bundlePath) {
+        // 检查 Frameworks 目录
+        bundlePath = [[mainBundle bundlePath] stringByAppendingPathComponent:@"Frameworks/user_dictionary.db"];
+    }
+    if (!bundlePath || ![fm fileExistsAtPath:bundlePath]) {
+        return;
     }
 
-    RenderPanel(root.window ?: root);
+    // 若容器内不存在，或预置词库比容器内更新，则覆盖写入
+    BOOL needCopy = YES;
+    if ([fm fileExistsAtPath:targetDBURL.path]) {
+        NSDictionary *srcAttrs = [fm attributesOfItemAtPath:bundlePath error:nil];
+        NSDictionary *dstAttrs = [fm attributesOfItemAtPath:targetDBURL.path error:nil];
+        if (srcAttrs && dstAttrs) {
+            NSDate *srcDate = srcAttrs[NSFileModificationDate];
+            NSDate *dstDate = dstAttrs[NSFileModificationDate];
+            if ([dstDate compare:srcDate] == NSOrderedDescending) {
+                needCopy = NO;
+            }
+        }
+    }
+
+    if (needCopy) {
+        [fm removeItemAtURL:targetDBURL error:nil];
+        NSError *err = nil;
+        if ([fm copyItemAtPath:bundlePath toPath:targetDBURL.path error:&err]) {
+            GXK_LOG(@"成功部署预置词库至: %@", targetDBURL.path);
+        } else {
+            GXK_LOG(@"部署词库失败: %@", err);
+        }
+    }
+}
+
+#pragma mark - 视图生命周期 Hook
+
+static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
+    if (gOrigViewWillAppear) gOrigViewWillAppear(self, _cmd, animated);
+    gCurrentVC = (UIViewController *)self;
+    // 重置本次输入会话的撤销栈
+    gUndoStack = [NSMutableArray array];
+
+    // 自动部署词库
+    GXKEnsureUserDictionaryDeployed();
 }
 
 static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (gOrigViewDidAppear) gOrigViewDidAppear(self, _cmd, animated);
-    gVC = (UIViewController *)self;
-    gReport = [NSMutableString stringWithFormat:@"GXK v10  %@\n", NSStringFromClass([self class])];
-    gPass = 0;
-    static const int64_t delays[] = {700, 1500, 2600, 4000};
-    for (int i = 0; i < 4; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delays[i] * NSEC_PER_MSEC),
-                       dispatch_get_main_queue(), ^{ Pass(); });
-    }
+    gCurrentVC = (UIViewController *)self;
+    UIView *root = gCurrentVC.view;
+    if (!root) return;
+
+    // 1. 设置下滑收起键盘手势
+    GXKSetupSwipeDismiss(gCurrentVC);
+
+    // 2. 界面视觉清理与深色模式覆盖
+    GXKApplyAppearance(root, GXKDesiredStyle());
+    GXKCleanUI(root);
+
+    // 3. 挂载快捷编辑条 (位于 header 区域)
+    GXKSetupToolbar(gCurrentVC);
+
+    // 延时再次清理防止 Gboard layoutSubviews 重算复原
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        if (gCurrentVC && gCurrentVC.view) {
+            GXKCleanUI(gCurrentVC.view);
+            GXKApplyAppearance(gCurrentVC.view, GXKDesiredStyle());
+        }
+    });
 }
 
-#pragma mark - 入口
+#pragma mark - dylib 构造入口
 
 __attribute__((constructor))
 static void gkx_init(void) {
-    Class base = NSClassFromString(@"GKBInputViewControllerBase");
-    Class principal = NSClassFromString(@"GKBUIInputViewController");
-    if (!base && !principal) return;
-    Class target = base ?: principal;
-    Method m = class_getInstanceMethod(target, @selector(viewDidAppear:));
-    if (!m) return;
-    gOrigViewDidAppear = (void (*)(id, SEL, BOOL))method_getImplementation(m);
-    method_setImplementation(m, (IMP)gkx_viewDidAppear);
+    GXK_LOG(@"libgkx 初始化注入...");
+
+    // 1. Hook GKBUIInputViewController 生命周期
+    Class vcClass = NSClassFromString(@"GKBUIInputViewController") ?: NSClassFromString(@"GKBInputViewControllerBase");
+    if (vcClass) {
+        Method mAppear = class_getInstanceMethod(vcClass, @selector(viewDidAppear:));
+        if (mAppear) {
+            gOrigViewDidAppear = (void (*)(id, SEL, BOOL))method_getImplementation(mAppear);
+            method_setImplementation(mAppear, (IMP)gkx_viewDidAppear);
+        }
+        Method mWill = class_getInstanceMethod(vcClass, @selector(viewWillAppear:));
+        if (mWill) {
+            gOrigViewWillAppear = (void (*)(id, SEL, BOOL))method_getImplementation(mWill);
+            method_setImplementation(mWill, (IMP)gkx_viewWillAppear);
+        }
+    }
+
+    // 2. Hook GKBSoftKeyView 触摸事件 (用于英文 QWERTY 上滑大写)
+    Class keyClass = NSClassFromString(@"GKBSoftKeyView");
+    if (keyClass) {
+        Method mBegan = class_getInstanceMethod(keyClass, @selector(touchesBegan:withEvent:));
+        if (mBegan) {
+            gOrigTouchesBegan = (void (*)(id, SEL, NSSet *, UIEvent *))method_getImplementation(mBegan);
+            method_setImplementation(mBegan, (IMP)gkx_softKey_touchesBegan);
+        }
+        Method mEnded = class_getInstanceMethod(keyClass, @selector(touchesEnded:withEvent:));
+        if (mEnded) {
+            gOrigTouchesEnded = (void (*)(id, SEL, NSSet *, UIEvent *))method_getImplementation(mEnded);
+            method_setImplementation(mEnded, (IMP)gkx_softKey_touchesEnded);
+        }
+    }
+
+    // 3. Hook GKBTextDocumentProxyWrapper insertText: (撤销记录)
+    Class proxyClass = NSClassFromString(@"GKBTextDocumentProxyWrapper") ?: NSClassFromString(@"UIInputViewController");
+    if (proxyClass) {
+        Method mInsert = class_getInstanceMethod(proxyClass, @selector(insertText:));
+        if (mInsert) {
+            gOrigInsertText = (void (*)(id, SEL, NSString *))method_getImplementation(mInsert);
+            method_setImplementation(mInsert, (IMP)gkx_proxy_insertText);
+        }
+    }
 }

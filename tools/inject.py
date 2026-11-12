@@ -282,6 +282,7 @@ def main():
     ap.add_argument("--dylib", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--app-group", help="把 Gboard 的 app group 改写成这个（描述文件授权的那个）")
+    ap.add_argument("--dict", help="预置 Mozc user_dictionary.db 词库文件")
     ap.add_argument("--keep", help="保留解包目录（调试用）")
     args = ap.parse_args()
 
@@ -322,6 +323,13 @@ def main():
         shutil.copy2(args.dylib, dst)
         os.chmod(dst, 0o755)
         print("        rpath=%s -> 落点 %s" % (used_rpath, os.path.relpath(dst, workdir)))
+
+        if args.dict and os.path.isfile(args.dict):
+            dict_dst_fw = os.path.join(fw, "user_dictionary.db")
+            dict_dst_appex = os.path.join(appex, "user_dictionary.db")
+            shutil.copy2(args.dict, dict_dst_fw)
+            shutil.copy2(args.dict, dict_dst_appex)
+            print("        词库注入: %s -> %s" % (args.dict, os.path.relpath(dict_dst_fw, workdir)))
 
     print("[3/5] 清理旧签名")
     removed = strip_signatures(workdir)
