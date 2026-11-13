@@ -1,14 +1,14 @@
 // gkx.m — Gboard iOS 增强扩展 dylib
-// 阶段一 + 阶段二 + 万象词库 + 7项深度优化版
+// 阶段一 + 阶段二 + 万象词库 + 外观自适应与7项深度优化版
 //
-// 针对用户反馈的 7 项问题完整闭环:
-//   1. 全选修复：彻底移除 setMarkedText，改为「全选复制」与「清空」，绝不再生成并排重复文字
-//   2. 预编辑防遮挡：键盘高度通过约束扩充 (+34pt)，Gboard 视图整体下移，工具条置顶且完全不遮挡拼音与候选
-//   3. 九键重输/换行：动态将回车上方表情键改造成「重输」（拼音编辑时微红清空）与「换行」（未输入时插入换行）
-//   4. 全局纯黑覆盖：深度向上递归至 root.window 及其所有兄弟/子背景层，彻底消除底部切换栏与语音栏的浅色底色
-//   5. 极速轻量内存：万象词库精选 6 万核心高频词 (2.18MB)，彻底消除 iOS Jetsam 杀扩展闪退
-//   6. 键盘高度调节：原生悬浮面板支持 [紧凑 / 标准 / 偏高 / 较高] 四档即时调节
-//   7. 词库管理面板：设置面板提供万象词库一键开关与剪贴板词库导入
+// 核心修复与功能闭环:
+//   1. 修复全屏黑幕遮挡：确保 window 与全屏容器 UIInputSetContainerView 始终透明，绝不遮挡宿主 App 输入框与聊天内容
+//   2. 外观模式自由切换：设置面板支持 [跟随系统 / 浅色 / 深色]，白天自动自适应浅色、夜晚自适应深色，工具栏/按键/面板全层级自适应配色
+//   3. 全选修复：彻底移除 setMarkedText，改为「全选复制」与「清空」，绝不再生成并排重复文字
+//   4. 预编辑防遮挡：键盘高度通过约束扩充 (+34pt)，Gboard 视图整体下移，工具条置顶且完全不遮挡拼音与候选
+//   5. 九键重输/换行：动态将回车上方表情键改造成「重输」（拼音编辑时微红清空）与「换行」（未输入时插入换行，浅深色自适应按键）
+//   6. 极速轻量内存：万象词库精选 6 万核心高频词 (2.18MB)，彻底消除 iOS Jetsam 杀扩展闪退
+//   7. 原生悬浮设置：支持键盘高度调节、外观模式切换、万象词库开关与剪贴板词库导入
 //
 // 保障：不劫持全局按键触摸，九键与全键盘滑行输入原生性能不受任何影响。
 
@@ -64,56 +64,81 @@ static BOOL GXKIsDictEnabled(void) {
     return [d boolForKey:GXKDictEnabledKey];
 }
 
-#pragma mark - 外观与全局深色模式 (穿透至 window 彻底消除底栏浅色)
+#pragma mark - 外观与自适应模式 (跟随系统 / 强制浅色 / 强制深色)
 
-static void GXKApplyDeepDarkMode(UIView *root) {
-    if (!root) return;
-    UIUserInterfaceStyle darkStyle = UIUserInterfaceStyleDark;
-    UIColor *darkBg = [UIColor colorWithRed:0.11 green:0.11 blue:0.11 alpha:1.0];
+static NSString *GXKGetAppearance(void) {
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+    NSString *val = d ? [d stringForKey:GXKAppearanceKey] : nil;
+    if ([val isEqualToString:@"light"] || [val isEqualToString:@"dark"]) {
+        return val;
+    }
+    return @"system";
+}
+
+static UIUserInterfaceStyle GXKDesiredStyle(void) {
+    NSString *app = GXKGetAppearance();
+    if ([app isEqualToString:@"light"]) return UIUserInterfaceStyleLight;
+    if ([app isEqualToString:@"dark"]) return UIUserInterfaceStyleDark;
+    return UIUserInterfaceStyleUnspecified; // 跟随系统
+}
+
+static BOOL GXKIsCurrentDark(UIView *view) {
+    UIUserInterfaceStyle desired = GXKDesiredStyle();
+    if (desired == UIUserInterfaceStyleDark) return YES;
+    if (desired == UIUserInterfaceStyleLight) return NO;
+    if (@available(iOS 13.0, *)) {
+        if (view && view.traitCollection) {
+            return view.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
+        }
+        if (view && view.window && view.window.traitCollection) {
+            return view.window.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
+        }
+        if ([UIScreen mainScreen].traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static void GXKUpdateToolbarTheme(BOOL isDark);
+extern void GXKUpdateActionKey(UIViewController *vc);
+
+static void GXKApplyAppearance(UIViewController *vc) {
+    if (!vc || !vc.view) return;
+    UIView *root = vc.view;
+    UIUserInterfaceStyle style = GXKDesiredStyle();
 
     if (@available(iOS 13.0, *)) {
-        root.overrideUserInterfaceStyle = darkStyle;
+        if (root.overrideUserInterfaceStyle != style) {
+            root.overrideUserInterfaceStyle = style;
+        }
         UIWindow *win = root.window;
         if (win) {
-            win.overrideUserInterfaceStyle = darkStyle;
-            // 递归遍历 window 下所有的祖先和兄弟图层（包括输入法宿主底栏、切换栏等）
-            NSMutableArray<UIView *> *wStack = [NSMutableArray arrayWithObject:win];
-            int wGuard = 0;
-            while (wStack.count > 0 && wGuard++ < 3000) {
-                UIView *wv = wStack.lastObject;
-                [wStack removeLastObject];
-                wv.overrideUserInterfaceStyle = darkStyle;
+            if (win.overrideUserInterfaceStyle != style) {
+                win.overrideUserInterfaceStyle = style;
+            }
+            // 确保全屏容器 UIInputSetContainerView 绝对透明，绝不遮挡上层宿主 App 与输入框
+            win.backgroundColor = [UIColor clearColor];
+            for (UIView *wv in win.subviews) {
                 NSString *wcls = NSStringFromClass([wv class]);
-                if ([wcls containsString:@"Input"] || [wcls containsString:@"Backdrop"] ||
-                    [wcls containsString:@"Host"] || [wcls containsString:@"Globe"] ||
-                    [wcls containsString:@"Bottom"] || [wcls containsString:@"Effect"]) {
-                    wv.backgroundColor = darkBg;
+                if ([wcls containsString:@"Container"] || [wcls containsString:@"Window"]) {
+                    wv.backgroundColor = [UIColor clearColor];
                 }
-                [wStack addObjectsFromArray:wv.subviews];
+                if ([wcls containsString:@"Backdrop"] || [wcls containsString:@"Content"] || [wcls containsString:@"Host"]) {
+                    if (wv.overrideUserInterfaceStyle != style) {
+                        wv.overrideUserInterfaceStyle = style;
+                    }
+                }
             }
         }
     }
 
-    root.backgroundColor = darkBg;
+    // 键盘根视图保持透明，让 UIKit 原生毛玻璃背景与 Gboard 皮肤层按 traitCollection 正常呈现
+    root.backgroundColor = [UIColor clearColor];
 
-    // 向下遍历 root 下所有视图
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    int guard = 0;
-    while (stack.count > 0 && guard++ < 4000) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-
-        if (@available(iOS 13.0, *)) {
-            if (v.overrideUserInterfaceStyle != darkStyle) v.overrideUserInterfaceStyle = darkStyle;
-        }
-
-        NSString *cls = NSStringFromClass([v class]);
-        if ([cls containsString:@"Backdrop"] || [cls containsString:@"Bottom"] || [cls containsString:@"Background"]) {
-            v.backgroundColor = darkBg;
-        }
-
-        [stack addObjectsFromArray:v.subviews];
-    }
+    BOOL isDark = GXKIsCurrentDark(root);
+    GXKUpdateToolbarTheme(isDark);
+    GXKUpdateActionKey(vc);
 }
 
 #pragma mark - 界面清理与布局下移避让 (完全腾出工具栏空间)
@@ -372,13 +397,25 @@ void GXKUpdateActionKey(UIViewController *vc) {
         }
         gActionKeyButton = btn;
 
+        BOOL isDark = GXKIsCurrentDark(vc ? vc.view : nil);
         BOOL composing = GXKIsComposingActive(vc);
         if (composing) {
             [btn setTitle:@"重输" forState:UIControlStateNormal];
-            btn.backgroundColor = [UIColor colorWithRed:0.85 green:0.30 blue:0.25 alpha:0.90]; // 醒目微红
+            btn.backgroundColor = [UIColor colorWithRed:0.85 green:0.30 blue:0.25 alpha:0.95]; // 醒目微红
+            [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            btn.layer.borderWidth = 0.0;
         } else {
             [btn setTitle:@"换行" forState:UIControlStateNormal];
-            btn.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.85]; // 沉稳深灰
+            if (isDark) {
+                btn.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.85]; // 沉稳深灰
+                [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                btn.layer.borderWidth = 0.0;
+            } else {
+                btn.backgroundColor = [UIColor colorWithWhite:0.88 alpha:0.95]; // 优雅浅灰
+                [btn setTitleColor:[UIColor colorWithWhite:0.15 alpha:1.0] forState:UIControlStateNormal];
+                btn.layer.borderColor = [UIColor colorWithWhite:0.75 alpha:0.7].CGColor;
+                btn.layer.borderWidth = 0.5;
+            }
         }
         [key bringSubviewToFront:btn];
     }
@@ -535,8 +572,6 @@ static UIButton *GXKCreateToolButton(NSString *title, SEL action) {
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
     [btn setTitle:title forState:UIControlStateNormal];
     btn.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
-    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    btn.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.65];
     btn.layer.cornerRadius = 6.0;
     btn.layer.masksToBounds = YES;
     btn.contentEdgeInsets = UIEdgeInsetsMake(4, 8, 4, 8);
@@ -544,9 +579,38 @@ static UIButton *GXKCreateToolButton(NSString *title, SEL action) {
     return btn;
 }
 
+static void GXKUpdateToolbarTheme(BOOL isDark) {
+    if (!gToolbarView) return;
+    gToolbarView.backgroundColor = isDark ? [UIColor colorWithWhite:0.10 alpha:0.75]
+                                          : [UIColor colorWithWhite:0.95 alpha:0.85];
+    for (UIView *sub in gToolbarView.subviews) {
+        if ([sub isKindOfClass:[UIStackView class]]) {
+            for (UIView *btn in sub.subviews) {
+                if ([btn isKindOfClass:[UIButton class]]) {
+                    UIButton *b = (UIButton *)btn;
+                    if (isDark) {
+                        b.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.70];
+                        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                        b.layer.borderColor = [UIColor clearColor].CGColor;
+                        b.layer.borderWidth = 0.0;
+                    } else {
+                        b.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.90];
+                        [b setTitleColor:[UIColor colorWithWhite:0.15 alpha:1.0] forState:UIControlStateNormal];
+                        b.layer.borderColor = [UIColor colorWithWhite:0.80 alpha:0.8].CGColor;
+                        b.layer.borderWidth = 0.5;
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void GXKSetupToolbar(UIViewController *vc) {
     if (!vc || !vc.view) return;
-    if (gToolbarView && gToolbarView.superview == vc.view) return;
+    if (gToolbarView && gToolbarView.superview == vc.view) {
+        GXKUpdateToolbarTheme(GXKIsCurrentDark(vc.view));
+        return;
+    }
 
     if (!gToolbarTarget) gToolbarTarget = [[GXKToolbarTarget alloc] init];
 
@@ -554,7 +618,6 @@ static void GXKSetupToolbar(UIViewController *vc) {
     CGFloat toolbarHeight = 32.0;
 
     gToolbarView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, toolbarHeight)];
-    gToolbarView.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.40];
     gToolbarView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleBottomMargin;
 
     UIStackView *stack = [[UIStackView alloc] initWithFrame:gToolbarView.bounds];
@@ -575,6 +638,8 @@ static void GXKSetupToolbar(UIViewController *vc) {
     [gToolbarView addSubview:stack];
     [vc.view addSubview:gToolbarView];
     [vc.view bringSubviewToFront:gToolbarView];
+
+    GXKUpdateToolbarTheme(GXKIsCurrentDark(vc.view));
 }
 
 #pragma mark - 悬浮设置面板 (高度调节 + 词库管理)
@@ -650,6 +715,29 @@ static void GXKSetupToolbar(UIViewController *vc) {
     if (gCurrentVC) [gCurrentVC presentViewController:alert animated:YES completion:nil];
 }
 
+- (void)onAppearanceChanged:(UISegmentedControl *)seg {
+    NSString *val = @"system";
+    if (seg.selectedSegmentIndex == 1) val = @"light";
+    else if (seg.selectedSegmentIndex == 2) val = @"dark";
+
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+    [d setObject:val forKey:GXKAppearanceKey];
+    [d synchronize];
+
+    UIImpactFeedbackGenerator *fb = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [fb impactOccurred];
+
+    if (gCurrentVC) {
+        GXKApplyAppearance(gCurrentVC);
+        // 重新刷新设置面板自身样式
+        if (gSettingsModalView) {
+            [gSettingsModalView removeFromSuperview];
+            gSettingsModalView = nil;
+            GXKShowSettingsModal(gCurrentVC);
+        }
+    }
+}
+
 - (void)onClose {
     [gSettingsModalView removeFromSuperview];
     gSettingsModalView = nil;
@@ -668,31 +756,37 @@ static void GXKShowSettingsModal(UIViewController *vc) {
     }
     if (!gSettingsHandler) gSettingsHandler = [[GXKSettingsHandler alloc] init];
 
+    BOOL isDark = GXKIsCurrentDark(vc.view);
     CGFloat w = vc.view.bounds.size.width;
-    CGFloat h = 210.0;
-    gSettingsModalView = [[UIView alloc] initWithFrame:CGRectMake(12, 38, w - 24, h)];
-    gSettingsModalView.backgroundColor = [UIColor colorWithRed:0.18 green:0.18 blue:0.20 alpha:0.96];
+    CGFloat h = 255.0;
+    gSettingsModalView = [[UIView alloc] initWithFrame:CGRectMake(12, 36, w - 24, h)];
+    gSettingsModalView.backgroundColor = isDark ? [UIColor colorWithRed:0.16 green:0.16 blue:0.18 alpha:0.98]
+                                                : [UIColor colorWithRed:0.95 green:0.95 blue:0.97 alpha:0.98];
     gSettingsModalView.layer.cornerRadius = 14.0;
     gSettingsModalView.layer.masksToBounds = YES;
-    gSettingsModalView.layer.borderColor = [UIColor colorWithWhite:0.35 alpha:0.5].CGColor;
+    gSettingsModalView.layer.borderColor = isDark ? [UIColor colorWithWhite:0.35 alpha:0.5].CGColor
+                                                  : [UIColor colorWithWhite:0.80 alpha:0.9].CGColor;
     gSettingsModalView.layer.borderWidth = 1.0;
+
+    UIColor *titleColor = isDark ? [UIColor whiteColor] : [UIColor colorWithWhite:0.10 alpha:1.0];
+    UIColor *labelColor = isDark ? [UIColor lightGrayColor] : [UIColor colorWithWhite:0.35 alpha:1.0];
 
     // 标题
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, w - 56, 22)];
     title.text = @"Gboard GKX 增强设置";
-    title.textColor = [UIColor whiteColor];
+    title.textColor = titleColor;
     title.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
     [gSettingsModalView addSubview:title];
 
     // 1. 键盘高度调节
-    UILabel *lblHeight = [[UILabel alloc] initWithFrame:CGRectMake(16, 46, 80, 26)];
+    UILabel *lblHeight = [[UILabel alloc] initWithFrame:CGRectMake(16, 44, 75, 26)];
     lblHeight.text = @"键盘高度";
-    lblHeight.textColor = [UIColor lightGrayColor];
+    lblHeight.textColor = labelColor;
     lblHeight.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
     [gSettingsModalView addSubview:lblHeight];
 
     UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"紧凑", @"标准", @"偏高", @"较高"]];
-    seg.frame = CGRectMake(90, 44, w - 130, 28);
+    seg.frame = CGRectMake(90, 43, w - 130, 28);
     CGFloat curOff = GXKGetHeightOffset();
     if (curOff <= 5.0) seg.selectedSegmentIndex = 0;
     else if (curOff <= 25.0) seg.selectedSegmentIndex = 1;
@@ -701,37 +795,54 @@ static void GXKShowSettingsModal(UIViewController *vc) {
     [seg addTarget:gSettingsHandler action:@selector(onHeightChanged:) forControlEvents:UIControlEventValueChanged];
     [gSettingsModalView addSubview:seg];
 
-    // 2. 词库开关
-    UILabel *lblDict = [[UILabel alloc] initWithFrame:CGRectMake(16, 88, 120, 26)];
+    // 2. 外观模式调节 (跟随系统 / 浅色 / 深色)
+    UILabel *lblTheme = [[UILabel alloc] initWithFrame:CGRectMake(16, 82, 75, 26)];
+    lblTheme.text = @"外观模式";
+    lblTheme.textColor = labelColor;
+    lblTheme.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    [gSettingsModalView addSubview:lblTheme];
+
+    UISegmentedControl *segTheme = [[UISegmentedControl alloc] initWithItems:@[@"跟随系统", @"浅色", @"深色"]];
+    segTheme.frame = CGRectMake(90, 81, w - 130, 28);
+    NSString *curApp = GXKGetAppearance();
+    if ([curApp isEqualToString:@"light"]) segTheme.selectedSegmentIndex = 1;
+    else if ([curApp isEqualToString:@"dark"]) segTheme.selectedSegmentIndex = 2;
+    else segTheme.selectedSegmentIndex = 0;
+    [segTheme addTarget:gSettingsHandler action:@selector(onAppearanceChanged:) forControlEvents:UIControlEventValueChanged];
+    [gSettingsModalView addSubview:segTheme];
+
+    // 3. 词库开关
+    UILabel *lblDict = [[UILabel alloc] initWithFrame:CGRectMake(16, 122, 120, 26)];
     lblDict.text = @"启用万象词库";
-    lblDict.textColor = [UIColor lightGrayColor];
+    lblDict.textColor = labelColor;
     lblDict.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
     [gSettingsModalView addSubview:lblDict];
 
-    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(w - 85, 85, 51, 31)];
+    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(w - 75, 119, 51, 31)];
     sw.on = GXKIsDictEnabled();
     [sw addTarget:gSettingsHandler action:@selector(onDictToggle:) forControlEvents:UIControlEventValueChanged];
     [gSettingsModalView addSubview:sw];
 
-    // 3. 从剪贴板导入
+    // 4. 从剪贴板导入
     UIButton *btnImport = [UIButton buttonWithType:UIButtonTypeSystem];
-    btnImport.frame = CGRectMake(16, 126, w - 56, 32);
+    btnImport.frame = CGRectMake(16, 160, w - 56, 32);
     [btnImport setTitle:@"📥 从系统剪贴板导入词条" forState:UIControlStateNormal];
     btnImport.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-    [btnImport setTitleColor:[UIColor colorWithRed:0.35 green:0.75 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
-    btnImport.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.5];
+    [btnImport setTitleColor:[UIColor colorWithRed:0.20 green:0.60 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
+    btnImport.backgroundColor = isDark ? [UIColor colorWithWhite:0.25 alpha:0.5]
+                                       : [UIColor colorWithWhite:0.90 alpha:0.7];
     btnImport.layer.cornerRadius = 6.0;
     [btnImport addTarget:gSettingsHandler action:@selector(onImportClipboard) forControlEvents:UIControlEventTouchUpInside];
     [gSettingsModalView addSubview:btnImport];
 
-    // 完成关闭按钮
+    // 5. 完成关闭按钮
     UIButton *btnClose = [UIButton buttonWithType:UIButtonTypeSystem];
-    btnClose.frame = CGRectMake(16, 168, w - 56, 32);
+    btnClose.frame = CGRectMake(16, 204, w - 56, 34);
     [btnClose setTitle:@"完成" forState:UIControlStateNormal];
     btnClose.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightBold];
     [btnClose setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     btnClose.backgroundColor = [UIColor colorWithRed:0.22 green:0.55 blue:0.95 alpha:1.0];
-    btnClose.layer.cornerRadius = 6.0;
+    btnClose.layer.cornerRadius = 7.0;
     [btnClose addTarget:gSettingsHandler action:@selector(onClose) forControlEvents:UIControlEventTouchUpInside];
     [gSettingsModalView addSubview:btnClose];
 
@@ -811,10 +922,23 @@ static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
     });
 }
 
+static void (*gOrigTraitCollectionDidChange)(id, SEL, UITraitCollection *);
+
+static void gkx_traitCollectionDidChange(id self, SEL _cmd, UITraitCollection *prev) {
+    if (gOrigTraitCollectionDidChange) gOrigTraitCollectionDidChange(self, _cmd, prev);
+    UIViewController *vc = (UIViewController *)self;
+    if (vc && [vc isViewLoaded]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            GXKApplyAppearance(vc);
+        });
+    }
+}
+
 static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     if (gOrigViewWillAppear) gOrigViewWillAppear(self, _cmd, animated);
     gCurrentVC = (UIViewController *)self;
     GXKEnsureUserDictionaryDeployed();
+    GXKApplyAppearance(gCurrentVC);
 
     // 启动状态轮询定时器 (0.25s 极轻量轮询，实时同步「重输」/「换行」)
     if (!gStatePollTimer) {
@@ -849,8 +973,8 @@ static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     // 1. 设置下滑收起键盘手势 (安全限定顶部 y<46pt)
     GXKSetupSwipeDismiss(gCurrentVC);
 
-    // 2. 全局纯深色覆盖 (递归至 root.window 消除底部切换与语音栏浅色)
-    GXKApplyDeepDarkMode(root);
+    // 2. 自适应外观模式 (透明顶层容器，宿主 App 视野完全清透，键盘依设置/系统切换浅深色)
+    GXKApplyAppearance(gCurrentVC);
 
     // 3. 界面清理与布局下移避让
     GXKCleanAndShiftUI(root);
@@ -863,7 +987,7 @@ static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         if (gCurrentVC && gCurrentVC.view) {
-            GXKApplyDeepDarkMode(gCurrentVC.view);
+            GXKApplyAppearance(gCurrentVC);
             GXKCleanAndShiftUI(gCurrentVC.view);
             GXKUpdateActionKey(gCurrentVC);
         }
@@ -874,7 +998,7 @@ static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
 
 __attribute__((constructor))
 static void gkx_init(void) {
-    GXK_LOG(@"libgkx 初始化注入 (v3.0 深度优化版)...");
+    GXK_LOG(@"libgkx 初始化注入 (自适应浅色/深色外观版)...");
 
     Class vcClass = NSClassFromString(@"GKBUIInputViewController") ?: NSClassFromString(@"GKBInputViewControllerBase");
     if (vcClass) {
@@ -902,6 +1026,17 @@ static void gkx_init(void) {
         if (mText) {
             gOrigTextDidChange = (void (*)(id, SEL, id))method_getImplementation(mText);
             method_setImplementation(mText, (IMP)gkx_textDidChange);
+        }
+        Method mTrait = class_getInstanceMethod(vcClass, @selector(traitCollectionDidChange:));
+        if (mTrait) {
+            IMP newImp = (IMP)gkx_traitCollectionDidChange;
+            const char *types = method_getTypeEncoding(mTrait);
+            if (class_addMethod(vcClass, @selector(traitCollectionDidChange:), newImp, types)) {
+                gOrigTraitCollectionDidChange = (void (*)(id, SEL, UITraitCollection *))method_getImplementation(mTrait);
+            } else {
+                gOrigTraitCollectionDidChange = (void (*)(id, SEL, UITraitCollection *))method_getImplementation(mTrait);
+                method_setImplementation(mTrait, newImp);
+            }
         }
     }
 }
