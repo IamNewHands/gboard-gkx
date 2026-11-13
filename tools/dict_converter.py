@@ -302,7 +302,8 @@ def build_from_directory(dir_path: str, output_db: str, max_total_words: int = 6
         if not unique_items:
             continue
 
-        proto_entries = [build_mozc_entry(py, w, pos=0, comment="wanxiang") for py, w in unique_items]
+        # 不写入 comment 字段，大幅减少 Protobuf 二进制体积并在 C++ 反序列化时避免大量堆内存分配，杜绝 Jetsam 内存溢出
+        proto_entries = [build_mozc_entry(py, w, pos=0, comment="") for py, w in unique_items]
         dict_bytes = build_mozc_dictionary(dict_id=dict_id_counter, name=display_name, entries=proto_entries)
         mozc_dictionaries.append(dict_bytes)
         dict_id_counter += 1
@@ -360,7 +361,7 @@ def main():
                 if (py, w) not in seen:
                     seen.add((py, w))
                     all_entries.append((py, w))
-        proto_entries = [build_mozc_entry(py, w, pos=0, comment="import") for py, w in all_entries[:args.max]]
+        proto_entries = [build_mozc_entry(py, w, pos=0, comment="") for py, w in all_entries[:args.max]]
         dict_bytes = build_mozc_dictionary(dict_id=1001, name=args.name, entries=proto_entries)
         storage_bytes = build_mozc_storage(dictionaries=[dict_bytes])
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
