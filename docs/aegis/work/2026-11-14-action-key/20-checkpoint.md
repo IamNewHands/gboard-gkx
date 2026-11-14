@@ -1,6 +1,6 @@
 # 修复检查点
 
-## 当前状态（2026-11-14，真机反馈已定位并修复，待编译与真机复验）
+## 当前状态（2026-11-14，已推送、CI 编译并出未签名测试包；真机复验待做）
 
 - 任务基线：main，HEAD `864f1e0d3968a38a419252febb2fcd3bbbc14fd8`；开始时跟踪文件干净。源码、测试及动作键文档的 mixed 提交 `8fd0dfd0b1a04ab912a2c60a7407a9b9f7acf669` 已普通推送到 `IamNewHands/gboard-gkx/main`；标准Git的实时 `ls-remote` 回读证实远端SHA相同，没有强推。
 - 已实施：直接可见 `restorationIdentifier` + 九键优先祖先分类；唯一可见外层布局体，不完整/竞争布局拒绝替换。退役坐标猜键、外层 `allSoftKeys` 依赖、全子视图隐藏/恢复和独立键帽配色；只清除已证原生前景，不改键帽背景层。
@@ -34,3 +34,13 @@
 - 修复：按钮改挂到键的宿主祖先（`GXKActionHostForKey`），frame 每帧按 `convertRect:toView:` 换算；点击与刷新均重解析宿主。不 swizzle、不隐藏原生子视图、不猜坐标、不改全局 touches 链。
 - 离线回归：20 项源码约束 + 6 项原包 NIB 断言，26 项通过、0 跳过、退出 0；`git diff --check` 干净。
 - 本地提交 `dd8ed95`；未推送、未 CI 构建、未打包、未真机复验。下一步待用户裁决是否推送（推送即出包）。
+
+## 推送、编译与测试包（2026-11-14，goal round 4）
+
+- 用户新输入：明确「推送并出包，后续不要再问我，直接推送出包」。据此本轮完成推送、CI 编译与本地打包，不再逐次确认。
+- 推送：`git -c credential.helper='!gh auth git-credential' push origin HEAD:refs/heads/main` 退出 0，`8fd0dfd..6ec8f92`；实时 `ls-remote origin refs/heads/main` 回读 `6ec8f920a8834b1ce5fcd6f76e6ec6af19e5c43a`，普通推送、无强推。默认 schannel 凭据不可用（`SEC_E_NO_CREDENTIALS`），改用已登录 gh 的 credential helper，未读取或改动任何凭据值。
+- CI：[run 43593793791](<https://github.com/IamNewHands/gboard-gkx/actions/runs/43593793791>) push 事件、head_sha 匹配、conclusion success；checkout / Build / ldid / upload-artifact 全 success。日志确认 Mach-O arm64 dylib、install_name `@rpath/libgkx.dylib`、依赖 UIKit/Foundation/CoreGraphics/objc，编译步骤无业务警告。
+- 产物：artifact `libgkx` id `14113018514`，平台 digest `sha256:88b01da7…`；下载后 [libgkx.dylib](<repo>/dist/libgkx-6ec8f92/libgkx.dylib>) 78752 字节、SHA256 `c4b4e4d5487c35a6a7fe4c5922edc3234e6cf897ce6a5bf759fee05dd8ec9742`，`MH_DYLIB`、arm64、ncmds 20，含 `_GXKActionHostForKey` 与 `convertRect:toView:` 符号，证明新代码确实进入二进制。
+- 测试包：[gboard-gkx-6ec8f92-unsigned.ipa](<repo>/dist/gboard-gkx-6ec8f92-unsigned.ipa>) 36654932 字节、SHA256 `a76f53c774382c79f4c0943be0fea47012c7c9a11089bc3928ffd6a162ba176d`。结构核验全部通过：ZIP CRC 完整、2051 成员无重复、无 `_CodeSignature`/`SC_Info` 残留；dylib 字节与 CI 产物一致且权限 0755；appex 可执行 0755；appex `LC_LOAD_DYLIB` 含 `@rpath/libgkx.dylib` 且 `LC_RPATH @executable_path/../../Frameworks`；`gboard_framework` 与 dylib 均改写为 `group.zunbengege.top`、旧 Google group 串为 0；`user_dictionary.db` 已内置。回执 [verification.json](<repo>/dist/libgkx-6ec8f92/verification.json>)。
+- 未验证：iOS 签名可用性、dylib 真机加载、真实键盘布局/触摸/主题、VoiceOver、性能。用户可见验收仍为 needs-verification。
+- 唯一下一步：用 LCSign 自签安装新测试包，先测「未输入时点换行是否真正换行」，再回归「有输入时重输」与九键→123→符号→26键循环切换。
