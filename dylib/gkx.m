@@ -86,6 +86,15 @@ static BOOL GXKIsComposingActive(UIViewController *vc) {
     if (!vc || !vc.view) return NO;
     UIView *root = vc.view;
 
+    // 先快速检查 textDocumentProxy 是否包含 markedText
+    if ([vc isKindOfClass:[UIInputViewController class]]) {
+        UIInputViewController *ivc = (UIInputViewController *)vc;
+        if ([ivc.textDocumentProxy respondsToSelector:@selector(markedText)]) {
+            NSString *mt = [ivc.textDocumentProxy valueForKey:@"markedText"];
+            if (mt.length > 0) return YES;
+        }
+    }
+
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     int guard = 0;
     while (stack.count > 0 && guard++ < 1500) {
@@ -226,93 +235,168 @@ static void GXKUpdateActionKey(UIViewController *vc);
 
 static GXKActionKeyTarget *gActionTarget;
 
+static void GXKRestoreKeySubviews(UIView *key) {
+    if (!key) return;
+    for (UIView *sub in key.subviews) {
+        if (sub != gActionKeyButton) {
+            sub.hidden = NO;
+        }
+    }
+}
+
 static UIView *GXKFindNineKeyEmojiKey(UIView *root) {
     if (!root) return nil;
-    CGFloat w = root.bounds.size.width;
-    CGFloat rightColX = w * 0.70;
 
-    // 先定位九键键盘容器
-    UIView *nineContainer = nil;
+    // 1. 递归查找当前在屏幕可视区内活跃可见的九键键盘容器 (GKB9KeysSoftKeyboardView)
+    UIView *active9KeyView = nil;
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     int guard = 0;
-    while (stack.count > 0 && guard++ < 1000) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        NSString *cls = NSStringFromClass([v class]);
-        if ([cls containsString:@"9Key"] && !v.isHidden) {
-            nineContainer = v;
-            break;
-        }
-        [stack addObjectsFromArray:v.subviews];
-    }
-
-    UIView *searchRoot = nineContainer ?: root;
-    stack = [NSMutableArray arrayWithObject:searchRoot];
-    guard = 0;
-    while (stack.count > 0 && guard++ < 1200) {
+    while (stack.count > 0 && guard++ < 1500) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
 
-        if (v.isHidden || v.alpha < 0.05) continue;
+        if (v.isHidden || v.alpha < 0.05 || !v.window) continue;
 
         NSString *cls = NSStringFromClass([v class]);
-        if ([cls isEqualToString:@"GKBSoftKeyView"]) {
-            CGPoint p = [v convertPoint:CGPointZero toView:root];
-            // 九键右侧纵列 (x > 70%)，回车键上方 (y 在 80 ~ 165pt)
-            if (p.x > rightColX && p.y > 80.0 && p.y < 165.0) {
-                return v;
-            }
-            // 语义辅助判定
-            NSString *label = [(v.accessibilityLabel ?: @"") lowercaseString];
-            NSString *ident = [(v.accessibilityIdentifier ?: @"") lowercaseString];
-            if (([label containsString:@"emoji"] || [label containsString:@"表情"] || [ident containsString:@"emoji"]) &&
-                p.x > rightColX) {
-                return v;
+        // 关键红线：仅匹配九键软键盘 GKB9KeysSoftKeyboardView，严禁匹配 26 键 (GKBZhQwertySoftKeyboardView)
+        if ([cls containsString:@"9Key"] && [cls containsString:@"SoftKeyboard"]) {
+            CGRect r = [v convertRect:v.bounds toView:root];
+            // 必须在可视窗口区域内且尺寸有效
+            if (r.size.width > 80.0 && r.size.height > 80.0 && CGRectIntersectsRect(root.bounds, r)) {
+                active9KeyView = v;
+                break;
             }
         }
         [stack addObjectsFromArray:v.subviews];
     }
-    return nil;
+
+    // 若当前无活跃的九键键盘（例如处于 26 键 Qwerty 或英文全键盘），绝对返回 nil（彻底保持原样）
+    if (!active9KeyView) {
+        return nil;
+    }
+
+    // 2. 从九键容器中获取按键映射字典 allSoftKeys
+    NSDictionary *allKeys = nil;
+    SEL selAllKeys = NSSelectorFromString(@"allSoftKeys");
+    if ([active9KeyView respondsToSelector:selAllKeys]) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        allKeys = [active9KeyView performSelector:selAllKeys];
+        #pragma clang diagnostic pop
+    }
+    if (!allKeys || ![allKeys isKindOfClass:[NSDictionary class]]) {
+        Ivar iv = class_getInstanceVariable([active9KeyView class], "_allSoftKeys");
+        if (iv) {
+            allKeys = object_getIvar(active9KeyView, iv);
+        }
+    }
+
+    UIView *returnKey = nil;
+    UIView *emojiKey = nil;
+
+    if (allKeys && [allKeys isKindOfClass:[NSDictionary class]]) {
+        returnKey = allKeys[@"key_pos_9keys_return"];
+        emojiKey = allKeys[@"key_pos_9keys_emoji"];
+    }
+
+    // 3. 校验 key_pos_9keys_emoji（绝对不可为回车键 returnKey，彻底根除变到回车按钮的缺陷）
+    if (emojiKey && emojiKey != returnKey && [emojiKey isKindOfClass:[UIView class]]) {
+        if (!emojiKey.isHidden && emojiKey.window) {
+            CGRect r = [emojiKey convertRect:emojiKey.bounds toView:root];
+            if (r.size.width > 15.0 && r.size.height > 15.0 && CGRectIntersectsRect(root.bounds, r)) {
+                return emojiKey;
+            }
+        }
+    }
+
+    // 4. 稳健兜底：若字典未直接命中，在 active9KeyView 右侧列严格查找位于回车键上方的按键
+    CGFloat rightColX = active9KeyView.bounds.size.width * 0.70;
+    CGFloat returnKeyY = (returnKey ? [returnKey convertPoint:CGPointZero toView:active9KeyView].y : 99999.0);
+
+    UIView *bestCandidate = nil;
+    CGFloat maxCandidateY = -1.0;
+
+    NSMutableArray<UIView *> *subStack = [NSMutableArray arrayWithObject:active9KeyView];
+    int subGuard = 0;
+    while (subStack.count > 0 && subGuard++ < 300) {
+        UIView *sub = subStack.lastObject;
+        [subStack removeLastObject];
+
+        if (sub != active9KeyView && [NSStringFromClass([sub class]) isEqualToString:@"GKBSoftKeyView"]) {
+            if (sub != returnKey && !sub.isHidden && sub.alpha > 0.05) {
+                CGPoint p = [sub convertPoint:CGPointZero toView:active9KeyView];
+                if (p.x > rightColX && p.y < returnKeyY - 10.0 && p.y > 40.0) {
+                    if (p.y > maxCandidateY) {
+                        maxCandidateY = p.y;
+                        bestCandidate = sub;
+                    }
+                }
+            }
+        }
+        [subStack addObjectsFromArray:sub.subviews];
+    }
+
+    return bestCandidate;
 }
 
 static void GXKUpdateActionKey(UIViewController *vc) {
     if (!vc || !vc.view) return;
     UIView *root = vc.view;
 
-    if (!gEmojiSoftKeyView || !gEmojiSoftKeyView.window) {
-        gEmojiSoftKeyView = GXKFindNineKeyEmojiKey(root);
+    UIView *currentKey = GXKFindNineKeyEmojiKey(root);
+
+    // 模式 1：当前不在九键界面（处于 26 键全键盘、英文键盘或全屏候选面板）
+    if (!currentKey) {
+        if (gActionKeyButton) {
+            gActionKeyButton.hidden = YES;
+        }
+        // 如果此前有被隐藏子视图的表情按键，彻底恢复其原生子视图显示
+        if (gEmojiSoftKeyView) {
+            GXKRestoreKeySubviews(gEmojiSoftKeyView);
+            gEmojiSoftKeyView = nil;
+        }
+        return; // 26 键完全保持官方原生原样，绝不修改！
     }
 
-    if (!gEmojiSoftKeyView) {
-        if (gActionKeyButton) gActionKeyButton.hidden = YES;
-        return;
+    // 模式 2：处于九键体系（拼音九键、123 数字九键、符号九键）
+    if (gEmojiSoftKeyView && gEmojiSoftKeyView != currentKey) {
+        // 如果切换到了不同的九键子界面，恢复前一个按键的原生子视图
+        GXKRestoreKeySubviews(gEmojiSoftKeyView);
     }
+    gEmojiSoftKeyView = currentKey;
 
-    UIView *key = gEmojiSoftKeyView;
     if (!gActionTarget) {
         gActionTarget = [[GXKActionKeyTarget alloc] init];
     }
 
-    UIButton *btn = [key viewWithTag:GXK_ACTION_TAG];
-    if (!btn) {
-        btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        btn.tag = GXK_ACTION_TAG;
-        btn.frame = key.bounds;
+    UIButton *btn = gActionKeyButton;
+    if (!btn || btn.superview != currentKey) {
+        if (btn && btn.superview) {
+            [btn removeFromSuperview];
+        }
+        if (!btn) {
+            btn = [UIButton buttonWithType:UIButtonTypeCustom];
+            btn.tag = GXK_ACTION_TAG;
+            btn.titleLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
+            btn.layer.cornerRadius = 5.0;
+            btn.layer.masksToBounds = YES;
+            [btn addTarget:gActionTarget action:@selector(onActionKeyTapped:) forControlEvents:UIControlEventTouchUpInside];
+            gActionKeyButton = btn;
+        }
+        btn.frame = currentKey.bounds;
         btn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        btn.titleLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
-        btn.layer.cornerRadius = 5.0;
-        btn.layer.masksToBounds = YES;
-        [btn addTarget:gActionTarget action:@selector(onActionKeyTapped:) forControlEvents:UIControlEventTouchUpInside];
-        [key addSubview:btn];
-        key.userInteractionEnabled = YES;
+        [currentKey addSubview:btn];
+    }
 
-        // 隐藏该按键原有表情图标，避免与文字重叠
-        for (UIView *sub in key.subviews) {
-            if (sub != btn) sub.hidden = YES;
+    currentKey.userInteractionEnabled = YES;
+    btn.hidden = NO;
+
+    // 隐藏当前按键原有的表情图标，避免与自定义文字重叠
+    for (UIView *sub in currentKey.subviews) {
+        if (sub != btn) {
+            sub.hidden = YES;
         }
     }
-    btn.hidden = NO;
-    gActionKeyButton = btn;
 
     BOOL isDark = NO;
     if (@available(iOS 13.0, *)) {
@@ -328,7 +412,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         btn.backgroundColor = [UIColor colorWithRed:0.86 green:0.32 blue:0.28 alpha:0.95]; // 醒目微红
     } else {
-        // 未输入状态：显示「换行」
+        // 未输入拼音状态：显示「换行」
         [btn setTitle:@"换行" forState:UIControlStateNormal];
         if (isDark) {
             [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -339,7 +423,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         }
     }
 
-    [key bringSubviewToFront:btn];
+    [currentKey bringSubviewToFront:btn];
 }
 
 #pragma mark - 视图控制器生命周期 Hook
@@ -376,7 +460,15 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
         [gStatePollTimer invalidate];
         gStatePollTimer = nil;
     }
-    gEmojiSoftKeyView = nil;
+    if (gEmojiSoftKeyView) {
+        GXKRestoreKeySubviews(gEmojiSoftKeyView);
+        gEmojiSoftKeyView = nil;
+    }
+    if (gActionKeyButton) {
+        gActionKeyButton.hidden = YES;
+        [gActionKeyButton removeFromSuperview];
+        gActionKeyButton = nil;
+    }
 }
 
 static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
