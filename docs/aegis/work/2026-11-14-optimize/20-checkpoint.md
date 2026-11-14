@@ -48,7 +48,14 @@
 - `tests/test_privacy.py` 7 项 OK（新增）
 - `git diff --check` 干净
 
+## 推送、CI 与测试包
+
+- 提交 `1a779c5`，推送 `b630aa4..1a779c5`，远端 main = `1a779c5e42e4a1bcf418cdfb0115f47ce1a8c3c1`。
+- CI run `43608139450`（push，macos-15-arm64，conclusion success）。
+- 产物 `dist/libgkx-1a779c5/libgkx.dylib`：79424 字节，SHA256 `4308af3ff2b4dc75b502331e7c26045c040e1afc20a786ac552b04fbbd24b0a5`；符号含 `GXKActionHostForKey`、`GXKApplyTelemetryBlockIfNeeded`、`CCTClearcutLogger`、`BreakpadController`、`startCollectForDebugPeriodicUpload`、`insertText:`。
+- 测试包 `dist/gboard-gkx-1a779c5-unsigned.ipa`：36656841 字节，SHA256 `f3c6e2898901dc7525974f858ffcd730f26bcf55b5dad0bce68acd4e834dee78`。
+- 字节级复核：2051 成员 0 重复、`testzip()` 无错、无 `_CodeSignature`/`SC_Info`、包内 dylib 与 CI 产物同 SHA256 且 mode 0755、`LC_LOAD_DYLIB @rpath/libgkx.dylib` 与 `LC_RPATH @executable_path/../../Frameworks` 均在、`group.zunbengege.top` 在 dylib 1 处与 framework 8 处、旧 Google group 串 0、词库在 appex 与 Frameworks 各一份。
+
 ## 未验证
 
-- 编译：本机无 clang，需 GitHub Actions
 - 真机：性能体感、翻译/YouTube/天气可用性、换行与重输行为
