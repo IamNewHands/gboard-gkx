@@ -119,7 +119,10 @@ class ActionKeySourceContracts(unittest.TestCase):
         create = update.index("[UIButton buttonWithType:UIButtonTypeCustom]")
         self.assertLess(update.index("GXKDetachActionKey();", update.index("gEmojiSoftKeyView != currentKey")), create)
         self.assertIn("gActionSoftKeyDef != model", update)
-        self.assertIn("gActionKeyButton.superview != currentKey", update)
+        self.assertIn("gActionKeyButton.superview != host", update)
+        self.assertIn("GXKActionHostForKey(currentKey)", update)
+        self.assertNotIn("[currentKey addSubview:btn]", update)
+        self.assertIn("[currentKey convertRect:currentKey.bounds toView:host]", update)
         self.assertIn("gUpdatingActionKey", update)
 
     def test_native_theme_and_both_titles_keep_same_transparent_style(self):

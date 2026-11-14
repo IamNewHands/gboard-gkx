@@ -40,7 +40,7 @@
 - [最终验证脚本](<repo>/dist/verify-action-closeout-20261114.py>) 执行两套维护测试：20项[源码约束](<repo>/tests/test_action_key.py>) + 6项[原包NIB断言](<repo>/tests/test_native_resources.py>)，合计26项、0跳过，0.024s，OK，退出0。覆盖精确ID、九键优先、竞争布局拒绝、完整遍历、旧点击、原生外观/恢复、解绑后复选、空模型与新绑定当前前景。源码约束不是UIKit行为测试，固定SHA256原包模板不是新dylib效果证明。
 - 对基线HEAD逐个函数体执行相等断言：`GXKEnsureUserDictionaryDeployed`、`GXKIsComposingActive`、`GXKPerformClearComposing` 未改；App Group未改。构建、注入、词库转换文件的基线diff为空。`git diff --check` 退出0。
 - [gkx.m](<repo>/dylib/gkx.m>) 最终575行，SHA256 `42af496fc61a4fbb4dac1525c91c1b14e10951592b39674abd402743aa695006`。真实UIKit/iOS编译、真机布局/触摸/主题、CPU/内存与VoiceOver未执行；用户可见验收 needs-verification，证据等级C（源码/离线）。
-- GitHub上传/构建/发布未授权、未执行；没有新dylib/IPA，旧构建文件不作为本次产物。维护测试可独立按其头部命令运行；最终编排脚本是忽略目录内的本次验证辅助，不新增运行时依赖。
+- 本地提交时尚未获GitHub推送/构建授权；后来已获指定提交到main的普通推送、查看CI和下载匹配libgkx授权，后续执行证据见下文。仍没有本次新dylib/IPA，旧构建文件不作为本次产物。维护测试可独立按头部命令运行；最终编排脚本是忽略目录内的验证辅助，不新增运行时依赖。
 
 ## 独立审查与收敛
 
@@ -60,3 +60,48 @@
 已运行安装版 `aegis-workspace.py bundle --root <repo> --work 2026-11-14-action-key`：退出2，`error: artifact file does not exist: <repo>\docs\aegis\work\2026-11-14-action-key\task-intent-draft.json`。随后 `check --root <repo>`：退出1，要求完整adr/baseline/specs/plans目录和README/INDEX/BASELINE-GOVERNANCE文件。
 
 实际本次只使用3个Markdown的薄工作记录，不是已初始化的完整Aegis工作区；完整glob复核没有新增副作用。不为通过通用结构模板而扩张本任务到无关基线/ADR/计划家族。工具结果明确不通过/不适配，不能标成成功；该检查只检查其模板结构，不是业务源码或真机正确性门禁。
+
+## 已授权推送尝试与执行环境（2026-11-14，goal round 1）
+
+- 已获授权：普通推送 `8fd0dfd0b1a04ab912a2c60a7407a9b9f7acf669` 到 `https://github.com/IamNewHands/gboard-gkx.git` 的main，触发现有build-dylib、检查匹配SHA的CI并下载libgkx。无强推/Release/签名凭据读取授权。后续不重复索取相同授权。
+- 默认Git执行 `git -c http.sslBackend=openssl push origin HEAD:refs/heads/main`：退出128，`warning: Ignoring unavailable SSL backend 'openssl'; using 'schannel' instead`、`schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e)`；获一次操作权限的确切重试仍退出128，`error: failed to execute prompt script (exit code 1)`、`fatal: could not read Username for 'https://github.com': No such file or directory`。没有成功推送回执。
+- 公共仓库分支工具返回 `Error: GitHub resource not found. Check owner/repo spelling and that the repository is public.`；不能据此判定仓库不存在。已安装gh执行分支查询退出1，`Get "https://api.github.com/repos/IamNewHands/gboard-gkx/branches/main": EOF`，没有远端SHA证据。
+- 标准Git版本2.53.0.windows.1带OpenSSL3.5.5，非秘密配置显示credential.helper=manager。默认DSH niugit版本2.56.0.windows.4不支持指定OpenSSL。没有读取GCM密码、令牌或配置凭据值。
+- 本次忽略目录内[守卫推送脚本](<repo>/dist/publish-action-key-20261114.sh>) 固定标准Git路径、目标/HEAD检查、禁止交互，执行中退出128：`0 [main] sh (34428) C:\Program Files\Git\usr\bin\sh.exe: *** fatal error - couldn't create signal pipe, Win32 error 5`、`fatal: could not read Username for 'https://github.com': terminal prompts disabled`。工具同时给出 `EXECUTOR_UNAVAILABLE: the sandbox runtime failed before the command ran; this is not a user authorization denial. Restore the runtime or confinement provider; changing the DSH selector is not a repair. Do not bypass confinement.`。遵从retry:never，不重复该推送、不切换执行器绕过。
+- 失败后只读本地Git回读退出0：HEAD `8fd0dfd0b1a04ab912a2c60a7407a9b9f7acf669`，本地refs/remotes/origin/main `864f1e0d3968a38a419252febb2fcd3bbbc14fd8`；当时跟踪文件diff为空。该引用不是实时远端状态；后续仅检查点/本证据记录新增续跑信息，源码未变。
+
+## 浏览器只读恢复尝试与剩余诊断
+
+- web-access依赖检查未连接Chrome；browser_tabs返回无任务页。BrowserSkill start失败：`automatic daemon startup failed: cannot start an independent Windows daemon; the host may prohibit Job Object breakaway`，并明确建议持久受管任务 `bsk daemon start --foreground`；没有创建session，不存在需关闭的任务标签。
+- 命令帮助证实foreground受支持。启动受管job `bash-7e9027db38b64719`，命令 `BSK_AUTO_START=0 bsk daemon start --foreground --quiet`；从独立调用执行 `BSK_AUTO_START=0 bsk status --json` 退出2，提示守护进程不存在。
+- 已收集job结果：退出101，`initializing rolling file appender failed: InitError { context: "failed to create log file", source: Os { code: 5, kind: PermissionDenied, message: "拒绝访问。" } }`。任务已结束，无后台服务残留。具体日志文件目标未出现在错误中，不能臆断为既有目录权限损坏；不更改BSK_HOME、权限或绕过宿主限制。
+- 此处为切换权限前的历史状态：当时仅本地源码/离线检查完成，远端/CI未核实。用户随后自行将本会话切换到完全权限并明确要求重新尝试；这项输入变化后按既有推送授权重试成功，证据见下文。失败的前台浏览器job已收集并结束，后续GitHub工作使用Git/gh，不需要浏览器或修改其配置。
+
+## 完全权限下的已授权重试、编译与产物（2026-11-14）
+
+- 新输入：用户表示已开启完整权限并要求重新尝试；当前runtime证实 danger-full-access、禁止审批升级请求。没有自行改变权限策略，也没有请求再次升级。更新的工作区只有两份续跑记录，业务源码/测试未变；20项源码约束+6项原包NIB断言重跑均通过、0跳过，退出0，`git diff --check` 退出0。
+- 标准Git在该模式下先只读查询远端，得到基线SHA；随后普通推送精确对象 `8fd0dfd0b1a04ab912a2c60a7407a9b9f7acf669:refs/heads/main`，退出0。再次实时 `ls-remote origin refs/heads/main` 得到 `8fd0dfd0b1a04ab912a2c60a7407a9b9f7acf669`，退出0。没有执行守卫脚本的dirty-worktree推送或推送续跑记录，没有强推、Release或PR。
+- 匹配的 [build-dylib run 43574354437](<https://github.com/IamNewHands/gboard-gkx/actions/runs/43574354437>) 为push事件，head_sha与上述提交相同，status=completed、conclusion=success；checkout、Build libgkx.dylib、ldid、上传artifact各步骤均success。已读取完整日志：macOS 15.8.2 / Xcode 16.4 (16F6) / iPhoneOS SDK 18.5，编译 arm64、最低iOS 12、ARC/O2/hidden；`otool -L` 安装名为 `@rpath/libgkx.dylib`。编译步骤没有报告警告；Actions依赖有punycode/url.parse弃用提示以及Node20 actions被强制用Node24运行的维护告警，不是编译失败。
+- Artifact ID `14105651716`，name=libgkx，expired=false，workflow_run.id=`43574354437`、head_sha匹配；ZIP 15972字节、平台声明SHA256 `155647785809d3a67539ce1daf594e45f5e3ff8d63c1b47815dd8316cc39aa3d`。使用已安装gh下载指定artifact，不输出凭据值，没有配置更改。
+- [下载核验辅助](<repo>/dist/download-verify-libgkx-8fd0dfd.py>) 执行退出0：再次核对run/path/event/SHA及artifact关系、ZIP尺寸/SHA256、唯一成员libgkx.dylib和CRC；只写新专用目录、不覆盖旧产物、不执行目标二进制。核验 [libgkx.zip](<repo>/dist/libgkx-8fd0dfd/libgkx.zip>) 摘要与平台一致；[libgkx.dylib](<repo>/dist/libgkx-8fd0dfd/libgkx.dylib>) 78704字节，SHA256 `b5d455e2a0f5d72edd38892316f7d02b3db086194453bd179ea6b133a9adba26`。
+- 本地产物Mach-O结构核验：MH_DYLIB、arm64、安装名 `@rpath/libgkx.dylib`、最低iOS `12.0.0`、SDK `18.5.0`，UIKit/Foundation/CoreGraphics/ObjC/System/CoreFoundation依赖；嵌入签名superblob的范围合法（offset 77232、1472字节、3 entries）。仅证明签名容器存在及边界，不验证签名可信或提取证书/entitlement；没有读取用户签名凭据。
+- [产物核验回执](<repo>/dist/libgkx-8fd0dfd/verification.json>) 保存上述谱系与摘要。推送、既有macOS构建检查、匹配dylib下载与核验均已在此记录；未做最终用户签名、未验证真机布局/触摸/主题/VoiceOver。
+
+## 本地未签名测试包（2026-11-14，goal round 3）
+
+- 用户在同一会话继续要求推进（“继续”），据此在本机执行既有注入流程生成测试包；不读取签名凭据、不发布Release、不改认证配置、不覆盖既有IPA文件。
+- 输入核对（`sha256sum` 退出0）：原始包 `<local>/Gboard_2.3.19.ipa` = `c011730153df537f226052e766bbbf71834b5afcfeb13cba12f365d049719731`；CI产物 `dist/libgkx-8fd0dfd/libgkx.dylib` = `b5d455e2a0f5d72edd38892316f7d02b3db086194453bd179ea6b133a9adba26`；词库 `dist/user_dictionary.db` 1688094字节。
+- 执行 `tools/inject.py --ipa … --dylib … --dict … --app-group group.zunbengege.top --out dist/gboard-gkx-8fd0dfd-unsigned.ipa`，退出0：注入 `Payload/Gboard.app/PlugIns/Gboard.appex/Gboard`，`add=added ncmds=48 sizeofcmds=0x17f8 验证=OK`；dylib落点 `Payload/Gboard.app/Frameworks/libgkx.dylib`（rpath `@executable_path/../../Frameworks`）；词库写入Frameworks与appex两处；删除3个旧签名目录；app group改写 `gboard_framework` 8处 + dylib 1处。
+- [新包](<repo>/dist/gboard-gkx-8fd0dfd-unsigned.ipa>) 34.96 MB（36651622→新文件），SHA256 `0876416ed6e6ee425607ddfbbe9d6f03b1dddee0c7a84bf42cc64576544fc1db`。
+- [打包核验辅助](<repo>/dist/verify-ipa-8fd0dfd.py>) 执行退出0，断言全部通过：ZIP CRC完整、2051个成员无重复、无 `_CodeSignature`/`SC_Info` 残留；`libgkx.dylib` 字节SHA与CI产物一致、权限 `0755`；扩展可执行文件 `0755`；`LC_LOAD_DYLIB` 含 `@rpath/libgkx.dylib`；`gboard_framework` 含 `group.zunbengege.top\0` 且不含 `group.com.google.keyboard`/`group.com.google.common` 旧串。
+- 该核验证明包结构、注入与App Group改写符合预期，不证明iOS签名可用、dylib加载成功或真机按键行为。用户可见验收仍为 needs-verification。
+
+## 真机反馈：空闲态点「换行」仍进表情页（2026-11-14，goal round 4）
+
+- 用户真机结论（唯一需求）：未开始输入时点「换行」，实际仍进入表情页面，只是外观显示为换行；有输入时「重输」已测正常，不需调整。据此把本轮范围限定为「空闲态点击必须真正插入换行」，不触碰组字检测、词库、几何与原生回车。
+- 反汇编取证（复用自研ARM64反汇编器，按LC_FUNCTION_STARTS切边界）：`-[GKBSoftKeyView hitTest:withEvent:]`（vm `0x10027deb8`–`0x10027df3c`，SHA256 `53fbe4f4fc9f7c7f2c3676104ff0f94b11125f4a15b09d03eebbcb62699e43a6`）只有三段：`isHidden` 为真返回 nil、`_softKeyDef` 为 nil 返回 nil、否则 `CGRectContainsPoint(self.bounds, point)` 返回 self 或 nil；**不调用 super、不遍历 subviews**。因此旧实现 `[currentKey addSubview:btn]` 的透明按钮永远不参与命中，触摸落到原生 GKBSoftKeyView 本身并触发原生表情 action。这是「看起来是换行、实际进表情页」的直接机制，也是为什么换行文本 `@"\n"` 本身没有问题的原因。
+- 派发链取证（同一二进制全量 `__objc_classlist` 612 类扫描）：`hitTest:withEvent:` 覆盖只存在于 GKBSoftKeyView / GKBHeaderLogoView / GKBCircleView / EMOPopupBubble；GKBKeyboardViewContainerView 与 GKBSoftKeyboardView / GKB9KeysSoftKeyboardView 均无覆盖，键盘子树走默认 UIKit 命中（最深子视图优先）。GKBSoftKeyView 方法表无 touches*，触摸沿响应链上浮到 GKBKeyboardViewContainerView 的 touchesBegan 再经 GKBTapTouchHandler 派发——正常键点击即此路径。
+- 修复（CanonicalOwner 仍是 gkx.m 的目标键解析与覆盖层生命周期）：新增 `GXKActionHostForKey`，从 `key.superview` 上浮取第一个非 `GKBSoftKeyView` 的祖先作为宿主；覆盖按钮改为宿主的同级子视图，frame 用 `[currentKey convertRect:currentKey.bounds toView:host]` 每帧换算，`autoresizingMask` 改为 None，置顶改为宿主 `bringSubviewToFront:`；点击与每帧刷新都重新解析宿主，宿主缺失即解绑。不 swizzle touches*/hitTest、不隐藏原生子视图、不猜坐标、不写 softKeyDef、不动全局 touches 链。
+- 契约同步：`tests/test_action_key.py` 的 `test_rebinding_creates_fresh_button_after_detaching` 由断言 `gActionKeyButton.superview != currentKey` 改为四条宿主语义断言（`!= host`、`GXKActionHostForKey(currentKey)`、不含 `[currentKey addSubview:btn]`、含 `convertRect:currentKey.bounds toView:host`），保留「按钮不再是 currentKey 子视图」的原意。
+- 离线回归：`python tests/test_action_key.py` 20项 OK；`python tests/test_native_resources.py` 6项 OK；合计26项、0跳过、退出0；`git diff --check` 退出0；`gkx.m` 花括号 89/89 平衡、`GXKActionHostForKey` 唯一定义。证据等级仍为C（源码/离线）：UIKit 实际命中与真机按键行为未执行，Windows 无 clang 无法本地编译。
+- 未执行：推送、CI 构建、IPA 打包、真机验收；本轮无 GitHub 推送授权，等待用户裁决。

@@ -235,6 +235,18 @@ static UIView *GXKNineKeyBodyForKey(UIView *key, UIView *root) {
     return nil;
 }
 
+// 覆盖按钮的宿主：GKBSoftKeyView的hitTest只判自身bounds、从不返回子视图，
+// 所以按钮必须是键的祖先视图的子视图，才能成为命中链上最深的一层。
+static UIView *GXKActionHostForKey(UIView *key) {
+    if (!key) return nil;
+    Class keyClass = NSClassFromString(@"GKBSoftKeyView");
+    for (UIView *v = key.superview; v; v = v.superview) {
+        if (keyClass && [v isKindOfClass:keyClass]) continue; // 嵌套键：继续上浮到真正容器。
+        return v;
+    }
+    return nil;
+}
+
 static BOOL GXKKeyIsVisible(UIView *key, UIView *root) {
     if (!root.window || key.window != root.window || CGRectIsEmpty(key.bounds)) return NO;
     CGRect visibleRect = CGRectIntersection(root.bounds, [key convertRect:key.bounds toView:root]);
@@ -370,7 +382,9 @@ static void GXKUpdateActionKey(UIViewController *vc);
     UIViewController *vc = gCurrentVC;
     if (!vc || ![vc isKindOfClass:[UIInputViewController class]] || sender != gActionKeyButton) return;
     UIView *key = GXKFindNineKeyEmojiKey(vc.view);
-    if (!key || key != gEmojiSoftKeyView || sender.superview != key ||
+    // 覆盖按钮挂在键的宿主容器上：GKBSoftKeyView的hitTest只判自身bounds、从不返回子视图。
+    UIView *host = GXKActionHostForKey(key);
+    if (!key || !host || key != gEmojiSoftKeyView || sender.superview != host ||
         GXKNativeIconForKey(key) != gActionNativeIcon ||
         ((id<GXKNativeSoftKeyContent>)key).softKeyDef != gActionSoftKeyDef ||
         !GXKModelHasNativeActions(gActionSoftKeyDef)) {
@@ -417,8 +431,14 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         return;
     }
 
+    UIView *host = GXKActionHostForKey(currentKey);
+    if (!host) {
+        GXKDetachActionKey();
+        gUpdatingActionKey = NO;
+        return;
+    }
     if (gEmojiSoftKeyView != currentKey || gActionNativeIcon != icon || gActionSoftKeyDef != model ||
-        !gActionKeyButton || gActionKeyButton.superview != currentKey) {
+        !gActionKeyButton || gActionKeyButton.superview != host) {
         GXKDetachActionKey();
         // 原生updateView会应用布局/可见性属性：重新验证控制器、root及完整当前目标。
         if (vc != gCurrentVC || !vc.isViewLoaded || vc.view != root) {
@@ -437,6 +457,12 @@ static void GXKUpdateActionKey(UIViewController *vc) {
             gUpdatingActionKey = NO;
             return;
         }
+        // 重扫后键可能换了宿主容器：按新键重新解析，不能沿用旧键的宿主。
+        host = GXKActionHostForKey(currentKey);
+        if (!host) {
+            gUpdatingActionKey = NO;
+            return;
+        }
         if (!gActionTarget) gActionTarget = [[GXKActionKeyTarget alloc] init];
         // 每次新绑定使用新按钮，旧TouchUp不能跟随复用的UIButton落到另一个键。
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -446,13 +472,15 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         btn.showsTouchWhenHighlighted = NO;
         btn.titleLabel.adjustsFontSizeToFitWidth = YES;
         btn.titleLabel.minimumScaleFactor = 0.85;
-        btn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        btn.autoresizingMask = UIViewAutoresizingNone; // 每帧按currentKey换算frame，不随父视图拉伸。
         [btn addTarget:gActionTarget action:@selector(onActionKeyTapped:) forControlEvents:UIControlEventTouchUpInside];
         gEmojiSoftKeyView = currentKey;
         gActionNativeIcon = icon;
         gActionSoftKeyDef = model;
         gActionKeyButton = btn;
-        [currentKey addSubview:btn];
+        // 挂在宿主容器：GKBSoftKeyView的hitTest只做自身bounds判定，其子视图永不参与命中。
+        [host addSubview:btn];
+        btn.frame = [currentKey convertRect:currentKey.bounds toView:host];
     }
 
     // 仅保留两张前景UIImage；原生重绘产生新图时更新引用，不存通用视图快照。
@@ -466,7 +494,9 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         icon.highlightedImage = nil;
     }
     UIButton *btn = gActionKeyButton;
-    if (!CGRectEqualToRect(btn.frame, currentKey.bounds)) btn.frame = currentKey.bounds;
+    if (btn.superview != host) [host addSubview:btn];
+    CGRect targetRect = [currentKey convertRect:currentKey.bounds toView:host];
+    if (!CGRectEqualToRect(btn.frame, targetRect)) btn.frame = targetRect;
     UIFont *font = GXKNativeActionFont(currentKey, root);
     if (![btn.titleLabel.font isEqual:font]) btn.titleLabel.font = font;
     if (![[btn titleColorForState:UIControlStateNormal] isEqual:color]) {
@@ -480,7 +510,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         btn.accessibilityLabel = title;
     }
     if (btn.hidden) btn.hidden = NO;
-    if (currentKey.subviews.lastObject != btn) [currentKey bringSubviewToFront:btn];
+    if (host.subviews.lastObject != btn) [host bringSubviewToFront:btn];
     gUpdatingActionKey = NO;
 }
 
