@@ -89,9 +89,13 @@ static BOOL GXKIsComposingActive(UIViewController *vc) {
     // 先快速检查 textDocumentProxy 是否包含 markedText
     if ([vc isKindOfClass:[UIInputViewController class]]) {
         UIInputViewController *ivc = (UIInputViewController *)vc;
-        if ([ivc.textDocumentProxy respondsToSelector:@selector(markedText)]) {
-            NSString *mt = [ivc.textDocumentProxy valueForKey:@"markedText"];
-            if (mt.length > 0) return YES;
+        NSObject *proxy = (NSObject *)ivc.textDocumentProxy;
+        if ([proxy respondsToSelector:NSSelectorFromString(@"markedText")]) {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            NSString *mt = [proxy performSelector:NSSelectorFromString(@"markedText")];
+            #pragma clang diagnostic pop
+            if (mt && [mt isKindOfClass:[NSString class]] && mt.length > 0) return YES;
         }
     }
 
@@ -185,8 +189,10 @@ static void GXKPerformClearComposing(UIViewController *vc) {
     // 4. 清除宿主 markedText
     if ([vc isKindOfClass:[UIInputViewController class]]) {
         UIInputViewController *ivc = (UIInputViewController *)vc;
-        if ([ivc.textDocumentProxy respondsToSelector:@selector(unmarkText)]) {
-            [ivc.textDocumentProxy unmarkText];
+        if (@available(iOS 13.0, *)) {
+            if ([ivc.textDocumentProxy respondsToSelector:@selector(unmarkText)]) {
+                [ivc.textDocumentProxy unmarkText];
+            }
         }
     }
 }
