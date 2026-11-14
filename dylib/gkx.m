@@ -42,8 +42,17 @@ static UIImage *gActionNormalImage;
 static UIImage *gActionHighlightedImage;
 static id gActionSoftKeyDef;
 static UIButton *gActionKeyButton;
+static __weak UIView *gActionHost;
 static NSTimer *gStatePollTimer;
 static BOOL gUpdatingActionKey;
+
+// 组字状态缓存：全树扫描只在布局/文本事件里跑，0.2s轮询只读缓存。
+static BOOL gComposingActive;
+// 词库部署一次性：本进程内成功比对/拷贝后不再重复访问磁盘。
+static BOOL gDictDeploySettled;
+// 触觉复用：避免每次点击分配generator并丢失prepare预热。
+static UIImpactFeedbackGenerator *gFbMedium;
+static UIImpactFeedbackGenerator *gFbLight;
 
 // 原实现函数指针
 static void (*gOrigViewDidAppear)(id, SEL, BOOL);
@@ -55,6 +64,7 @@ static void (*gOrigTextDidChange)(id, SEL, id);
 #pragma mark - 外部词库自动部署 (防 Jetsam 轻量版)
 
 static void GXKEnsureUserDictionaryDeployed(void) {
+    if (gDictDeploySettled) return; // 本进程已确认部署一致，不再访问磁盘。
     NSFileManager *fm = [NSFileManager defaultManager];
     NSURL *containerURL = [fm containerURLForSecurityApplicationGroupIdentifier:GXKGroup];
     if (!containerURL) {
@@ -97,20 +107,22 @@ static void GXKEnsureUserDictionaryDeployed(void) {
         [fm removeItemAtURL:targetDBURL error:nil];
         NSError *err = nil;
         if ([fm copyItemAtPath:bundlePath toPath:targetDBURL.path error:&err]) {
+            gDictDeploySettled = YES;
             GXK_LOG(@"[+] 词库部署成功: %@", targetDBURL.path);
         } else {
             GXK_LOG(@"[!] 词库部署失败: %@", err.localizedDescription);
         }
+    } else {
+        gDictDeploySettled = YES; // 包内与目标已一致，后续弹键盘无需再比对。
     }
 }
 
 #pragma mark - 拼音输入状态判定 (Composing)
 
-static BOOL GXKIsComposingActive(UIViewController *vc) {
-    if (!vc || !vc.view) return NO;
-    UIView *root = vc.view;
-
-    // 先快速检查 textDocumentProxy 是否包含 markedText
+// 组字状态有两个来源：代理层markedText是O(1)权威值；视图树扫描代价高，
+// 只在布局/文本事件里跑一次并写入gComposingActive，轮询只读缓存。
+static BOOL GXKComposingFromProxy(UIViewController *vc) {
+    if (!vc) return NO;
     if ([vc isKindOfClass:[UIInputViewController class]]) {
         UIInputViewController *ivc = (UIInputViewController *)vc;
         NSObject *proxy = (NSObject *)ivc.textDocumentProxy;
@@ -122,6 +134,12 @@ static BOOL GXKIsComposingActive(UIViewController *vc) {
             if (mt && [mt isKindOfClass:[NSString class]] && mt.length > 0) return YES;
         }
     }
+    return NO;
+}
+
+static BOOL GXKComposingFullScan(UIViewController *vc) {
+    if (!vc || !vc.view) return NO;
+    UIView *root = vc.view;
 
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     int guard = 0;
@@ -169,6 +187,20 @@ static BOOL GXKIsComposingActive(UIViewController *vc) {
         [stack addObjectsFromArray:v.subviews];
     }
     return NO;
+}
+
+// 事件驱动的状态刷新：代理有mark就是YES（O(1)）；否则跑一次全树。
+static void GXKRefreshComposingState(UIViewController *vc) {
+    if (!vc) { gComposingActive = NO; return; }
+    if (GXKComposingFromProxy(vc)) { gComposingActive = YES; return; }
+    gComposingActive = GXKComposingFullScan(vc);
+}
+
+// 轮询与刷新用：优先读缓存，代理层已明确有mark时立即纠正缓存。
+static BOOL GXKComposingStateCached(UIViewController *vc) {
+    if (!vc) return NO;
+    if (GXKComposingFromProxy(vc)) { gComposingActive = YES; return YES; }
+    return gComposingActive;
 }
 
 #pragma mark - 清空拼音 (重输)
@@ -352,6 +384,7 @@ static void GXKDetachActionKey(void) {
     gActionNormalImage = nil;
     gActionHighlightedImage = nil;
     gActionSoftKeyDef = nil;
+    gActionHost = nil;
     gActionKeyButton = nil;
     [oldButton removeFromSuperview];
     if (oldKey && [oldKey respondsToSelector:@selector(updateView)]) {
@@ -369,6 +402,27 @@ static void GXKDetachActionKey(void) {
         }
     }
     gUpdatingActionKey = wasUpdating;
+}
+
+#pragma mark - 触觉反馈 (复用 + prepare 预热)
+
+static void GXKImpact(UIImpactFeedbackStyle style) {
+    if (@available(iOS 10.0, *)) {
+        if (style == UIImpactFeedbackStyleMedium) {
+            if (!gFbMedium) gFbMedium = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+            [gFbMedium impactOccurred];
+            [gFbMedium prepare]; // 为下一次点击预热，缩短延迟。
+        } else {
+            if (!gFbLight) gFbLight = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+            [gFbLight impactOccurred];
+            [gFbLight prepare];
+        }
+    }
+}
+
+static void GXKReleaseHaptics(void) {
+    gFbMedium = nil;
+    gFbLight = nil;
 }
 
 @interface GXKActionKeyTarget : NSObject
@@ -393,19 +447,15 @@ static void GXKUpdateActionKey(UIViewController *vc);
     }
     UIInputViewController *ivc = (UIInputViewController *)vc;
     id<UITextDocumentProxy> proxy = ivc.textDocumentProxy;
-    BOOL composing = GXKIsComposingActive(vc);
+    // 点击是低频事件：这里取一次真实状态，避免用轮询缓存的陈旧值决定重输/换行。
+    GXKRefreshComposingState(vc);
+    BOOL composing = gComposingActive;
     if (composing) {
         GXKPerformClearComposing(vc); // 保留原有「重输」能力。
-        if (@available(iOS 10.0, *)) {
-            UIImpactFeedbackGenerator *fb = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-            [fb impactOccurred];
-        }
+        GXKImpact(UIImpactFeedbackStyleMedium);
     } else {
         if (proxy) [proxy insertText:@"\n"];
-        if (@available(iOS 10.0, *)) {
-            UIImpactFeedbackGenerator *fb = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-            [fb impactOccurred];
-        }
+        GXKImpact(UIImpactFeedbackStyleLight);
     }
     __weak UIViewController *weakVC = vc;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
@@ -421,6 +471,48 @@ static void GXKUpdateActionKey(UIViewController *vc) {
     if (gUpdatingActionKey || !vc || vc != gCurrentVC || !vc.isViewLoaded) return;
     gUpdatingActionKey = YES;
     UIView *root = vc.view;
+
+    // 廉价路径：绑定仍然有效时只刷新标题/位置，不做全树定位。
+    // 任一条不成立就落回完整路径，失败闭合语义不变。
+    if (gEmojiSoftKeyView && gActionNativeIcon && gActionSoftKeyDef && gActionKeyButton && gActionHost &&
+        gActionKeyButton.superview == gActionHost &&
+        [gEmojiSoftKeyView.restorationIdentifier isEqualToString:GXKEmojiKeyID] &&
+        GXKActionHostForKey(gEmojiSoftKeyView) == gActionHost &&
+        [gEmojiSoftKeyView isDescendantOfView:root] &&
+        GXKKeyIsVisible(gEmojiSoftKeyView, root) &&
+        GXKNativeIconForKey(gEmojiSoftKeyView) == gActionNativeIcon &&
+        ((id<GXKNativeSoftKeyContent>)gEmojiSoftKeyView).softKeyDef == gActionSoftKeyDef &&
+        GXKModelHasNativeActions(gActionSoftKeyDef)) {
+        UIButton *cheapBtn = gActionKeyButton;
+        UIView<GXKNativeIconContent> *cheapIcon = gActionNativeIcon;
+        // 原生updateView可能重画前景图：继续把图搬走，否则会盖在我们的文字下。
+        if (cheapIcon.image) {
+            gActionNormalImage = cheapIcon.image;
+            cheapIcon.image = nil;
+        }
+        if (cheapIcon.highlightedImage) {
+            gActionHighlightedImage = cheapIcon.highlightedImage;
+            cheapIcon.highlightedImage = nil;
+        }
+        CGRect cheapRect = [gEmojiSoftKeyView convertRect:gEmojiSoftKeyView.bounds toView:gActionHost];
+        if (!CGRectEqualToRect(cheapBtn.frame, cheapRect)) cheapBtn.frame = cheapRect;
+        if (gActionHost.subviews.lastObject != cheapBtn) [gActionHost bringSubviewToFront:cheapBtn];
+        UIColor *cheapColor = cheapIcon.foregroundColor;
+        if ([cheapColor isKindOfClass:[UIColor class]] &&
+            ![[cheapBtn titleColorForState:UIControlStateNormal] isEqual:cheapColor]) {
+            [cheapBtn setTitleColor:cheapColor forState:UIControlStateNormal];
+            [cheapBtn setTitleColor:cheapColor forState:UIControlStateHighlighted];
+        }
+        NSString *cheapTitle = GXKComposingStateCached(vc) ? @"重输" : @"换行";
+        if (![[cheapBtn titleForState:UIControlStateNormal] isEqualToString:cheapTitle]) {
+            [cheapBtn setTitle:cheapTitle forState:UIControlStateNormal];
+            [cheapBtn setTitle:cheapTitle forState:UIControlStateHighlighted];
+            cheapBtn.accessibilityLabel = cheapTitle;
+        }
+        gUpdatingActionKey = NO;
+        return;
+    }
+
     UIView *currentKey = GXKFindNineKeyEmojiKey(root);
     UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(currentKey);
     id model = icon ? ((id<GXKNativeSoftKeyContent>)currentKey).softKeyDef : nil;
@@ -477,6 +569,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         gEmojiSoftKeyView = currentKey;
         gActionNativeIcon = icon;
         gActionSoftKeyDef = model;
+        gActionHost = host;
         gActionKeyButton = btn;
         // 挂在宿主容器：GKBSoftKeyView的hitTest只做自身bounds判定，其子视图永不参与命中。
         [host addSubview:btn];
@@ -494,6 +587,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         icon.highlightedImage = nil;
     }
     UIButton *btn = gActionKeyButton;
+    gActionHost = host; // 廉价路径依赖该宿主引用，绑定未重建时也要补齐。
     if (btn.superview != host) [host addSubview:btn];
     CGRect targetRect = [currentKey convertRect:currentKey.bounds toView:host];
     if (!CGRectEqualToRect(btn.frame, targetRect)) btn.frame = targetRect;
@@ -503,7 +597,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         [btn setTitleColor:color forState:UIControlStateNormal];
         [btn setTitleColor:color forState:UIControlStateHighlighted];
     }
-    NSString *title = GXKIsComposingActive(vc) ? @"重输" : @"换行";
+    NSString *title = GXKComposingStateCached(vc) ? @"重输" : @"换行";
     if (![[btn titleForState:UIControlStateNormal] isEqualToString:title]) {
         [btn setTitle:title forState:UIControlStateNormal];
         [btn setTitle:title forState:UIControlStateHighlighted];
@@ -516,24 +610,34 @@ static void GXKUpdateActionKey(UIViewController *vc) {
 
 #pragma mark - 视图控制器生命周期 Hook
 
+static void GXKApplyTelemetryBlockIfNeeded(void);
+
 static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
     if (gOrigTextDidChange) gOrigTextDidChange(self, _cmd, textInput);
     __weak UIViewController *weakVC = (UIViewController *)self;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *vc = weakVC;
-        if (vc && vc == gCurrentVC) GXKUpdateActionKey(vc);
+        if (vc && vc == gCurrentVC) {
+            GXKRefreshComposingState(vc); // 组字状态只在此处与布局事件里全树扫描一次。
+            GXKUpdateActionKey(vc);
+        }
     });
 }
 
 static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
     if (gOrigViewDidLayoutSubviews) gOrigViewDidLayoutSubviews(self, _cmd);
-    if ((UIViewController *)self == gCurrentVC) GXKUpdateActionKey((UIViewController *)self);
+    if ((UIViewController *)self == gCurrentVC) {
+        GXKRefreshComposingState((UIViewController *)self);
+        GXKUpdateActionKey((UIViewController *)self);
+    }
 }
 
 static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     if (gOrigViewWillAppear) gOrigViewWillAppear(self, _cmd, animated);
     if ((UIViewController *)self != gCurrentVC) GXKDetachActionKey();
     gCurrentVC = (UIViewController *)self;
+    GXKRefreshComposingState((UIViewController *)self); // 新会话先取一次真实组字状态。
+    GXKApplyTelemetryBlockIfNeeded(); // 兜底：构造函数时framework若未就绪，这里补一次。
 
     // 部署外部万象词库
     GXKEnsureUserDictionaryDeployed();
@@ -552,16 +656,74 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
     // 先撤销当前绑定，原生生命周期引起的布局/异步事件不得重建旧按钮。
     if ((UIViewController *)self == gCurrentVC) {
         gCurrentVC = nil;
+        gComposingActive = NO; // 扩展隐藏后组字缓存作废，下次出现重新采样。
         [gStatePollTimer invalidate];
         gStatePollTimer = nil;
         GXKDetachActionKey();
+        GXKReleaseHaptics(); // 扩展隐藏后不常驻触觉引擎。
     }
     if (gOrigViewWillDisappear) gOrigViewWillDisappear(self, _cmd, animated);
 }
 
 static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (gOrigViewDidAppear) gOrigViewDidAppear(self, _cmd, animated);
-    if ((UIViewController *)self == gCurrentVC) GXKUpdateActionKey((UIViewController *)self);
+    if ((UIViewController *)self == gCurrentVC) {
+        GXKRefreshComposingState((UIViewController *)self);
+        GXKUpdateActionKey((UIViewController *)self);
+    }
+}
+
+#pragma mark - 隐私上报拦截 (只掐 clearcut 与 Breakpad 上报)
+
+// 只替换上报出口本身，不碰初始化、自检、返回值被使用的入口。
+// 翻译(translation.googleapis.com)、YouTube(www.googleapis.com/youtube)、天气(www.weather.com)
+// 走完全不同的链路，不受影响。
+static void gxk_noop_void(id self, SEL _cmd) {}
+static void gxk_noop_void_obj(id self, SEL _cmd, id obj) {}
+static void gxk_noop_void_bool(id self, SEL _cmd, BOOL flag) {}
+static void gxk_noop_void_u64(id self, SEL _cmd, unsigned long long v) {}
+static void gxk_noop_void_u64_u64(id self, SEL _cmd, unsigned long long a, unsigned long long b) {}
+static BOOL gxk_noop_bool_no(id self, SEL _cmd) { return NO; }
+
+// 逐条替换；类或方法不存在就跳过，换新版Gboard时自然降级为不拦截。
+static void GXKDisableOne(NSString *className, NSString *selName, IMP imp) {
+    Class cls = NSClassFromString(className);
+    if (!cls) return;
+    SEL sel = NSSelectorFromString(selName);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    method_setImplementation(m, imp);
+}
+
+static void GXKDisableTelemetryUpload(void) {
+    // CCTClearcutLogger：事件根本不落盘，上游埋点自然失效。
+    GXKDisableOne(@"CCTClearcutLogger", @"log:", (IMP)gxk_noop_void_obj);
+    GXKDisableOne(@"CCTClearcutLogger", @"logWithExtension:", (IMP)gxk_noop_void_obj);
+    GXKDisableOne(@"CCTClearcutLogger", @"logCounters:", (IMP)gxk_noop_void_obj);
+    // CCTClearcutUploader：不启动任何自动/周期上传。
+    GXKDisableOne(@"CCTClearcutUploader", @"startAutoUpload", (IMP)gxk_noop_void);
+    GXKDisableOne(@"CCTClearcutUploader", @"startPeriodicUploadWithTimeInterval:", (IMP)gxk_noop_void_u64);
+    GXKDisableOne(@"CCTClearcutUploader", @"startPeriodicUploadWithTimeInterval:leeway:",
+                  (IMP)gxk_noop_void_u64_u64);
+    GXKDisableOne(@"CCTClearcutUploader", @"startAutoUploadOnBackground", (IMP)gxk_noop_void);
+    GXKDisableOne(@"CCTClearcutUploader", @"startAutoUploadOnForegroundWithDelay:", (IMP)gxk_noop_void_u64);
+    GXKDisableOne(@"CCTClearcutUploader", @"startCollectForDebugPeriodicUpload", (IMP)gxk_noop_void);
+    // GKBClearcutUploader：扩展自身的上传入口。
+    GXKDisableOne(@"GKBClearcutUploader", @"uploadClearcutLogs", (IMP)gxk_noop_void);
+    GXKDisableOne(@"GKBClearcutUploader", @"shouldUploadClearcutLogs", (IMP)gxk_noop_bool_no);
+    // Breakpad：不启动崩溃捕获，历史残留也不补发。
+    GXKDisableOne(@"BreakpadController", @"start:", (IMP)gxk_noop_void_bool);
+    GXKDisableOne(@"BreakpadController", @"sendStoredCrashReports", (IMP)gxk_noop_void);
+    GXK_LOG(@"[*] 隐私上报已拦截 (clearcut + Breakpad)");
+}
+
+// 幂等入口：framework在构造函数阶段可能尚未加载，首次viewWillAppear再补一次。
+static void GXKApplyTelemetryBlockIfNeeded(void) {
+    static BOOL blocked = NO;
+    if (blocked) return;
+    if (!NSClassFromString(@"CCTClearcutLogger") && !NSClassFromString(@"BreakpadController")) return;
+    GXKDisableTelemetryUpload();
+    blocked = YES;
 }
 
 #pragma mark - dylib 构造入口
@@ -602,4 +764,7 @@ static void gkx_init(void) {
             method_setImplementation(mText, (IMP)gkx_textDidChange);
         }
     }
+
+    // 只掐无意义上报；翻译/YouTube/天气不受影响。
+    GXKApplyTelemetryBlockIfNeeded();
 }
