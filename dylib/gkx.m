@@ -9,6 +9,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <string.h>
 
 #define GXK_LOG(fmt, ...) NSLog(@"[GXK] " fmt, ##__VA_ARGS__)
 #define GXK_ACTION_TAG 0x47584B41  // 'GXKA'
@@ -45,6 +46,8 @@ static UIButton *gActionKeyButton;
 static __weak UIView *gActionHost;
 static NSTimer *gStatePollTimer;
 static BOOL gUpdatingActionKey;
+// 按需轮询剩余补帧次数：事件把它抬高，归零后停表，空闲时零唤醒。
+static NSInteger gPollTicks;
 
 // 组字状态缓存：全树扫描只在布局/文本事件里跑，0.2s轮询只读缓存。
 static BOOL gComposingActive;
@@ -425,6 +428,36 @@ static void GXKReleaseHaptics(void) {
     gFbLight = nil;
 }
 
+#pragma mark - 按需轮询 (事件驱动，空闲即停表)
+
+static void GXKUpdateActionKey(UIViewController *vc);
+
+// 一次事件后只保留约 3 秒的补帧窗口；窗口内没有新事件就停表，不再每秒空唤醒 5 次。
+#define GXK_POLL_BURST 15
+
+static void GXKStopPolling(void) {
+    if (gStatePollTimer) {
+        [gStatePollTimer invalidate];
+        gStatePollTimer = nil;
+    }
+    gPollTicks = 0;
+}
+
+static void GXKBumpPolling(NSInteger ticks) {
+    if (ticks > gPollTicks) gPollTicks = ticks;
+    if (gStatePollTimer || gPollTicks <= 0 || !gCurrentVC) return;
+    gStatePollTimer = [NSTimer scheduledTimerWithTimeInterval:0.20 repeats:YES block:^(NSTimer *timer) {
+        UIViewController *vc = gCurrentVC;
+        if (!vc || gPollTicks <= 0) { // 没有待刷新内容：停表，等下一个事件再启动。
+            GXKStopPolling();
+            return;
+        }
+        gPollTicks--;
+        GXKUpdateActionKey(vc);
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:gStatePollTimer forMode:NSRunLoopCommonModes];
+}
+
 @interface GXKActionKeyTarget : NSObject
 - (void)onActionKeyTapped:(UIButton *)sender;
 @end
@@ -462,6 +495,7 @@ static void GXKUpdateActionKey(UIViewController *vc);
         UIViewController *currentVC = weakVC;
         if (currentVC && currentVC == gCurrentVC) GXKUpdateActionKey(currentVC);
     });
+    GXKBumpPolling(GXK_POLL_BURST); // 原生刷新可能在点击后几帧才到，给补帧窗口。
 }
 @end
 
@@ -620,6 +654,7 @@ static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
         if (vc && vc == gCurrentVC) {
             GXKRefreshComposingState(vc); // 组字状态只在此处与布局事件里全树扫描一次。
             GXKUpdateActionKey(vc);
+            GXKBumpPolling(GXK_POLL_BURST); // 输入后给一小段补帧窗口。
         }
     });
 }
@@ -643,13 +678,8 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     GXKEnsureUserDictionaryDeployed();
 
     // 轮询只补足组字/原生主题内容刷新；布局切换由layout回调立即重新定位。
-    if (!gStatePollTimer) {
-        gStatePollTimer = [NSTimer scheduledTimerWithTimeInterval:0.20 repeats:YES block:^(NSTimer *timer) {
-            UIViewController *vc = gCurrentVC;
-            if (vc) GXKUpdateActionKey(vc);
-        }];
-        [[NSRunLoop mainRunLoop] addTimer:gStatePollTimer forMode:NSRunLoopCommonModes];
-    }
+    // 这里只给一小段补帧窗口，窗口走完自动停表。
+    GXKBumpPolling(GXK_POLL_BURST);
 }
 
 static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
@@ -657,8 +687,7 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
     if ((UIViewController *)self == gCurrentVC) {
         gCurrentVC = nil;
         gComposingActive = NO; // 扩展隐藏后组字缓存作废，下次出现重新采样。
-        [gStatePollTimer invalidate];
-        gStatePollTimer = nil;
+        GXKStopPolling();
         GXKDetachActionKey();
         GXKReleaseHaptics(); // 扩展隐藏后不常驻触觉引擎。
     }
@@ -670,6 +699,7 @@ static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     if ((UIViewController *)self == gCurrentVC) {
         GXKRefreshComposingState((UIViewController *)self);
         GXKUpdateActionKey((UIViewController *)self);
+        GXKBumpPolling(GXK_POLL_BURST);
     }
 }
 
@@ -717,12 +747,38 @@ static void GXKDisableTelemetryUpload(void) {
     GXK_LOG(@"[*] 隐私上报已拦截 (clearcut + Breakpad)");
 }
 
+// 通用空实现：埋点方法参数从 0 个到 16 个不等，多余实参在 ARM64 上不读取即可。
+static void gxk_noop_any(id self, SEL _cmd, ...) {}
+
+// GKBClearcutClient：78 个 log* 埋点入口全部置空，事件不再构造。
+// 运行时枚举方法表，只处理「名字以 log 开头且返回 void」的方法；
+// 有返回值的读方法(isEnabled/isRegexRule:/featureFlagEventsForDailyLog 等)一律不动。
+static void GXKDisableClearcutClientEvents(void) {
+    Class cls = NSClassFromString(@"GKBClearcutClient");
+    if (!cls) return;
+    unsigned int total = 0;
+    Method *methods = class_copyMethodList(cls, &total);
+    if (!methods) return;
+    unsigned int blockedCount = 0;
+    for (unsigned int i = 0; i < total; i++) {
+        const char *name = sel_getName(method_getName(methods[i]));
+        if (!name || strncmp(name, "log", 3) != 0) continue;
+        const char *types = method_getTypeEncoding(methods[i]);
+        if (!types || types[0] != 'v') continue; // 有返回值的读方法绝不动。
+        method_setImplementation(methods[i], (IMP)gxk_noop_any);
+        blockedCount++;
+    }
+    free(methods);
+    GXK_LOG(@"[*] GKBClearcutClient 埋点已置空: %u/%u", blockedCount, total);
+}
+
 // 幂等入口：framework在构造函数阶段可能尚未加载，首次viewWillAppear再补一次。
 static void GXKApplyTelemetryBlockIfNeeded(void) {
     static BOOL blocked = NO;
     if (blocked) return;
     if (!NSClassFromString(@"CCTClearcutLogger") && !NSClassFromString(@"BreakpadController")) return;
     GXKDisableTelemetryUpload();
+    GXKDisableClearcutClientEvents();
     blocked = YES;
 }
 

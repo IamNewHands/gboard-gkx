@@ -148,6 +148,16 @@ def appex_executable(appex):
     return os.path.join(appex, name)
 
 
+def bundle_executable(bundle):
+    """读任意 bundle（.app/.appex）的 CFBundleExecutable 并返回绝对路径。"""
+    with open(os.path.join(bundle, "Info.plist"), "rb") as f:
+        data = plistlib.load(f)
+    name = data["CFBundleExecutable"]
+    if not isinstance(name, str) or not name or name in (".", "..") or "/" in name or ":" in name:
+        raise ValueError("Invalid CFBundleExecutable")
+    return os.path.join(bundle, name)
+
+
 # ---------------------------------------------------------------- Mach-O
 
 def _parse_header(data):
@@ -312,6 +322,17 @@ def resolve_frameworks_dir(appex, binary_path):
     raise ValueError("Unsupported LC_RPATH: cannot resolve @rpath/libgkx.dylib")
 
 
+def resolve_app_frameworks_dir(app, binary_path):
+    """主 App 自己的 @executable_path 是 Gboard.app，@executable_path/Frameworks 落点即主 App Frameworks。
+
+    与 appex 的 @executable_path/Frameworks（appex 内部目录）语义不同，必须独立解析。
+    """
+    for rp in _rpaths(binary_path):
+        if rp.rstrip("/") in ("@executable_path/Frameworks", "@executable_path/../Frameworks"):
+            return os.path.join(app, "Frameworks"), rp
+    raise ValueError("Unsupported LC_RPATH for main app: cannot resolve @rpath/libgkx.dylib")
+
+
 def strip_signatures(root):
     removed = []
     for dirpath, dirnames, _files in os.walk(root):
@@ -386,6 +407,26 @@ def main():
     if not appexes:
         raise SystemExit("没找到 .appex，无法注入")
     print("[2/5] 发现 %d 个扩展: %s" % (len(appexes), [os.path.basename(a) for a in appexes]))
+
+    # 主 App 进程也有自己的 clearcut/Breakpad 上报链路，必须一并注入。
+    # 它的 LC_RPATH 是 @executable_path/Frameworks，落点同样是主 App 的 Frameworks。
+    main_app = os.path.dirname(appexes[0])
+    main_app = os.path.dirname(main_app)  # PlugIns -> Gboard.app
+    app_exe = bundle_executable(main_app)
+    print("      注入 %s" % os.path.relpath(app_exe, workdir))
+    app_result, _, app_sizeof = add_load_command(app_exe)
+    app_libs, app_ncmds, _ = verify(app_exe)
+    if LOAD_PATH not in app_libs:
+        raise SystemExit("主 App 加载命令未写入，注入失败")
+    print("        add=%s ncmds=%d sizeofcmds=0x%x 验证=OK" % (app_result, app_ncmds, app_sizeof))
+    app_fw, app_rpath = resolve_app_frameworks_dir(main_app, app_exe)
+    print("        rpath=%s -> 落点 %s" % (app_rpath, os.path.relpath(app_fw, workdir)))
+    os.makedirs(app_fw, exist_ok=True)
+    app_dst = os.path.join(app_fw, DYLIB_NAME)
+    shutil.copy2(args.dylib, app_dst)
+    os.chmod(app_dst, 0o755)
+    archive_metadata[os.path.relpath(app_dst, workdir).replace(os.sep, "/")] = (
+        stat.S_IFREG | 0o755, (1980, 1, 1, 0, 0, 0))
 
     for appex in appexes:
         exe = appex_executable(appex)

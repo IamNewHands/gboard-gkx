@@ -78,7 +78,10 @@ class ActionKeySourceContracts(unittest.TestCase):
         disappear = function_body(self.source, "static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated)")
         self.assertIn("GXKDetachActionKey", disappear)
         self.assertIn("gCurrentVC = nil", disappear)
-        self.assertIn("invalidate", disappear)
+        # 停表职责收敛到 GXKStopPolling：这里必须调用它，invalidate 在它体内。
+        self.assertIn("GXKStopPolling()", disappear)
+        stop = function_body(self.source, "static void GXKStopPolling(void) {")
+        self.assertIn("invalidate", stop)
         self.assertLess(disappear.index("gCurrentVC = nil"), disappear.index("gOrigViewWillDisappear(self"))
 
     def test_incomplete_or_detached_tree_fails_closed(self):

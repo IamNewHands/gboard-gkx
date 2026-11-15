@@ -30,12 +30,32 @@ class PerfContracts(unittest.TestCase):
         cls.source = SOURCE.read_text(encoding="utf-8")
 
     def test_timer_body_never_scans_full_tree(self):
-        timer = function_body(self.source, "static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated)")
-        self.assertIn("scheduledTimerWithTimeInterval", timer)
-        body = timer[timer.index("scheduledTimerWithTimeInterval"):]
+        """定时器只在按需窗口内跑，且体内绝不做全树扫描。"""
+        pump = function_body(self.source, "static void GXKBumpPolling(NSInteger ticks) {")
+        self.assertIn("scheduledTimerWithTimeInterval", pump)
+        body = pump[pump.index("scheduledTimerWithTimeInterval"):]
         self.assertNotIn("GXKFindNineKeyEmojiKey", body)
         self.assertNotIn("GXKComposingFullScan", body)
         self.assertIn("GXKUpdateActionKey(vc)", body)
+        # 生命周期入口只抬计数，不直接建表；建表只在 GXKBumpPolling 里发生一次。
+        appear = function_body(self.source, "static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated)")
+        self.assertIn("GXKBumpPolling(GXK_POLL_BURST)", appear)
+        self.assertNotIn("scheduledTimerWithTimeInterval", appear)
+
+    def test_polling_stops_when_idle(self):
+        """空闲必须停表：计数归零后 invalidate，隐藏时也停表。"""
+        pump = function_body(self.source, "static void GXKBumpPolling(NSInteger ticks) {")
+        self.assertIn("gPollTicks <= 0", pump)
+        self.assertIn("GXKStopPolling()", pump)
+        self.assertIn("gPollTicks--", pump)
+        stop = function_body(self.source, "static void GXKStopPolling(void) {")
+        self.assertIn("[gStatePollTimer invalidate]", stop)
+        self.assertIn("gStatePollTimer = nil", stop)
+        self.assertIn("gPollTicks = 0", stop)
+        gone = function_body(self.source, "static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated)")
+        self.assertIn("GXKStopPolling()", gone)
+        # 旧的无条件常驻表必须消失，否则空闲仍每秒唤醒 5 次。
+        self.assertNotIn("if (!gStatePollTimer) {", self.source)
 
     def test_update_has_cheap_path_before_full_scan(self):
         update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")

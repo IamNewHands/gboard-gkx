@@ -116,6 +116,25 @@ class PrivacyContracts(unittest.TestCase):
         self.assertIn("blocked = YES;", apply)
         self.assertIn("GXKDisableTelemetryUpload()", apply)
 
+    def test_clearcut_client_events_are_nooped_without_touching_readers(self):
+        """GKBClearcutClient 的 log* 全置空，但有返回值的读方法必须保留。"""
+        body = function_body(self.source, "static void GXKDisableClearcutClientEvents(void) {")
+        # 只按名字前缀 log + 返回类型 v 两个条件筛选，不写死 78 条选择器。
+        self.assertIn('strncmp(name, "log", 3) != 0', body)
+        self.assertIn("types[0] != 'v'", body)
+        self.assertIn("class_copyMethodList(cls, &total)", body)
+        self.assertIn("method_setImplementation(methods[i], (IMP)gxk_noop_any)", body)
+        self.assertIn("free(methods)", body)
+        # 读方法/初始化/生命周期选择器绝不能出现在这个函数体里。
+        for sel in ("isEnabled", "isRegexRule:", "featureFlagEventsForDailyLog",
+                    "gboardExtensionWithTopLevelFields", "init", "dealloc"):
+            self.assertNotIn(sel, body, f"{sel} must keep its implementation")
+        # 通用空实现必须接受可变实参，否则 16 参的 logThemeAction... 会错位。
+        self.assertIn("static void gxk_noop_any(id self, SEL _cmd, ...) {}", self.source)
+        # 必须由幂等入口调用，否则装了也不生效。
+        apply = function_body(self.source, "static void GXKApplyTelemetryBlockIfNeeded(void) {")
+        self.assertIn("GXKDisableClearcutClientEvents()", apply)
+
     def test_blocking_does_not_touch_lifecycle_hooks(self):
         init = function_body(self.source, "static void gkx_init(void)")
         privacy_at = init.index("GXKApplyTelemetryBlockIfNeeded()")
