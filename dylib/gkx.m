@@ -1513,6 +1513,7 @@ static void (*gOrigLocationCardLoad)(id, SEL, id, BOOL);
 static void (*gOrigLocationCardLayout)(id, SEL);
 static __weak UIView *gLocationCardView;
 static __weak UIButton *gLocationJumpButton;
+static __weak UIView *gLocationLinkView; // 缓存找到的链接视图，布局回调里不再全树重扫。
 
 // 在子类上新增覆盖方法，绝不改父类实现：loadWithModel:toShare: 与 layoutSubviews
 // 都来自父类，直接 setImplementation 会污染所有卡片。
@@ -1688,7 +1689,11 @@ static GXKLocationTarget *gLocationTarget = nil;
 static void GXKAttachLocationJump(UIView *card) {
     if (!card || gUpdatingLocationButton) return;
     gUpdatingLocationButton = YES;
-    UIView *link = GXKFindLocationLink(card);
+    UIView *link = gLocationLinkView;
+    if (!link || link.window != card.window || ![link isDescendantOfView:card]) {
+        link = GXKFindLocationLink(card);
+        gLocationLinkView = link;
+    }
     if (!link) {
         GXK_LOG(@"[!] 卡片里没找到定位链接文字，保持原生");
         gUpdatingLocationButton = NO;
@@ -1774,6 +1779,7 @@ static void GXKDetachLocationButton(void) {
     if (button) [button removeFromSuperview];
     gLocationJumpButton = nil;
     gLocationCardView = nil;
+    gLocationLinkView = nil;
 }
 
 static void GXKInstallLocationHooks(void) {
