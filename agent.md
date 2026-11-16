@@ -13,7 +13,8 @@
   3. **九键工具栏**（全选／复制／粘贴／剪切／收起），复用官方 G 图标 band，不加高度；
   4. **G 图标展开页裁剪**：去掉 YouTube 与联系人两页；
   5. **搜索历史单条删除**：每条历史右侧叠「×」，点掉即删（列表 + 持久化记录）；
-  6. **地图分页跳系统定位设置**：定位关闭时的「开启位置信息服务」改跳 iOS 定位服务页（等价 `prefs:root=Privacy&path=LOCATION`），三通道级联、全失败回落原生。
+  6. **地图分页一键去开定位**（A 路线）：定位关闭时的「开启位置信息服务」不再跳 Gboard 搜索设置，改为发 `gboard://x-gxk-location` 中转，由主 App 接住后级联 `prefs:` → `App-Prefs:` → `UIApplicationOpenSettingsURLString`；
+  7. **常用语分页**：G 图标内与搜索／翻译／地图同级，叠加层展示已维护的短语，点击即上屏；钉子固定后连续输入，未固定点一条即关；维护入口在主 App「设置 → Gboard」页导航栏右侧。
 - **极简原则**：**已彻底废除并移除**悬浮工具条、键盘高度扩张约束、强制全屏深色注入及短语管理器。杜绝任何破坏原生界面视野与触摸链的做法。当前九键工具栏是**原地复用官方 G 图标 band**（G 图标 alpha 归零、工具条占同一段、空位不足即整条不显示），不新增视图高度、不位移任何原生容器。
 - **技术载体**：Objective-C 动态库注入（`libgkx.dylib`），在扩展初始化时进行最小必要生命周期 Hook。
 - **目标环境**：iOS 12.0 ~ iOS 18+，arm64 设备，支持 LCSign、SideStore、SideInstaller 等免越狱自签工具。
@@ -25,7 +26,7 @@
 ```
 gboard-gkx/
 ├── dylib/
-│   └── gkx.m                          # 核心动态库源码：词库部署 + 九键重输/换行 + G 图标 band 工具栏 + 分页裁剪 + 搜索历史单条删除 + 地图定位跳转
+│   └── gkx.m                          # 核心动态库源码：词库部署 + 九键重输/换行 + G 图标 band 工具栏 + 分页裁剪 + 搜索历史单条删除 + 地图定位中转 + 常用语分页/维护
 ├── .github/workflows/
 │   └── build-dylib.yml                # CI 云端编译流：macOS-15 runner，原生 clang 编译 arm64，ldid 伪签名
 ├── tools/
@@ -88,6 +89,11 @@ gboard-gkx/
 ### 🚫 避坑 5：swizzle 必须按真实返回值类型声明原实现指针
 * **历史教训**：`GKBFeatureFlagManager` 的 `enableYouTubeMiniApp`／`enableContactsMiniApp` 名字像 BOOL，实际返回 `GKBBoolFeatureFlag` 对象。若把原实现指针声明成 `BOOL (*)(id, SEL)`，返回值被截断，hook 里拿到垃圾地址，必崩。
 * **开发准则**：写 hook 前先用 `dump_types.py` 查 method type encoding；`method_setImplementation` 的原实现指针签名必须与 encoding 严格一致。返回对象的 getter 想关掉功能时，优先改原对象的 `value`（保留对象身份），而不是伪造新对象。
+
+### 🚫 避坑 7：键盘扩展不能打开系统设置页，必须走宿主 App 中转
+* **历史教训**：曾试图在键盘扩展里直接开 `prefs:root=Privacy&path=LOCATION` 跳 iOS 定位设置，真机点击**毫无反应**。原因是 `NSExtensionContext` 的 `openURL:` 只放行宿主 App 自己的 URL scheme，`prefs:`／`App-Prefs:` 一律被沙盒静默拒绝；快捷指令能跳是因为它有独立授权。三层通道（extensionContext → `gkb_openURL:` → `UIApplication`）全都过不去。
+* **开发准则**：需要跳出键盘打开任何系统页面时，一律先发宿主 scheme（本项目用 `gboard://x-gxk-<功能>`）唤起主 App，主 App 侧的同一个 dylib 在 `AppDelegate` 的 `application:openURL:options:` 里接住再级联尝试；最后一级必须落在 `UIApplicationOpenSettingsURLString`（必然能打开「设置 → Gboard」），保证用户总有出路。
+* **配套准则**：用户不接 Console.app，所以任何"看日志判断"的设计都不可执行——失败必须画在屏幕上（改按钮标题等），日志只作辅助。
 
 ### 🚫 避坑 6：Windows 打包必须显式保留 Unix 权限（0o755 / 0o644）
 * **历史教训**：在 Windows 上用标准 zipfile 解包重打包后，所有文件的外部属性变为 `0o666`，丢失可执行权限（Execute 标志），导致真机加载 dylib 时报权限拒绝。

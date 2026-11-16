@@ -6,7 +6,8 @@
 //   3. 九键 G 图标 band 内嵌工具栏：全选/复制/粘贴/剪切/收起（原地复用，不加高度）
 //   4. G 图标展开页去掉 YouTube / 联系人两页
 //   5. 搜索历史每行右侧叠 ×，点掉即删（列表 + 持久化记录）
-//   6. 地图分页：定位关闭时直接跳 iOS 定位设置（接管原生链接 + 叠「去开启定位」按钮）
+//   6. 地图分页：定位关闭时的链接改为经主 App 中转打开设置（键盘扩展只放行宿主 scheme）
+//   7. G 图标「常用语」分页：点一条直接上屏，可固定面板连续输入；主 App 设置里维护
 // 其余一切界面与输入逻辑均完全保持 Gboard 官方原生！
 
 #import <UIKit/UIKit.h>
@@ -1132,6 +1133,11 @@ static void GXKApplyTelemetryBlockIfNeeded(void);
 static void GXKApplyMiniAppAndSuggestionHooks(void);
 static void GXKInstallLocationHooks(void);
 static void GXKDetachLocationButton(void);
+static void GXKInstallPhrasesHooks(void);
+static void GXKInstallMainAppHooks(void);
+static void GXKDetachPhrasesPanel(void);
+static id GXKPhrasesPickerItem(void);
+static NSString *GXKPickerItemIdentifier(id item);
 
 static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
     if (gOrigTextDidChange) gOrigTextDidChange(self, _cmd, textInput);
@@ -1167,6 +1173,8 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     GXKApplyTelemetryBlockIfNeeded(); // 兜底：构造函数时framework若未就绪，这里补一次。
     GXKApplyMiniAppAndSuggestionHooks(); // 分页裁剪与历史删除：类未就绪时下次出现再试。
     GXKInstallLocationHooks(); // 地图分页定位跳转：同上，类未就绪时下次出现再试。
+    GXKInstallPhrasesHooks(); // 常用语分页：同上。
+    GXKInstallMainAppHooks(); // 主 App 侧入口（键盘进程里类不存在，自然跳过）。
 
     // 部署外部万象词库
     GXKEnsureUserDictionaryDeployed();
@@ -1186,6 +1194,7 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
         GXKDetachActionKey();
         GXKDetachToolbar(); // 扩展隐藏后工具条随宿主一起撤走，下次出现重新定位。
         GXKDetachLocationButton(); // 定位按钮随地图分页一起撤走。
+        GXKDetachPhrasesPanel(); // 常用语面板随扩展隐藏一起撤走。
         GXKReleaseHaptics(); // 扩展隐藏后不常驻触觉引擎。
     }
     if (gOrigViewWillDisappear) gOrigViewWillDisappear(self, _cmd, animated);
@@ -1207,6 +1216,15 @@ static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
 //   1. 从 G 图标展开页的分页条里去掉 YouTube 与联系人两页（三层兜底）。
 //   2. 搜索历史每一行右侧叠一个 ×，点掉即从列表与持久化记录里删掉该条。
 // 任一类或方法在新版 Gboard 里消失就跳过，自然降级为原生行为。
+
+#define GXK_PHRASES_PANEL_TAG   0x47584B50  // 'GXKP'
+#define GXK_PHRASES_PIN_TAG     0x47584B51
+#define GXK_PHRASES_CLOSE_TAG   0x47584B52
+#define GXK_PHRASES_TITLE_TAG   0x47584B54
+#define GXK_PHRASES_TABLE_TAG   0x47584B55
+#define GXK_PHRASES_HINT_TAG    0x47584B56
+#define GXK_PHRASES_CELL_ID     @"GXKPhraseCell"
+#define GXK_PHRASES_IDENTIFIER  @"gxk_phrases"
 
 #define GXK_SUGGESTION_X_TAG 0x47584B58  // 'GXKX'
 static char GXKSuggestionTextKey;  // 关联对象键：必须用静态地址，字符串字面量会被合并。
@@ -1287,10 +1305,17 @@ static id gxk_availablePickerItems(id self, SEL _cmd) {
     id items = gOrigAvailablePickerItems ? gOrigAvailablePickerItems(self, _cmd) : nil;
     if (![items isKindOfClass:[NSArray class]]) return items;
     NSArray *list = (NSArray *)items;
-    NSMutableArray *kept = [NSMutableArray arrayWithCapacity:list.count];
+    NSMutableArray *kept = [NSMutableArray arrayWithCapacity:list.count + 1];
+    BOOL hasPhrases = NO;
     for (id item in list) {
-        if (!GXKIdentifierExcluded(item)) [kept addObject:item];
+        if (GXKIdentifierExcluded(item)) continue;
+        NSString *ident = GXKPickerItemIdentifier(item);
+        if (ident && [ident isEqualToString:GXK_PHRASES_IDENTIFIER]) hasPhrases = YES;
+        [kept addObject:item];
     }
+    // 常用语排在地图之后、其余原生分页之前，位置与原生命令一致。
+    id phrases = GXKPhrasesPickerItem();
+    if (phrases && !hasPhrases) [kept addObject:phrases];
     return kept;
 }
 
@@ -1530,10 +1555,9 @@ static void GXKOverrideOrSkip(NSString *className, NSString *selName, IMP imp, v
 }
 
 static NSArray<NSString *> *GXKLocationURLStrings(void) {
-    // 依次尝试：设置里的定位页 → 隐私页 → 定位服务页。
-    return @[@"prefs:root=Privacy&path=LOCATION",
-             @"App-Prefs:root=Privacy&path=LOCATION",
-             @"prefs:root=Privacy&path=LOCATION&path=LOCATION_SERVICES"];
+    // A 路线：键盘扩展只被放行宿主 App 自己的 scheme，设置类 scheme 一律被沙盒拒绝。
+    // 这里只发一个中转地址，由主 App 侧接住后再尝试打开系统设置（最后一级是「设置 → Gboard」）。
+    return @[@"gboard://x-gxk-location"];
 }
 
 // 通道 1：NSExtensionContext。键盘扩展唯一官方支持的打开 URL 方式（需 RequestsOpenAccess）。
@@ -1617,7 +1641,12 @@ static BOOL GXKOpenLocationSettings(void) {
 
 // 卡片里那条链接的文字：命中「开启/设置/位置信息/定位/location」都算候选。
 static NSString *GXKViewPlainText(UIView *view) {
-    if ([view isKindOfClass:[UILabel class]]) return ((UILabel *)view).text;
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)view;
+        // 原生那条链接是 attributedText 拼的，.text 可能是 nil，必须先读 attributedText.string。
+        if (label.text.length > 0) return label.text;
+        return label.attributedText.string;
+    }
     if ([view isKindOfClass:[UIButton class]]) {
         UIButton *button = (UIButton *)view;
         NSString *title = [button titleForState:UIControlStateNormal];
@@ -1674,10 +1703,10 @@ static UIView *GXKFindLocationLink(UIView *root) {
     GXKImpact(UIImpactFeedbackStyleLight);
     GXK_LOG(@"[*] 点了「去开启定位」");
     if (GXKOpenLocationSettings()) {
-        GXKFlashTitle(sender, @"已跳转");
+        GXKFlashTitle(sender, @"已打开 Gboard");
         return;
     }
-    GXK_LOG(@"[!] 定位设置打不开，提示用户手动去设置");
+    GXK_LOG(@"[!] gboard:// 中转打不开，提示用户手动去设置");
     GXKFlashTitle(sender, @"请手动打开");
 }
 
@@ -1694,13 +1723,12 @@ static void GXKAttachLocationJump(UIView *card) {
         link = GXKFindLocationLink(card);
         gLocationLinkView = link;
     }
-    if (!link) {
-        GXK_LOG(@"[!] 卡片里没找到定位链接文字，保持原生");
-        gUpdatingLocationButton = NO;
-        return;
-    }
     NSString *title = GXKViewPlainText(link);
-    if (title.length == 0) title = @"去开启定位";
+    if (title.length == 0) title = @"去 Gboard 设置开启定位";
+    if (!link) {
+        // 找不到那条链接也照挂：贴在卡片底部，保证有可见入口可点。
+        GXK_LOG(@"[*] 未匹配到定位链接，按钮改贴卡片底部");
+    }
     UIButton *button = gLocationJumpButton;
     if (!button || button.superview != card) {
         if (button) [button removeFromSuperview];
@@ -1724,8 +1752,15 @@ static void GXKAttachLocationJump(UIView *card) {
     if (!tint) tint = [UIColor colorWithRed:0.26 green:0.52 blue:0.96 alpha:1.0];
     [button setTitleColor:tint forState:UIControlStateNormal];
     [button setTitleColor:[tint colorWithAlphaComponent:0.5] forState:UIControlStateHighlighted];
-    CGRect rect = [link convertRect:link.bounds toView:card];
-    rect = CGRectInset(rect, -6.0, -4.0);
+    CGRect rect;
+    if (link) {
+        rect = [link convertRect:link.bounds toView:card];
+        rect = CGRectInset(rect, -6.0, -4.0);
+    } else {
+        CGFloat cardWidth = CGRectGetWidth(card.bounds);
+        CGFloat cardHeight = CGRectGetHeight(card.bounds);
+        rect = CGRectMake(8.0, cardHeight - 34.0, MAX(cardWidth - 16.0, 80.0), 28.0);
+    }
     if (!CGRectEqualToRect(button.frame, rect)) button.frame = rect;
     button.autoresizingMask = UIViewAutoresizingNone;
     if (card.subviews.lastObject != button) [card bringSubviewToFront:button];
@@ -1795,6 +1830,528 @@ static void GXKInstallLocationHooks(void) {
                       (IMP)gxk_locationCardLayout, (void **)&gOrigLocationCardLayout);
     gxk_location_hooked = YES;
     GXK_LOG(@"[*] 地图分页定位跳转已接管");
+}
+
+#pragma mark - G 图标「常用语」分页 + 主 App 维护入口
+
+// 常用语存在 App Group 的 NSUserDefaults 里，键盘与主 App 共用同一份数据。
+// 分页本身是自建覆盖层：不实现整套 mini app 协议，只在分页条上多一项并接管它的选中事件。
+
+static NSString *const GXKPhrasesKey = @"GXKPhrases";
+static NSString *const GXKPhrasesPinnedKey = @"GXKPhrasesPinned";
+
+static char GXKPhrasesSettingsKey;  // 关联对象键：必须是静态地址。
+
+static BOOL gxk_phrases_hooked = NO;
+static BOOL gxk_appdelegate_hooked = NO;
+static BOOL gxk_settings_hooked = NO;
+static void (*gOrigMiniAppPickerDidSelect)(id, SEL, id, id, unsigned long long);
+static BOOL (*gOrigApplicationOpenURL)(id, SEL, id, id, id);
+static void (*gOrigSettingsViewDidLoad)(id, SEL);
+static __weak UIView *gPhrasesPanelView;
+static __weak id gPhrasesMiniAppHost;
+
+static NSUserDefaults *GXKPhraseDefaults(void) {
+    static NSUserDefaults *defaults = nil;
+    static BOOL tried = NO;
+    if (!tried) {
+        tried = YES;
+        defaults = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+        if (!defaults) defaults = [NSUserDefaults standardUserDefaults];
+    }
+    return defaults;
+}
+
+static NSMutableArray<NSString *> *GXKPhraseList(void) {
+    NSMutableArray *list = [NSMutableArray array];
+    id raw = [GXKPhraseDefaults() objectForKey:GXKPhrasesKey];
+    if (![raw isKindOfClass:[NSArray class]]) return list;
+    for (id item in (NSArray *)raw) {
+        if ([item isKindOfClass:[NSString class]] && ((NSString *)item).length > 0) {
+            [list addObject:(NSString *)item];
+        }
+    }
+    return list;
+}
+
+static void GXKPhraseSave(NSArray<NSString *> *list) {
+    NSUserDefaults *defaults = GXKPhraseDefaults();
+    if (!defaults) return;
+    [defaults setObject:(list ?: @[]) forKey:GXKPhrasesKey];
+    [defaults synchronize];
+}
+
+static BOOL GXKPhrasesPinned(void) {
+    return [GXKPhraseDefaults() boolForKey:GXKPhrasesPinnedKey];
+}
+
+static void GXKPhrasesSetPinned(BOOL pinned) {
+    NSUserDefaults *defaults = GXKPhraseDefaults();
+    if (!defaults) return;
+    [defaults setBool:pinned forKey:GXKPhrasesPinnedKey];
+    [defaults synchronize];
+}
+
+// 部署目标 12.0：systemBlue / systemBackground 都是 iOS 13 才有的，统一在这里兜底。
+static UIColor *GXKPhraseTintColor(void) {
+    if (@available(iOS 13.0, *)) return [UIColor systemBlueColor];
+    return [UIColor colorWithRed:0.0 green:0.478 blue:1.0 alpha:1.0];
+}
+
+static UIColor *GXKPhraseBackgroundColor(void) {
+    if (@available(iOS 13.0, *)) return [UIColor systemBackgroundColor];
+    return [UIColor whiteColor];
+}
+
+// 分页条上的图标：直接画一个「语」字，避免依赖资源包里的图片名。
+static UIImage *GXKPhrasesIcon(void) {
+    static UIImage *image = nil;
+    static BOOL tried = NO;
+    if (tried) return image;
+    tried = YES;
+    @try {
+        UIGraphicsImageRenderer *renderer =
+            [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(24.0, 24.0)];
+        image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+            [[UIColor clearColor] setFill];
+            UIRectFill(CGRectMake(0.0, 0.0, 24.0, 24.0));
+            NSDictionary *attrs = @{NSFontAttributeName: [UIFont systemFontOfSize:15.0 weight:UIFontWeightMedium],
+                                    NSForegroundColorAttributeName: [UIColor darkGrayColor]};
+            CGSize size = [@"语" sizeWithAttributes:attrs];
+            [@"语" drawAtPoint:CGPointMake((24.0 - size.width) / 2.0, (24.0 - size.height) / 2.0)
+                withAttributes:attrs];
+        }];
+    } @catch (__unused NSException *e) {
+        image = nil;
+    }
+    return image;
+}
+
+static id GXKKeyboardProxy(void) {
+    UIViewController *vc = gCurrentVC;
+    if (!vc) return nil;
+    if (![vc respondsToSelector:@selector(textDocumentProxy)]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(vc, @selector(textDocumentProxy));
+}
+
+static void GXKInsertPhraseText(NSString *text) {
+    if (text.length == 0) return;
+    id proxy = GXKKeyboardProxy();
+    if (!proxy || ![proxy respondsToSelector:@selector(insertText:)]) {
+        GXK_LOG(@"[!] 常用语上屏失败：输入代理不可用");
+        return;
+    }
+    ((void (*)(id, SEL, id))objc_msgSend)(proxy, @selector(insertText:), text);
+}
+
+@interface GXKPhrasesPanel : UIView <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) UITableView *table;
+@property (nonatomic, strong) NSMutableArray<NSString *> *items;
+@property (nonatomic, strong) UIButton *pinButton;
+- (void)reloadItems;
+- (void)dismissPanel;
+@end
+
+@implementation GXKPhrasesPanel
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.backgroundColor = [UIColor colorWithWhite:0.97 alpha:1.0];
+    self.tag = GXK_PHRASES_PANEL_TAG;
+    self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectZero];
+    title.tag = GXK_PHRASES_TITLE_TAG;
+    title.text = @"常用语";
+    title.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
+    title.textColor = [UIColor darkTextColor];
+    [self addSubview:title];
+
+    UIButton *pin = [UIButton buttonWithType:UIButtonTypeSystem];
+    pin.tag = GXK_PHRASES_PIN_TAG;
+    pin.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
+    pin.accessibilityLabel = @"固定常用语面板";
+    [pin addTarget:self action:@selector(onPin:) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:pin];
+    _pinButton = pin;
+
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+    close.tag = GXK_PHRASES_CLOSE_TAG;
+    [close setTitle:@"×" forState:UIControlStateNormal];
+    close.titleLabel.font = [UIFont systemFontOfSize:20.0 weight:UIFontWeightRegular];
+    close.accessibilityLabel = @"关闭常用语";
+    [close addTarget:self action:@selector(onClose:) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:close];
+
+    UITableView *table = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
+    table.tag = GXK_PHRASES_TABLE_TAG;
+    table.dataSource = self;
+    table.delegate = self;
+    table.rowHeight = 40.0;
+    table.backgroundColor = [UIColor clearColor];
+    table.separatorInset = UIEdgeInsetsZero;
+    [self addSubview:table];
+    _table = table;
+
+    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectZero];
+    hint.tag = GXK_PHRASES_HINT_TAG;
+    hint.text = @"还没有常用语。打开 Gboard App → 设置 → 右上角「常用语」添加。";
+    hint.font = [UIFont systemFontOfSize:13.0];
+    hint.textColor = [UIColor grayColor];
+    hint.numberOfLines = 0;
+    hint.textAlignment = NSTextAlignmentCenter;
+    [self addSubview:hint];
+
+    [self reloadItems];
+    return self;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat width = CGRectGetWidth(self.bounds);
+    CGFloat height = CGRectGetHeight(self.bounds);
+    UIView *title = [self viewWithTag:GXK_PHRASES_TITLE_TAG];
+    title.frame = CGRectMake(16.0, 8.0, 120.0, 24.0);
+    self.pinButton.frame = CGRectMake(MAX(width - 160.0, 120.0), 6.0, 100.0, 28.0);
+    UIButton *close = (UIButton *)[self viewWithTag:GXK_PHRASES_CLOSE_TAG];
+    close.frame = CGRectMake(MAX(width - 48.0, 200.0), 4.0, 36.0, 32.0);
+    self.table.frame = CGRectMake(0.0, 38.0, width, MAX(height - 38.0, 0.0));
+    UIView *hint = [self viewWithTag:GXK_PHRASES_HINT_TAG];
+    hint.frame = CGRectMake(24.0, 44.0, MAX(width - 48.0, 0.0), 60.0);
+    [self updatePinTitle];
+}
+
+- (void)updatePinTitle {
+    BOOL pinned = GXKPhrasesPinned();
+    [self.pinButton setTitle:(pinned ? @"已固定" : @"固定") forState:UIControlStateNormal];
+    [self.pinButton setTitleColor:(pinned ? GXKPhraseTintColor() : [UIColor grayColor])
+                         forState:UIControlStateNormal];
+}
+
+- (void)reloadItems {
+    self.items = GXKPhraseList();
+    [self.table reloadData];
+    UIView *hint = [self viewWithTag:GXK_PHRASES_HINT_TAG];
+    if (hint) hint.hidden = (self.items.count > 0);
+    [self updatePinTitle];
+}
+
+- (void)onPin:(UIButton *)sender {
+    GXKImpact(UIImpactFeedbackStyleLight);
+    GXKPhrasesSetPinned(!GXKPhrasesPinned());
+    [self updatePinTitle];
+}
+
+- (void)onClose:(UIButton *)sender {
+    GXKImpact(UIImpactFeedbackStyleLight);
+    [self dismissPanel];
+}
+
+- (void)dismissPanel {
+    id host = gPhrasesMiniAppHost;
+    [self removeFromSuperview];
+    gPhrasesPanelView = nil;
+    gPhrasesMiniAppHost = nil;
+    if (host && [host respondsToSelector:@selector(deactivate)]) {
+        @try {
+            ((void (*)(id, SEL))objc_msgSend)(host, @selector(deactivate));
+        } @catch (__unused NSException *e) {}
+    }
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return (NSInteger)self.items.count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:GXK_PHRASES_CELL_ID];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
+                                     reuseIdentifier:GXK_PHRASES_CELL_ID];
+    }
+    NSString *text = (indexPath.row < (NSInteger)self.items.count) ? self.items[indexPath.row] : @"";
+    cell.textLabel.text = text;
+    cell.textLabel.font = [UIFont systemFontOfSize:15.0];
+    cell.textLabel.numberOfLines = 2;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:NO];
+    if (indexPath.row >= (NSInteger)self.items.count) return;
+    GXKImpact(UIImpactFeedbackStyleLight);
+    GXKInsertPhraseText(self.items[indexPath.row]);
+    // 没固定就点一条关面板；固定了就一直留着连续输入。
+    if (!GXKPhrasesPinned()) [self dismissPanel];
+}
+
+@end
+
+static void GXKShowPhrasesPanel(id miniAppHost) {
+    UIViewController *vc = gCurrentVC;
+    if (!vc || !vc.isViewLoaded) {
+        GXK_LOG(@"[!] 常用语分页：键盘宿主未就绪");
+        return;
+    }
+    UIView *existing = [vc.view viewWithTag:GXK_PHRASES_PANEL_TAG];
+    if (existing) [existing removeFromSuperview];
+    GXKPhrasesPanel *panel = [[GXKPhrasesPanel alloc] initWithFrame:vc.view.bounds];
+    [vc.view addSubview:panel];
+    [vc.view bringSubviewToFront:panel];
+    gPhrasesPanelView = panel;
+    gPhrasesMiniAppHost = miniAppHost;
+    GXK_LOG(@"[*] 常用语分页已展开，共 %lu 条", (unsigned long)panel.items.count);
+}
+
+static void GXKDetachPhrasesPanel(void) {
+    UIView *panel = gPhrasesPanelView;
+    if (panel) [panel removeFromSuperview];
+    gPhrasesPanelView = nil;
+    gPhrasesMiniAppHost = nil;
+}
+
+static NSString *GXKPickerItemIdentifier(id item) {
+    if (!item) return nil;
+    if ([item isKindOfClass:[NSString class]]) return (NSString *)item;
+    if ([item respondsToSelector:@selector(identifier)]) {
+        id value = ((id (*)(id, SEL))objc_msgSend)(item, @selector(identifier));
+        if ([value isKindOfClass:[NSString class]]) return (NSString *)value;
+    }
+    return nil;
+}
+
+static id GXKPhrasesPickerItem(void) {
+    static id item = nil;
+    static BOOL tried = NO;
+    if (tried) return item;
+    tried = YES;
+    Class itemClass = NSClassFromString(@"GKBAppStripItem");
+    if (!itemClass) return nil;
+    @try {
+        item = ((id (*)(id, SEL, id, id, id, id))objc_msgSend)(
+            [itemClass alloc], @selector(initWithIdentifier:name:icon:accessibilityLabel:),
+            GXK_PHRASES_IDENTIFIER, @"常用语", GXKPhrasesIcon(), @"常用语");
+    } @catch (__unused NSException *e) {
+        item = nil;
+    }
+    return item;
+}
+
+static void gxk_miniAppPickerDidSelect(id self, SEL _cmd, id picker, id item, unsigned long long index) {
+    NSString *ident = GXKPickerItemIdentifier(item);
+    if (ident && [ident isEqualToString:GXK_PHRASES_IDENTIFIER]) {
+        GXKShowPhrasesPanel(self);
+        return;
+    }
+    if (gOrigMiniAppPickerDidSelect) gOrigMiniAppPickerDidSelect(self, _cmd, picker, item, index);
+}
+
+static void GXKInstallPhrasesHooks(void) {
+    if (gxk_phrases_hooked) return;
+    if (!NSClassFromString(@"GKBMiniAppExtensionBase")) return;
+    GXKSwizzleOrSkip(@"GKBMiniAppExtensionBase", @"miniAppPicker:didSelectItem:atIndex:",
+                     (IMP)gxk_miniAppPickerDidSelect, (void **)&gOrigMiniAppPickerDidSelect);
+    gxk_phrases_hooked = YES;
+    GXK_LOG(@"[*] 常用语分页已接入 G 图标");
+}
+
+#pragma mark - 主 App：定位中转 + 常用语维护入口
+
+// 键盘扩展只被放行宿主 App 的 scheme，所以「跳定位设置」必须由主 App 代跑。
+static BOOL GXKIsLocationRelayURL(NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]]) return NO;
+    if (![[url.scheme lowercaseString] isEqualToString:@"gboard"]) return NO;
+    NSString *host = [[url.host lowercaseString] stringByRemovingPercentEncoding];
+    NSString *path = [[url.path lowercaseString] stringByRemovingPercentEncoding];
+    if ([host isEqualToString:@"x-gxk-location"]) return YES;
+    if (path.length && [path rangeOfString:@"x-gxk-location"].location != NSNotFound) return YES;
+    return NO;
+}
+
+// 主 App 内逐级尝试：定位页 → 隐私页 → 本 App 设置页（最后一级必然能开）。
+static BOOL GXKMainAppOpenLocationSettings(void) {
+    NSMutableArray *candidates = [NSMutableArray array];
+    [candidates addObject:@"prefs:root=Privacy&path=LOCATION"];
+    [candidates addObject:@"App-Prefs:root=Privacy&path=LOCATION"];
+    if (UIApplicationOpenSettingsURLString.length) [candidates addObject:UIApplicationOpenSettingsURLString];
+    for (NSString *text in candidates) {
+        NSURL *url = [NSURL URLWithString:text];
+        if (!url) continue;
+        if (GXKOpenViaApplication(url)) {
+            GXK_LOG(@"[*] 主 App 已打开设置: %@", text);
+            return YES;
+        }
+        GXK_LOG(@"[!] 主 App 打不开: %@", text);
+    }
+    return NO;
+}
+
+static BOOL gxk_applicationOpenURL(id self, SEL _cmd, id app, id url, id options) {
+    if (GXKIsLocationRelayURL((NSURL *)url)) {
+        GXK_LOG(@"[*] 主 App 收到定位中转: %@", url);
+        GXKMainAppOpenLocationSettings();
+        return YES;
+    }
+    return gOrigApplicationOpenURL ? gOrigApplicationOpenURL(self, _cmd, app, url, options) : NO;
+}
+
+@interface GXKPhrasesEditorController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) UITableView *table;
+@property (nonatomic, strong) NSMutableArray<NSString *> *items;
+@end
+
+@implementation GXKPhrasesEditorController
+
+- (instancetype)init {
+    self = [super initWithNibName:nil bundle:nil];
+    if (!self) return nil;
+    self.title = @"常用语";
+    _items = GXKPhraseList();
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = GXKPhraseBackgroundColor();
+    UITableView *table = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStylePlain];
+    table.dataSource = self;
+    table.delegate = self;
+    table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:table];
+    self.table = table;
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
+                                                      target:self
+                                                      action:@selector(onAdd:)];
+    if (self.presentingViewController && !self.navigationController) {
+        self.navigationItem.leftBarButtonItem =
+            [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                          target:self
+                                                          action:@selector(onDone:)];
+    }
+}
+
+- (void)onDone:(id)sender {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onAdd:(id)sender {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"新增常用语"
+                                                                  message:nil
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = @"要上屏的文字";
+    }];
+    __weak GXKPhrasesEditorController *weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        NSString *text = alert.textFields.firstObject.text;
+        if (text.length == 0) return;
+        [weakSelf.items addObject:text];
+        GXKPhraseSave(weakSelf.items);
+        [weakSelf.table reloadData];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return (NSInteger)self.items.count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *cellID = @"GXKPhraseEditCell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cellID];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:cellID];
+    cell.textLabel.text = (indexPath.row < (NSInteger)self.items.count) ? self.items[indexPath.row] : @"";
+    cell.textLabel.numberOfLines = 2;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle
+                                            forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (editingStyle != UITableViewCellEditingStyleDelete) return;
+    if (indexPath.row >= (NSInteger)self.items.count) return;
+    [self.items removeObjectAtIndex:indexPath.row];
+    GXKPhraseSave(self.items);
+    [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:NO];
+    if (indexPath.row >= (NSInteger)self.items.count) return;
+    NSString *current = self.items[indexPath.row];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"编辑常用语"
+                                                                  message:nil
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.text = current;
+    }];
+    __weak GXKPhrasesEditorController *weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        NSString *text = alert.textFields.firstObject.text;
+        if (text.length == 0) return;
+        [weakSelf.items replaceObjectAtIndex:indexPath.row withObject:text];
+        GXKPhraseSave(weakSelf.items);
+        [weakSelf.table reloadData];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+@end
+
+@interface GXKPhrasesSettingsTarget : NSObject
+@property (nonatomic, weak) UIViewController *controller;
+- (void)onOpenPhrasesEditor:(id)sender;
+@end
+
+@implementation GXKPhrasesSettingsTarget
+
+- (void)onOpenPhrasesEditor:(id)sender {
+    UIViewController *vc = self.controller;
+    if (!vc) return;
+    GXKPhrasesEditorController *editor = [[GXKPhrasesEditorController alloc] init];
+    UINavigationController *nav = vc.navigationController;
+    if (nav) {
+        [nav pushViewController:editor animated:YES];
+        return;
+    }
+    UINavigationController *wrapper = [[UINavigationController alloc] initWithRootViewController:editor];
+    [vc presentViewController:wrapper animated:YES completion:nil];
+}
+
+@end
+
+static void gxk_settingsViewDidLoad(id self, SEL _cmd) {
+    if (gOrigSettingsViewDidLoad) gOrigSettingsViewDidLoad(self, _cmd);
+    if (![self isKindOfClass:[UIViewController class]]) return;
+    UIViewController *vc = (UIViewController *)self;
+    GXKPhrasesSettingsTarget *target = [[GXKPhrasesSettingsTarget alloc] init];
+    target.controller = vc;
+    objc_setAssociatedObject(vc, &GXKPhrasesSettingsKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithTitle:@"常用语"
+                                                            style:UIBarButtonItemStylePlain
+                                                           target:target
+                                                           action:@selector(onOpenPhrasesEditor:)];
+    item.accessibilityLabel = @"常用语管理";
+    vc.navigationItem.rightBarButtonItem = item;
+    GXK_LOG(@"[*] 主 App 设置页已加「常用语」入口");
+}
+
+static void GXKInstallMainAppHooks(void) {
+    if (!gxk_appdelegate_hooked && NSClassFromString(@"AppDelegate")) {
+        GXKSwizzleOrSkip(@"AppDelegate", @"application:openURL:options:",
+                         (IMP)gxk_applicationOpenURL, (void **)&gOrigApplicationOpenURL);
+        gxk_appdelegate_hooked = YES;
+    }
+    if (!gxk_settings_hooked && NSClassFromString(@"GKBSettingsViewController")) {
+        GXKSwizzleOrSkip(@"GKBSettingsViewController", @"viewDidLoad",
+                         (IMP)gxk_settingsViewDidLoad, (void **)&gOrigSettingsViewDidLoad);
+        gxk_settings_hooked = YES;
+    }
 }
 
 #pragma mark - 隐私上报拦截 (只掐 clearcut 与 Breakpad 上报)
@@ -1917,4 +2474,12 @@ static void gkx_init(void) {
 
     // 只掐无意义上报；翻译/YouTube/天气不受影响。
     GXKApplyTelemetryBlockIfNeeded();
+
+    // 主 App 进程里根本没有键盘控制器，viewWillAppear 那套接线永远不触发，
+    // 所以定位中转与「常用语」维护入口必须在这里挂一次；键盘进程里这些类不存在，自然跳过。
+    GXKInstallMainAppHooks();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        GXKInstallMainAppHooks(); // 类加载晚于构造阶段时补一次。
+    });
 }

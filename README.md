@@ -36,11 +36,20 @@
 * **搜索历史单条删除**：搜索分页每条历史记录右侧叠一个 28pt 的「×」，点击即从当前建议数组删掉该条并重刷列表，同时把持久化记录里同名的条目去掉（只删不造：只有键名含 `RecentQueries` 且确实命中才写回）。
 * **不碰 cell 布局**：× 是 `contentView` 上的叠加按钮（`autoresizingMask` 跟随），不参与原生自动布局、不改行高、不改约束。
 
-### 5. 地图分页一键跳系统定位设置
-* **改跳目标**：地图分页在定位关闭时会显示「开启位置信息服务」链接，官方实现跳到 Gboard 自己的搜索设置页。本补丁把它改为打开 iOS 的定位服务页，等价于快捷指令里的 `prefs:root=Privacy&path=LOCATION`。
-* **两个接管点**：`GKBLocationPermissionCardView` 的 `handleGoToSettings:handler:` 与 `handleLocationPermissionTap:handler:`——命中就直接开定位设置，不再走官方错误地址；同时在卡片里找到那条链接文字，**原位置叠一个同文案按钮**（`autoresizingMask = None`，不加约束、不改行高、不改容器），点它效果相同。
-* **通道级联**：`NSExtensionContext` 的 `openURL:completionHandler:`（键盘扩展唯一官方支持的通道，需 `RequestsOpenAccess`）→ framework 的 `gkb_openURL:` → 系统 `openURL:options:completionHandler:`，逐级尝试，全部失败才回落原生行为。每一步都写 `[GXK]` 日志，真机看 Console 即可判断走到哪一层。
-* **绝不污染父类**：`loadWithModel:toShare:` 与 `layoutSubviews` 都来自 `GKBCardView` 父类，一律用 `class_addMethod` 在子类新增覆盖；新增失败才退到 `method_setImplementation`，不会把定位卡片的逻辑带到其它卡片上。
+### 5. 地图分页一键去开定位（A 路线：经宿主 App 中转）
+* **为什么不是直接跳**：键盘扩展的 `NSExtensionContext` 只放行宿主 App 自己的 URL scheme，`prefs:` 与 `App-Prefs:` 一律被沙盒拒绝（实测点击无任何反应）。快捷指令能跳是因为它有独立授权，键盘扩展没有。因此键盘侧只发一个中转地址 `gboard://x-gxk-location`。
+* **两个接管点**：`GKBLocationPermissionCardView` 的 `handleGoToSettings:handler:` 与 `handleLocationPermissionTap:handler:`——命中就发中转地址，不再走官方那个错误的 Gboard 搜索设置页。
+* **找不到原生链接也照挂**：地图卡片里的「开启位置信息服务」是运行时拼的 attributed string，扫描可能落空，所以按文字匹配不到时就在卡片底部固定位置叠一个「去 Gboard 设置开启定位」按钮（`autoresizingMask = None`，不加约束、不改行高、不改容器）。文案读取同时兼容 `UILabel.text` 与 `attributedText.string`。
+* **主 App 三级级联**：同一个 dylib 也注入主 App，`AppDelegate` 的 `application:openURL:options:` 接住中转后依次尝试 `prefs:root=Privacy&path=LOCATION` → `App-Prefs:root=Privacy&path=LOCATION` → `UIApplicationOpenSettingsURLString`（最后一级必然能打开「设置 → Gboard」）。每一步都写 `[GXK]` 日志。
+* **绝不污染父类**：`loadWithModel:toShare:` 与 `layoutSubviews` 都来自 `GKBCardView` 父类，一律用 `class_addMethod` 在子类新增覆盖；新增失败才退到 `method_setImplementation`。
+
+### 6. 常用语分页（G 图标内，与搜索／翻译／地图同级）
+* **分页入口**：`GKBMiniAppManager` 的 `availablePickerItems` 末尾追加一项「常用语」（`GKBAppStripItem`，identifier `gxk_phrases`，图标用 `UIGraphicsImageRenderer` 现画「语」字，不依赖资源名）。`GKBMiniAppExtensionBase` 的 `miniAppPicker:didSelectItem:atIndex:` 命中该 identifier 时改为弹自己的面板，其余分页原样回落。
+* **面板是叠加层**：`GXKPhrasesPanel` 铺满键盘视图 `bounds`，`layoutSubviews` 手算 frame，**不新增任何约束、不改键盘高度**。顶部有标题、钉子按钮与关闭「×」，中间是常用语列表，底部一行提示。
+* **钉子固定**：钉子关闭（默认）时点一条常用语就上屏并立即关闭面板；钉子打开后点多少条都不关，可以连续输入。状态存 App Group 的 `GXKPhrasesPinned`。
+* **上屏方式**：通过 `UITextDocumentProxy` 的 `insertText:` 写入，和原生输入完全同一条路。
+* **维护入口在主 App**：主 App 的「设置 → Gboard」页导航栏右侧多一个「常用语」按钮，进去是增／删／改列表（`UIAlertController` 输入，左滑删除）。数据存 App Group 的 `GXKPhrases` 数组，键盘与主 App 共享同一份。
+* **为什么不用设置项枚举**：二进制里查不到任何 `GKBSettingType*` 字符串，`GKBSettingsItem` 的 type 枚举值无法静态确定，硬塞会有崩风险，所以入口挂在导航栏而不是插进设置主页列表。
 
 ---
 

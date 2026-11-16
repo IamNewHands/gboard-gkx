@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""地图分页定位跳转模块的静态契约测试。
+"""地图分页定位跳转（A 路线）的静态契约测试。
 
-本机没有 clang，真机行为只能靠 GitHub Actions 编译后再验；这里只锁住
-「不改布局、不写死单一路径、通道级联、失败回落原生」这几条硬约束。
+键盘扩展只被放行宿主 App 自己的 URL scheme，prefs: 与 App-Prefs: 会被沙盒拒绝，
+所以键盘侧只发 gboard:// 中转，真正的设置跳转由主 App 代跑。这里锁住这条链路。
 """
 import pathlib
 import unittest
@@ -12,8 +12,15 @@ SOURCE = ROOT / "dylib" / "gkx.m"
 
 
 def function_body(source: str, signature: str) -> str:
-    start = source.index(signature)
-    brace = source.index("{", start)
+    """Locate a definition, skipping earlier forward declarations of the same name."""
+    search = 0
+    while True:
+        start = source.index(signature, search)
+        brace = source.index("{", start)
+        semi = source.find(";", start, brace)
+        if semi == -1:
+            break  # 找到了函数定义，不是前置声明。
+        search = semi + 1
     depth = 0
     for index in range(brace, len(source)):
         char = source[index]
@@ -38,18 +45,26 @@ class LocationJumpTest(unittest.TestCase):
         disappear = function_body(self.source, "static void gkx_viewWillDisappear(")
         self.assertIn("GXKDetachLocationButton();", disappear)
 
-    def test_opens_location_panel_not_search_settings(self) -> None:
+    def test_keyboard_side_only_sends_host_scheme(self) -> None:
         body = function_body(self.source, "static NSArray<NSString *> *GXKLocationURLStrings(void)")
-        self.assertIn("prefs:root=Privacy&path=LOCATION", body)
-        # 绝不把 Gboard 自己的搜索设置页当成目标。
+        self.assertIn("gboard://x-gxk-location", body)
+        # 键盘扩展里绝不直接开 prefs: —— 沙盒会拒绝，用户只会看到「点了没反应」。
+        self.assertNotIn("@\"prefs:root=Privacy", body)
+        self.assertNotIn("@\"App-Prefs:root", body)
         self.assertNotIn("searchSettingsURL", body)
 
-    def test_channels_cascade_before_giving_up(self) -> None:
-        body = function_body(self.source, "static BOOL GXKOpenLocationSettings(void)")
-        for channel in ("GXKOpenViaExtensionContext", "GXKOpenViaFramework", "GXKOpenViaApplication"):
-            self.assertIn(channel, body)
-        # 三级都失败才 return NO，让调用方回落原生。
+    def test_main_app_relay_cascades_to_settings(self) -> None:
+        body = function_body(self.source, "static BOOL GXKMainAppOpenLocationSettings(void)")
+        self.assertIn("prefs:root=Privacy&path=LOCATION", body)
+        self.assertIn("App-Prefs:root=Privacy&path=LOCATION", body)
+        # 最后一级必须是本 App 设置页，保证 100% 能打开。
+        self.assertIn("UIApplicationOpenSettingsURLString", body)
         self.assertIn("return NO;", body)
+
+    def test_relay_url_is_recognised(self) -> None:
+        body = function_body(self.source, "static BOOL GXKIsLocationRelayURL(NSURL *url)")
+        self.assertIn("x-gxk-location", body)
+        self.assertIn("gboard", body)
 
     def test_native_handlers_fall_back_when_jump_fails(self) -> None:
         go = function_body(self.source, "static void gxk_locationGoToSettings(")
@@ -67,11 +82,10 @@ class LocationJumpTest(unittest.TestCase):
     def test_override_never_pollutes_parent_class(self) -> None:
         body = function_body(self.source, "static void GXKOverrideOrSkip(")
         self.assertIn("class_addMethod", body)
-        # 新增失败才 setImplementation，避免直接改到父类实现。
         self.assertIn("method_setImplementation", body)
 
     def test_every_attempt_is_logged(self) -> None:
-        body = function_body(self.source, "static BOOL GXKOpenLocationSettings(void)")
+        body = function_body(self.source, "static BOOL GXKMainAppOpenLocationSettings(void)")
         self.assertGreaterEqual(body.count("GXK_LOG("), 2)
 
 
