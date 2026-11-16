@@ -120,6 +120,8 @@ python tools/inject.py `
   --out "dist/gboard-gkx-unsigned.ipa"
 ```
 
+`--app-group` 是必填参数，漏掉脚本直接退出（exit 2）。真机上漏掉这一步的包会表现为：打开 Gboard 应用闪退、键盘锁在 26 键切不到九键。
+
 注入脚本将自动执行：
 1. 解包原 IPA 并解析 Unix 文件权限与时间戳；
 2. 在 `Gboard.appex/Gboard` 的 Mach-O Padding 区写入 `LC_LOAD_DYLIB @rpath/libgkx.dylib`；

@@ -3,7 +3,7 @@
 // 核心范围：
 //   1. 外部万象词库 (user_dictionary.db) 自动部署到 App Group 共享容器
 //   2. 九键界面回车键上方表情键替换为「重输」/「换行」动态切换按键
-//   3. 九键 G 图标 band 内嵌工具栏：全选/复制/粘贴/剪切/收起键盘（原地复用，不加高度）
+//   3. 九键 G 图标 band 内嵌工具栏：全选/复制/粘贴/剪切/收起（原地复用，不加高度）
 // 其余一切界面与输入逻辑均完全保持 Gboard 官方原生！
 
 #import <UIKit/UIKit.h>
@@ -443,6 +443,7 @@ static void GXKUpdateToolbar(UIViewController *vc);
 - (void)onPaste:(UIButton *)sender;
 - (void)onCut:(UIButton *)sender;
 - (void)onDismissKeyboard:(UIButton *)sender;
+- (void)deleteBeforeCursor:(NSUInteger)count;
 - (BOOL)refuseWhileComposing:(UIButton *)sender;
 - (id<UITextDocumentProxy>)proxy;
 @end
@@ -456,6 +457,17 @@ static BOOL gToolbarLogoWasHidden;
 static CGFloat gToolbarLogoWasAlpha = 1.0;
 static BOOL gUpdatingToolbar;
 static GXKToolbarTarget *gToolbarTarget;
+
+// band 内被工具条盖住的原生图标（九键顶部右侧语音按钮等）：挂载时 alpha=0，撤走时原样归还。
+static NSMutableArray<UIView *> *gToolbarHiddenViews;
+static NSMutableArray<NSNumber *> *gToolbarHiddenAlphas;
+// 「全选」记下的文本与时间：紧接着的「剪切」直接作用于同一段内容，不再要求系统选区。
+static NSString *gToolbarSelectAllText;
+static NSTimeInterval gToolbarSelectAllAt;
+// 单次剪切最多删这么多字符：documentContext 本身会被系统截断，这里再兜一层上限。
+#define GXK_CUT_MAX_CHARS 4000
+// 全选之后多少秒内点剪切仍视为「剪全部」。
+#define GXK_SELECT_ALL_WINDOW 15.0
 
 // 点击反馈只改标题 1.1 秒，不弹面板、不改几何：键盘扩展里最省事也最不容易卡。
 static void GXKFlashTitle(UIButton *button, NSString *text) {
@@ -566,6 +578,102 @@ static UIColor *GXKToolbarTint(UIView *body) {
     return [UIColor darkGrayColor]; // 部署目标 12.0：labelColor 不可用。
 }
 
+static void GXKRestoreToolbarDecorations(void) {
+    for (NSUInteger i = 0; i < gToolbarHiddenViews.count; i++) {
+        UIView *view = gToolbarHiddenViews[i];
+        if (i < gToolbarHiddenAlphas.count) view.alpha = gToolbarHiddenAlphas[i].doubleValue;
+    }
+    [gToolbarHiddenViews removeAllObjects];
+    [gToolbarHiddenAlphas removeAllObjects];
+}
+
+static BOOL GXKViewHasImage(UIView *view) {
+    if ([view isKindOfClass:[UIImageView class]]) return YES;
+    for (UIView *sub in view.subviews) {
+        if (GXKViewHasImage(sub)) return YES;
+    }
+    return NO;
+}
+
+// 工具条只借 band，但 band 里仍可能浮着原生装饰图标（九键顶部右侧那个语音按钮就是：
+// 它的祖先空尺寸、不裁剪，几何上逃过 band 计算，视觉上却压在按钮文字上）。
+// 这里只挑「图标尺寸 + 含图片 + 与 band 相交」的视图隐藏，命中即整块子树让位；
+// 文本、候选词、键帽都不满足这些条件，不会被误伤。撤走工具条时原样归还。
+static NSUInteger GXKHideToolbarDecorations(UIView *row, UIView *logo, UIView *root, CGRect band) {
+    if (!row || !logo || CGRectIsEmpty(band)) return 0;
+    if (!gToolbarHiddenViews) gToolbarHiddenViews = [NSMutableArray array];
+    if (!gToolbarHiddenAlphas) gToolbarHiddenAlphas = [NSMutableArray array];
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:row];
+    NSUInteger visited = 0;
+    while (stack.count && visited++ < 800) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        if (view == row) {
+            [stack addObjectsFromArray:view.subviews];
+            continue;
+        }
+        if (view == logo || [view isDescendantOfView:logo] || [logo isDescendantOfView:view]) continue;
+        if (view == gToolbarStack || [view isDescendantOfView:gToolbarStack]) continue;
+        if (view.isHidden || view.alpha < 0.05) continue;
+        CGRect rect = [view convertRect:view.bounds toView:row];
+        CGSize size = rect.size;
+        BOOL iconSized = size.width >= 8.0 && size.height >= 8.0 && size.width <= 64.0 && size.height <= 64.0;
+        if (!iconSized || CGRectIsEmpty(CGRectIntersection(rect, band))) {
+            [stack addObjectsFromArray:view.subviews];
+            continue;
+        }
+        if (!GXKViewHasImage(view)) {
+            [stack addObjectsFromArray:view.subviews];
+            continue;
+        }
+        [gToolbarHiddenViews addObject:view];
+        [gToolbarHiddenAlphas addObject:@(view.alpha)];
+        view.alpha = 0.0; // 整块子树已让位，不再向下找。
+    }
+    if (gToolbarHiddenViews.count) {
+        GXK_LOG(@"工具条: 让位原生图标 %lu 个", (unsigned long)gToolbarHiddenViews.count);
+    }
+    return gToolbarHiddenViews.count;
+}
+
+// 组字中工具条整条让位，这时必须把让位的原生图标还回去：否则拼音栏会缺一个按钮。
+static void GXKSyncToolbarDecorations(BOOL composing) {
+    if (composing) {
+        GXKRestoreToolbarDecorations();
+        return;
+    }
+    UIView *row = gToolbarRow;
+    UIView *logo = gToolbarLogoView;
+    UIViewController *vc = gCurrentVC;
+    UIView *root = (vc && vc.isViewLoaded) ? vc.view : nil;
+    if (!row || !logo || !root) return;
+    if (gToolbarHiddenViews.count == 0) GXKHideToolbarDecorations(row, logo, root, gToolbarBand);
+}
+
+// 工具条底色取键盘自身的表面色，而不是透明：万一 band 里还有没被让位的原生素材，
+// 也不会从按钮缝隙里透出来。取面积最大的一块不透明背景，比按类名猜稳。
+static UIColor *GXKToolbarSurface(UIView *row, UIView *body) {
+    UIColor *rowColor = row.backgroundColor;
+    if ([rowColor isKindOfClass:[UIColor class]] && CGColorGetAlpha(rowColor.CGColor) > 0.9) return rowColor;
+    if (!body) return nil;
+    UIColor *best = nil;
+    CGFloat bestArea = 0.0;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:body];
+    NSUInteger visited = 0;
+    while (stack.count && visited++ < 800) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        if (view.isHidden || view.alpha < 0.05) continue;
+        UIColor *color = view.backgroundColor;
+        if ([color isKindOfClass:[UIColor class]] && CGColorGetAlpha(color.CGColor) > 0.9) {
+            CGFloat area = view.bounds.size.width * view.bounds.size.height;
+            if (area > bestArea) { bestArea = area; best = color; }
+        }
+        [stack addObjectsFromArray:view.subviews];
+    }
+    return best;
+}
+
 static void GXKDetachToolbar(void) {
     UIStackView *stack = gToolbarStack;
     UIView *logo = gToolbarLogoView;
@@ -577,6 +685,7 @@ static void GXKDetachToolbar(void) {
     gToolbarNineBody = nil;
     gToolbarBand = CGRectZero;
     [stack removeFromSuperview];
+    GXKRestoreToolbarDecorations();
     if (logo) {
         logo.hidden = logoWasHidden; // G 图标按原状态归还，不替用户决定隐藏。
         logo.alpha = logoWasAlpha;
@@ -585,7 +694,7 @@ static void GXKDetachToolbar(void) {
 
 static UIStackView *GXKMakeToolbar(UIView *row, UIColor *tint, UIColor *background) {
     UIFont *font = [UIFont fontWithName:@"Roboto-Regular" size:13.0] ?: [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
-    NSArray<NSString *> *titles = @[@"全选", @"复制", @"粘贴", @"剪切", @"收起键盘"];
+    NSArray<NSString *> *titles = @[@"全选", @"复制", @"粘贴", @"剪切", @"收起"];
     NSArray<NSString *> *actions = @[@"onSelectAll:", @"onCopy:", @"onPaste:", @"onCut:", @"onDismissKeyboard:"];
     UIStackView *stack = [[UIStackView alloc] initWithFrame:row.bounds];
     stack.axis = UILayoutConstraintAxisHorizontal;
@@ -621,13 +730,22 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     if (gToolbarStack && gToolbarRow && gToolbarLogoView && gToolbarRow.window &&
         gToolbarRow.window == root.window && [gToolbarRow isDescendantOfView:root] &&
         GXKKeyIsVisible(gToolbarRow, root)) {
+        GXKSyncToolbarDecorations(composing);
+        // 组字中工具条整体隐藏，band 已还原成原生宽度，这时不必也不该按 band 重挂。
+        if (composing) {
+            UIStackView *stack = gToolbarStack;
+            if (stack.superview != gToolbarRow) [gToolbarRow addSubview:stack];
+            if (!stack.hidden) stack.hidden = YES;
+            gUpdatingToolbar = NO;
+            return;
+        }
         CGRect band = CGRectZero;
         if (GXKToolbarBand(gToolbarRow, gToolbarLogoView, root, &band) &&
             fabs(band.origin.x - gToolbarBand.origin.x) < 0.5 &&
             fabs(band.size.width - gToolbarBand.size.width) < 0.5) {
             UIStackView *stack = gToolbarStack;
             if (stack.superview != gToolbarRow) [gToolbarRow addSubview:stack];
-            if (stack.hidden != composing) stack.hidden = composing;
+            if (stack.hidden) stack.hidden = NO;
             gUpdatingToolbar = NO;
             return;
         }
@@ -646,11 +764,18 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     }
 
     GXKDetachToolbar();
+    // 先让 band 内的原生图标（语音按钮等）让位，再按新的可见性重算空位：
+    // 被藏掉的邻居不再挡路，五个按钮能分到更多宽度，也不会再被压在下面。
+    if (!composing && GXKHideToolbarDecorations(row, logo, root, band) > 0) {
+        CGRect widened = CGRectZero;
+        if (GXKToolbarBand(row, logo, root, &widened) && widened.size.width > band.size.width) band = widened;
+    }
     if (!gToolbarTarget) gToolbarTarget = [[GXKToolbarTarget alloc] init];
     gToolbarTarget.controller = vc;
 
     UIColor *tint = GXKToolbarTint(body);
-    UIStackView *stack = GXKMakeToolbar(row, tint, [UIColor clearColor]);
+    UIColor *surface = GXKToolbarSurface(row, body) ?: [UIColor clearColor];
+    UIStackView *stack = GXKMakeToolbar(row, tint, surface);
     gToolbarStack = stack;
     gToolbarRow = row;
     gToolbarLogoView = logo;
@@ -698,25 +823,28 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     // 长文本下 documentContext 会被系统截断，这是平台上限，不是本补丁的取舍。
     if ([self refuseWhileComposing:sender]) return;
     id<UITextDocumentProxy> proxy = self.proxy;
+    if (!proxy) return;
     NSString *before = proxy.documentContextBeforeInput ?: @"";
     NSString *after = proxy.documentContextAfterInput ?: @"";
     NSString *text = [before stringByAppendingString:after];
     if (!text.length) { GXKFlashTitle(sender, @"无文本"); return; }
     [UIPasteboard generalPasteboard].string = text;
-    GXKFlashTitle(sender, @"已复制");
-    GXKImpact(UIImpactFeedbackStyleLight);
+    // 记下这次「全选」覆盖的范围：紧接着点「剪切」直接按这段文本落地，不再要求系统选区。
+    gToolbarSelectAllText = text;
+    gToolbarSelectAllAt = [NSDate timeIntervalSinceReferenceDate];
+    GXKImpact(UIImpactFeedbackStyleLight); // 成功不闪提示：连点时不改标题就不重排、不卡。
 }
 
 - (void)onCopy:(UIButton *)sender {
     if ([self refuseWhileComposing:sender]) return;
     id<UITextDocumentProxy> proxy = self.proxy;
+    if (!proxy) return;
     NSString *text = proxy.selectedText;
     if (!text.length) {
         text = [(proxy.documentContextBeforeInput ?: @"") stringByAppendingString:(proxy.documentContextAfterInput ?: @"")];
     }
     if (!text.length) { GXKFlashTitle(sender, @"无文本"); return; }
     [UIPasteboard generalPasteboard].string = text;
-    GXKFlashTitle(sender, @"已复制");
     GXKImpact(UIImpactFeedbackStyleLight);
 }
 
@@ -726,23 +854,48 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     NSString *text = [UIPasteboard generalPasteboard].string;
     if (!proxy || !text.length) { GXKFlashTitle(sender, @"剪贴板空"); return; }
     [proxy insertText:text];
-    GXKFlashTitle(sender, @"已粘贴");
     GXKImpact(UIImpactFeedbackStyleLight);
+}
+
+// 光标前逐字删除：只在用户明确点了「剪切」且确实有内容时才走，且总量有上限。
+// 先删「光标前」再删「光标后」是不可能的（扩展无法移动光标），所以只处理光标前那一段。
+- (void)deleteBeforeCursor:(NSUInteger)count {
+    id<UITextDocumentProxy> proxy = self.proxy;
+    if (!proxy) return;
+    NSUInteger limit = MIN(count, (NSUInteger)GXK_CUT_MAX_CHARS);
+    for (NSUInteger i = 0; i < limit; i++) [proxy deleteBackward];
 }
 
 - (void)onCut:(UIButton *)sender {
     if ([self refuseWhileComposing:sender]) return;
     id<UITextDocumentProxy> proxy = self.proxy;
-    NSString *text = proxy.selectedText;
-    if (!proxy || !text.length) {
-        // 无选区时绝不逐字删除：旧版按上下文长度循环 deleteBackward，长文本会卡死键盘扩展。
-        GXKFlashTitle(sender, @"先选中");
+    if (!proxy) return;
+    NSString *selected = proxy.selectedText;
+    if (selected.length) {
+        [UIPasteboard generalPasteboard].string = selected;
+        [proxy deleteBackward]; // 有选区时删掉的就是选区本身。
+        gToolbarSelectAllText = nil;
         GXKImpact(UIImpactFeedbackStyleLight);
         return;
     }
-    [UIPasteboard generalPasteboard].string = text;
-    [proxy deleteBackward]; // 有选区时删掉的就是选区本身。
-    GXKFlashTitle(sender, @"已剪切");
+    // 刚点过「全选」：把当时记下的内容直接剪切，等价于"全选→剪切"，不要求系统选区。
+    NSTimeInterval since = [NSDate timeIntervalSinceReferenceDate] - gToolbarSelectAllAt;
+    NSString *remembered = gToolbarSelectAllText;
+    if (remembered.length && since >= 0.0 && since <= GXK_SELECT_ALL_WINDOW) {
+        NSString *before = proxy.documentContextBeforeInput ?: @"";
+        NSString *after = proxy.documentContextAfterInput ?: @"";
+        NSString *current = [before stringByAppendingString:after];
+        // 只在文本没变过时按"全选"语义剪掉光标前那一段，避免误删新输入的内容。
+        if ([current isEqualToString:remembered] && before.length) {
+            [UIPasteboard generalPasteboard].string = remembered;
+            gToolbarSelectAllText = nil;
+            [self deleteBeforeCursor:before.length];
+            GXKImpact(UIImpactFeedbackStyleLight);
+            return;
+        }
+    }
+    // 其余情况绝不逐字删除：旧版按上下文长度循环 deleteBackward，长文本会卡死键盘扩展。
+    GXKFlashTitle(sender, @"先选中");
     GXKImpact(UIImpactFeedbackStyleLight);
 }
 

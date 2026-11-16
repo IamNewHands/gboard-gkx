@@ -2,7 +2,11 @@
 """把 libgkx.dylib 注入 Gboard IPA 的键盘扩展，输出未签名 IPA。
 
 用法:
-    python tools/inject.py --ipa <原始.ipa> --dylib <libgkx.dylib> --out <输出.ipa>
+    python tools/inject.py --ipa <原始.ipa> --dylib <libgkx.dylib> \
+        --app-group group.zunbengege.top --out <输出.ipa>
+
+--app-group 是必填项，不是可选优化：不改写的话 Gboard 拿不到 app group
+容器，真机上打开应用即闪退、键盘锁在 26 键无法切九键。
 
 实现要点:
   纯 Python 写 Mach-O 加载命令，不依赖 LIEF。
@@ -375,7 +379,12 @@ def main():
     ap.add_argument("--ipa", required=True)
     ap.add_argument("--dylib", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--app-group", help="把 Gboard 的 app group 改写成这个（描述文件授权的那个）")
+    ap.add_argument(
+        "--app-group",
+        required=True,
+        help="把 Gboard 的 app group 改写成这个（描述文件授权的那个，例如 group.zunbengege.top）。"
+             "必填：漏掉会导致真机启动闪退且键盘锁在 26 键。",
+    )
     ap.add_argument("--dict", help="预置 Mozc user_dictionary.db 词库文件")
     ap.add_argument("--keep", help="保留解包目录（调试用）")
     args = ap.parse_args()
@@ -387,6 +396,8 @@ def main():
         raise SystemExit("IPA 不存在: %s" % args.ipa)
     if args.dict and not os.path.isfile(args.dict):
         raise SystemExit("词库不存在: %s" % args.dict)
+    if not args.app_group.startswith("group.") or "\0" in args.app_group:
+        raise SystemExit("--app-group 必须是 group. 开头的合法标识符: %r" % args.app_group)
     if os.path.lexists(args.out):
         raise SystemExit("输出已存在，请指定新的 --out 文件名")
     if args.keep:
@@ -460,13 +471,14 @@ def main():
     removed = strip_signatures(workdir)
     print("      删除 %d 个签名目录" % len(removed))
 
-    if args.app_group:
-        print("[3.5/5] 改写 app group -> %s" % args.app_group)
-        changed = patch_app_groups(payload, args.app_group)
-        if not changed:
-            raise ValueError("No App Group strings matched; refusing a misleading package")
-        for rel, hits in changed:
-            print("      %s (%d 处)" % (rel, hits))
+    # 必做步骤：不改写的话 Gboard 拿不到 app group 容器，
+    # 真机表现为打开应用即闪退、键盘锁在 26 键无法切九键。
+    print("[3.5/5] 改写 app group -> %s" % args.app_group)
+    changed = patch_app_groups(payload, args.app_group)
+    if not changed:
+        raise SystemExit("没有匹配到任何 app group 字符串，拒绝产出误导性安装包")
+    for rel, hits in changed:
+        print("      %s (%d 处)" % (rel, hits))
 
     print("[4/5] 重新打包")
     out = repack(workdir, args.out, archive_metadata)

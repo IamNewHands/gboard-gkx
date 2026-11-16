@@ -102,7 +102,7 @@ git push origin main
 gh run download <RUN_ID> -n libgkx -D dist/artifact
 Copy-Item dist/artifact/libgkx.dylib dist/libgkx.dylib -Force
 
-# 4. 一键注入打包未签名 IPA
+# 4. 一键注入打包未签名 IPA（--app-group 必填，漏掉脚本直接退出）
 python tools/inject.py `
   --ipa "<local>\Gboard_2.3.19.ipa" `
   --dylib "dist/libgkx.dylib" `

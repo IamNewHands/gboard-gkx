@@ -60,6 +60,31 @@ class InjectContracts(unittest.TestCase):
             with self.assertRaises(ValueError):
                 inject.resolve_app_frameworks_dir("/tmp/Gboard.app", "/dummy/Gboard")
 
+    def test_app_group_flag_is_required(self):
+        """漏掉 --app-group 必须立刻报错：真机上漏掉会闪退且键盘锁 26 键。"""
+        import contextlib
+        import io
+
+        with mock.patch.object(sys, "argv", ["inject.py", "--ipa", "a.ipa", "--dylib", "b.dylib", "--out", "c.ipa"]):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as ctx:
+                    inject.main()
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertIn("--app-group", err.getvalue())
+
+    def test_app_group_rewrite_is_unconditional(self):
+        """改写 app group 不能是可跳过的分支。"""
+        main = function_body(self.source, "def main():")
+        self.assertIn("patch_app_groups(payload, args.app_group)", main)
+        self.assertNotIn("if args.app_group:", main)
+        # 没命中任何字符串时必须中止，而不是产出看起来正常的包。
+        self.assertIn("拒绝产出误导性安装包", main)
+
+    def test_app_group_format_is_validated_before_unpack(self):
+        main = function_body(self.source, "def main():")
+        guard = main.index('--app-group 必须是 group. 开头的合法标识符')
+        self.assertLess(guard, main.index("unpack(args.ipa, workdir)"))
+
     def test_both_resolvers_land_in_same_physical_dir(self):
         """同一份 dylib 对两个进程都可达：两条 rpath 必须解析到同一目录。"""
         app = str(ROOT / "Payload/Gboard.app")
