@@ -6,6 +6,7 @@
 //   3. 九键 G 图标 band 内嵌工具栏：全选/复制/粘贴/剪切/收起（原地复用，不加高度）
 //   4. G 图标展开页去掉 YouTube / 联系人两页
 //   5. 搜索历史每行右侧叠 ×，点掉即删（列表 + 持久化记录）
+//   6. 地图分页：定位关闭时直接跳 iOS 定位设置（接管原生链接 + 叠「去开启定位」按钮）
 // 其余一切界面与输入逻辑均完全保持 Gboard 官方原生！
 
 #import <UIKit/UIKit.h>
@@ -1129,6 +1130,8 @@ static void GXKUpdateActionKey(UIViewController *vc) {
 
 static void GXKApplyTelemetryBlockIfNeeded(void);
 static void GXKApplyMiniAppAndSuggestionHooks(void);
+static void GXKInstallLocationHooks(void);
+static void GXKDetachLocationButton(void);
 
 static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
     if (gOrigTextDidChange) gOrigTextDidChange(self, _cmd, textInput);
@@ -1163,6 +1166,7 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     GXKRefreshComposingState((UIViewController *)self); // 新会话先取一次真实组字状态。
     GXKApplyTelemetryBlockIfNeeded(); // 兜底：构造函数时framework若未就绪，这里补一次。
     GXKApplyMiniAppAndSuggestionHooks(); // 分页裁剪与历史删除：类未就绪时下次出现再试。
+    GXKInstallLocationHooks(); // 地图分页定位跳转：同上，类未就绪时下次出现再试。
 
     // 部署外部万象词库
     GXKEnsureUserDictionaryDeployed();
@@ -1181,6 +1185,7 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
         GXKStopPolling();
         GXKDetachActionKey();
         GXKDetachToolbar(); // 扩展隐藏后工具条随宿主一起撤走，下次出现重新定位。
+        GXKDetachLocationButton(); // 定位按钮随地图分页一起撤走。
         GXKReleaseHaptics(); // 扩展隐藏后不常驻触觉引擎。
     }
     if (gOrigViewWillDisappear) gOrigViewWillDisappear(self, _cmd, animated);
@@ -1485,6 +1490,305 @@ static void GXKInstallSuggestionHooks(void) {
 static void GXKApplyMiniAppAndSuggestionHooks(void) {
     GXKInstallMiniAppHooks();
     GXKInstallSuggestionHooks();
+}
+
+#pragma mark - 地图分页：定位设置快捷跳转
+
+// 目标：地图分页在定位关闭时会显示「开启位置信息服务」链接，原生实现跳到 Gboard 自己的
+// 搜索设置页。这里接管这条链路，改为打开 iOS 的定位服务设置页（等价于快捷指令
+// prefs:root=Privacy&path=LOCATION）：
+//   1. hook 权限卡片的「去设置」处理器：命中就直接开定位设置页，不再走原生错误地址。
+//   2. 在卡片里找到那条链接文字，原位置叠一个同文案按钮，点它同样跳定位设置页。
+// 通道按可用性级联（扩展上下文 → framework 通道 → 系统 openURL），全失败才回落原生。
+// 每一步都打日志，真机看 Console 里 [GXK] 前缀即可判断走到哪一层。
+
+#define GXK_LOCATION_BUTTON_TAG 0x47584B4C  // 'GXKL'
+#define GXK_LOCATION_MAX_NODES 1500
+
+static BOOL gxk_location_hooked = NO;
+static BOOL gUpdatingLocationButton = NO;
+static void (*gOrigLocationGoToSettings)(id, SEL, id, id);
+static void (*gOrigLocationPermissionTap)(id, SEL, id, id);
+static void (*gOrigLocationCardLoad)(id, SEL, id, BOOL);
+static void (*gOrigLocationCardLayout)(id, SEL);
+static __weak UIView *gLocationCardView;
+static __weak UIButton *gLocationJumpButton;
+
+// 在子类上新增覆盖方法，绝不改父类实现：loadWithModel:toShare: 与 layoutSubviews
+// 都来自父类，直接 setImplementation 会污染所有卡片。
+static void GXKOverrideOrSkip(NSString *className, NSString *selName, IMP imp, void **orig) {
+    Class cls = NSClassFromString(className);
+    if (!cls) return;
+    SEL sel = NSSelectorFromString(selName);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    if (orig) *orig = (void *)method_getImplementation(m);
+    if (!class_addMethod(cls, sel, imp, method_getTypeEncoding(m))) {
+        method_setImplementation(m, imp);
+    }
+}
+
+static NSArray<NSString *> *GXKLocationURLStrings(void) {
+    // 依次尝试：设置里的定位页 → 隐私页 → 定位服务页。
+    return @[@"prefs:root=Privacy&path=LOCATION",
+             @"App-Prefs:root=Privacy&path=LOCATION",
+             @"prefs:root=Privacy&path=LOCATION&path=LOCATION_SERVICES"];
+}
+
+// 通道 1：NSExtensionContext。键盘扩展唯一官方支持的打开 URL 方式（需 RequestsOpenAccess）。
+static BOOL GXKOpenViaExtensionContext(id host, NSURL *url) {
+    if (!host || !url) return NO;
+    id context = nil;
+    if ([host respondsToSelector:@selector(extensionContext)]) {
+        context = ((id (*)(id, SEL))objc_msgSend)(host, @selector(extensionContext));
+    }
+    if (!context || ![context respondsToSelector:@selector(openURL:completionHandler:)]) return NO;
+    @try {
+        void (^completion)(BOOL) = ^(BOOL ok) {
+            GXK_LOG(@"[*] 扩展上下文跳转回调 success=%d", ok ? 1 : 0);
+        };
+        ((void (*)(id, SEL, id, id))objc_msgSend)(context, @selector(openURL:completionHandler:),
+                                                  url, (id)completion);
+        return YES;
+    } @catch (NSException *e) {
+        GXK_LOG(@"[!] 扩展上下文打开异常: %@", e.reason);
+        return NO;
+    }
+}
+
+// 通道 2：Gboard framework 自带的 gkb_openURL: 分类方法。
+static BOOL GXKOpenViaFramework(id host, NSURL *url) {
+    if (!host || !url) return NO;
+    if (![host respondsToSelector:@selector(gkb_openURL:)]) return NO;
+    @try {
+        ((void (*)(id, SEL, id))objc_msgSend)(host, @selector(gkb_openURL:), url);
+        return YES;
+    } @catch (NSException *e) {
+        GXK_LOG(@"[!] framework 打开异常: %@", e.reason);
+        return NO;
+    }
+}
+
+// 通道 3：系统 openURL。扩展里通常无效，但保留兜底，异常一律吞掉。
+static BOOL GXKOpenViaApplication(NSURL *url) {
+    if (!url) return NO;
+    Class appClass = NSClassFromString(@"UIApplication");
+    if (!appClass) return NO;
+    id app = nil;
+    @try {
+        app = ((id (*)(id, SEL))objc_msgSend)(appClass, @selector(sharedApplication));
+    } @catch (NSException *e) {
+        app = nil;
+    }
+    if (!app) return NO;
+    SEL sel = @selector(openURL:options:completionHandler:);
+    if (![app respondsToSelector:sel]) return NO;
+    @try {
+        ((void (*)(id, SEL, id, id, id))objc_msgSend)(app, sel, url, @{}, nil);
+        return YES;
+    } @catch (NSException *e) {
+        return NO;
+    }
+}
+
+static BOOL GXKOpenLocationSettings(void) {
+    id host = gCurrentVC;
+    if (!host) return NO;
+    for (NSString *text in GXKLocationURLStrings()) {
+        NSURL *url = [NSURL URLWithString:text];
+        if (!url) continue;
+        if (GXKOpenViaExtensionContext(host, url)) {
+            GXK_LOG(@"[*] 定位设置跳转: 扩展上下文 %@", text);
+            return YES;
+        }
+        if (GXKOpenViaFramework(host, url)) {
+            GXK_LOG(@"[*] 定位设置跳转: framework %@", text);
+            return YES;
+        }
+        if (GXKOpenViaApplication(url)) {
+            GXK_LOG(@"[*] 定位设置跳转: 系统 openURL %@", text);
+            return YES;
+        }
+        GXK_LOG(@"[!] 该地址所有通道均不可用: %@", text);
+    }
+    return NO;
+}
+
+// 卡片里那条链接的文字：命中「开启/设置/位置信息/定位/location」都算候选。
+static NSString *GXKViewPlainText(UIView *view) {
+    if ([view isKindOfClass:[UILabel class]]) return ((UILabel *)view).text;
+    if ([view isKindOfClass:[UIButton class]]) {
+        UIButton *button = (UIButton *)view;
+        NSString *title = [button titleForState:UIControlStateNormal];
+        return title.length ? title : button.currentTitle;
+    }
+    return nil;
+}
+
+static BOOL GXKTextLooksLikeLocationLink(NSString *text) {
+    if (text.length == 0) return NO;
+    return [text rangeOfString:@"位置信息"].location != NSNotFound ||
+           [text rangeOfString:@"定位"].location != NSNotFound ||
+           [text rangeOfString:@"Location"].location != NSNotFound ||
+           [text rangeOfString:@"location"].location != NSNotFound;
+}
+
+// 找面积最小的那条链接文字，优先带「开启」「设置」字样的，避免命中卡片正文。
+static UIView *GXKFindLocationLink(UIView *root) {
+    if (!root) return nil;
+    UIView *best = nil;
+    CGFloat bestArea = CGFLOAT_MAX;
+    int bestScore = -1;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    NSUInteger visited = 0;
+    while (stack.count > 0 && visited < GXK_LOCATION_MAX_NODES) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        visited++;
+        for (UIView *child in view.subviews) [stack addObject:child];
+        if (view == gLocationJumpButton) continue;
+        if (view.hidden || view.alpha < 0.05) continue;
+        NSString *text = GXKViewPlainText(view);
+        if (!GXKTextLooksLikeLocationLink(text)) continue;
+        int score = 0;
+        if ([text rangeOfString:@"开启"].location != NSNotFound) score += 2;
+        if ([text rangeOfString:@"设置"].location != NSNotFound) score += 1;
+        CGFloat area = CGRectGetWidth(view.frame) * CGRectGetHeight(view.frame);
+        if (score > bestScore || (score == bestScore && area < bestArea)) {
+            best = view;
+            bestScore = score;
+            bestArea = area;
+        }
+    }
+    return best;
+}
+
+@interface GXKLocationTarget : NSObject
+- (void)onJumpToLocationSettings:(UIButton *)sender;
+@end
+
+@implementation GXKLocationTarget
+
+- (void)onJumpToLocationSettings:(UIButton *)sender {
+    GXKImpact(UIImpactFeedbackStyleLight);
+    GXK_LOG(@"[*] 点了「去开启定位」");
+    if (GXKOpenLocationSettings()) {
+        GXKFlashTitle(sender, @"已跳转");
+        return;
+    }
+    GXK_LOG(@"[!] 定位设置打不开，提示用户手动去设置");
+    GXKFlashTitle(sender, @"请手动打开");
+}
+
+@end
+
+static GXKLocationTarget *gLocationTarget = nil;
+
+// 在找到的链接原位置叠一个同文案按钮：不加高度、不改约束，只覆盖那条链接。
+static void GXKAttachLocationJump(UIView *card) {
+    if (!card || gUpdatingLocationButton) return;
+    gUpdatingLocationButton = YES;
+    UIView *link = GXKFindLocationLink(card);
+    if (!link) {
+        GXK_LOG(@"[!] 卡片里没找到定位链接文字，保持原生");
+        gUpdatingLocationButton = NO;
+        return;
+    }
+    NSString *title = GXKViewPlainText(link);
+    if (title.length == 0) title = @"去开启定位";
+    UIButton *button = gLocationJumpButton;
+    if (!button || button.superview != card) {
+        if (button) [button removeFromSuperview];
+        if (!gLocationTarget) gLocationTarget = [[GXKLocationTarget alloc] init];
+        button = [UIButton buttonWithType:UIButtonTypeCustom];
+        button.tag = GXK_LOCATION_BUTTON_TAG;
+        button.adjustsImageWhenHighlighted = NO;
+        button.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
+        button.titleLabel.minimumScaleFactor = 0.7;
+        button.titleLabel.adjustsFontSizeToFitWidth = YES;
+        button.accessibilityLabel = @"去开启定位（跳系统定位设置）";
+        [button addTarget:gLocationTarget action:@selector(onJumpToLocationSettings:)
+         forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:button];
+        gLocationJumpButton = button;
+        GXK_LOG(@"[*] 已叠「%@」按钮", title);
+    }
+    [button setTitle:title forState:UIControlStateNormal];
+    UIColor *tint = nil;
+    if ([link isKindOfClass:[UILabel class]]) tint = ((UILabel *)link).textColor;
+    if (!tint) tint = [UIColor colorWithRed:0.26 green:0.52 blue:0.96 alpha:1.0];
+    [button setTitleColor:tint forState:UIControlStateNormal];
+    [button setTitleColor:[tint colorWithAlphaComponent:0.5] forState:UIControlStateHighlighted];
+    CGRect rect = [link convertRect:link.bounds toView:card];
+    rect = CGRectInset(rect, -6.0, -4.0);
+    if (!CGRectEqualToRect(button.frame, rect)) button.frame = rect;
+    button.autoresizingMask = UIViewAutoresizingNone;
+    if (card.subviews.lastObject != button) [card bringSubviewToFront:button];
+    gUpdatingLocationButton = NO;
+}
+
+static void gxk_locationGoToSettings(id self, SEL _cmd, id first, id second) {
+    GXK_LOG(@"[*] 原生「开启位置信息服务」被点击，尝试改跳系统定位设置");
+    if (GXKOpenLocationSettings()) {
+        GXK_LOG(@"[*] 已接管该链接，不再跳 Gboard 搜索设置");
+        return;
+    }
+    GXK_LOG(@"[!] 定位设置无法打开，回落原生行为");
+    if (gOrigLocationGoToSettings) gOrigLocationGoToSettings(self, _cmd, first, second);
+}
+
+// 点「开启位置信息服务」走的另一条入口：先试定位设置页，失败再回落原生请求权限。
+static void gxk_locationPermissionTap(id self, SEL _cmd, id first, id second) {
+    GXK_LOG(@"[*] 原生定位权限入口被点击，先试跳系统定位设置");
+    if (GXKOpenLocationSettings()) {
+        GXK_LOG(@"[*] 已接管该入口");
+        return;
+    }
+    GXK_LOG(@"[!] 定位设置无法打开，回落原生请求权限");
+    if (gOrigLocationPermissionTap) gOrigLocationPermissionTap(self, _cmd, first, second);
+}
+
+static void gxk_locationCardLoad(id self, SEL _cmd, id model, BOOL toShare) {
+    if (gOrigLocationCardLoad) gOrigLocationCardLoad(self, _cmd, model, toShare);
+    if (![self isKindOfClass:[UIView class]]) return;
+    gLocationCardView = (UIView *)self;
+    GXKAttachLocationJump((UIView *)self);
+    // 文案可能异步填充，补一次。
+    __weak UIView *weakCard = (UIView *)self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UIView *card = weakCard;
+        if (card) GXKAttachLocationJump(card);
+    });
+}
+
+static void gxk_locationCardLayout(id self, SEL _cmd) {
+    if (gOrigLocationCardLayout) gOrigLocationCardLayout(self, _cmd);
+    if (![self isKindOfClass:[UIView class]]) return;
+    if ((UIView *)self != gLocationCardView) return;
+    GXKAttachLocationJump((UIView *)self);
+}
+
+static void GXKDetachLocationButton(void) {
+    UIButton *button = gLocationJumpButton;
+    if (button) [button removeFromSuperview];
+    gLocationJumpButton = nil;
+    gLocationCardView = nil;
+}
+
+static void GXKInstallLocationHooks(void) {
+    if (gxk_location_hooked) return;
+    if (!NSClassFromString(@"GKBLocationPermissionCardView")) return;
+    GXKOverrideOrSkip(@"GKBLocationPermissionCardView", @"handleGoToSettings:handler:",
+                      (IMP)gxk_locationGoToSettings, (void **)&gOrigLocationGoToSettings);
+    GXKOverrideOrSkip(@"GKBLocationPermissionCardView", @"handleLocationPermissionTap:handler:",
+                      (IMP)gxk_locationPermissionTap, (void **)&gOrigLocationPermissionTap);
+    GXKOverrideOrSkip(@"GKBLocationPermissionCardView", @"loadWithModel:toShare:",
+                      (IMP)gxk_locationCardLoad, (void **)&gOrigLocationCardLoad);
+    GXKOverrideOrSkip(@"GKBLocationPermissionCardView", @"layoutSubviews",
+                      (IMP)gxk_locationCardLayout, (void **)&gOrigLocationCardLayout);
+    gxk_location_hooked = YES;
+    GXK_LOG(@"[*] 地图分页定位跳转已接管");
 }
 
 #pragma mark - 隐私上报拦截 (只掐 clearcut 与 Breakpad 上报)

@@ -36,6 +36,12 @@
 * **搜索历史单条删除**：搜索分页每条历史记录右侧叠一个 28pt 的「×」，点击即从当前建议数组删掉该条并重刷列表，同时把持久化记录里同名的条目去掉（只删不造：只有键名含 `RecentQueries` 且确实命中才写回）。
 * **不碰 cell 布局**：× 是 `contentView` 上的叠加按钮（`autoresizingMask` 跟随），不参与原生自动布局、不改行高、不改约束。
 
+### 5. 地图分页一键跳系统定位设置
+* **改跳目标**：地图分页在定位关闭时会显示「开启位置信息服务」链接，官方实现跳到 Gboard 自己的搜索设置页。本补丁把它改为打开 iOS 的定位服务页，等价于快捷指令里的 `prefs:root=Privacy&path=LOCATION`。
+* **两个接管点**：`GKBLocationPermissionCardView` 的 `handleGoToSettings:handler:` 与 `handleLocationPermissionTap:handler:`——命中就直接开定位设置，不再走官方错误地址；同时在卡片里找到那条链接文字，**原位置叠一个同文案按钮**（`autoresizingMask = None`，不加约束、不改行高、不改容器），点它效果相同。
+* **通道级联**：`NSExtensionContext` 的 `openURL:completionHandler:`（键盘扩展唯一官方支持的通道，需 `RequestsOpenAccess`）→ framework 的 `gkb_openURL:` → 系统 `openURL:options:completionHandler:`，逐级尝试，全部失败才回落原生行为。每一步都写 `[GXK]` 日志，真机看 Console 即可判断走到哪一层。
+* **绝不污染父类**：`loadWithModel:toShare:` 与 `layoutSubviews` 都来自 `GKBCardView` 父类，一律用 `class_addMethod` 在子类新增覆盖；新增失败才退到 `method_setImplementation`，不会把定位卡片的逻辑带到其它卡片上。
+
 ---
 
 ## 📐 开发规范与架构红线 (Development Standards)
