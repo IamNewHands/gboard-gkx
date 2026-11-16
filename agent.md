@@ -7,9 +7,12 @@
 
 ## 1. 项目定位与核心边界
 
-- **项目目标**：在 **iOS Gboard 2.3.19**（官方 IPA）基础上进行无源码逆向增强，在**100% 保留原生 Mozc 拼音引擎、官方界面排布与九键/全键盘滑行输入性能**的前提下，仅聚焦两大核心体验提升：
+- **项目目标**：在 **iOS Gboard 2.3.19**（官方 IPA）基础上进行无源码逆向增强，在**100% 保留原生 Mozc 拼音引擎、官方界面排布与九键/全键盘滑行输入性能**的前提下，聚焦以下核心体验提升：
   1. **Rime 万象方案词库预置**（精选 60,000 高频词，Protobuf 精简无 comment，运行时防 Jetsam 杀后台）；
-  2. **九键及其 123／符号页原生表情键智能切换**（输入拼音时为「重输」，清空拼音；空闲时为「换行」）。原生回车与26键不替换，保留原生键帽背景、边框与主题；两种标题不另加红色或高亮配色。
+  2. **九键及其 123／符号页原生表情键智能切换**（输入拼音时为「重输」，清空拼音；空闲时为「换行」）。原生回车与26键不替换，保留原生键帽背景、边框与主题；两种标题不另加红色或高亮配色；
+  3. **九键工具栏**（全选／复制／粘贴／剪切／收起），复用官方 G 图标 band，不加高度；
+  4. **G 图标展开页裁剪**：去掉 YouTube 与联系人两页；
+  5. **搜索历史单条删除**：每条历史右侧叠「×」，点掉即删（列表 + 持久化记录）。
 - **极简原则**：**已彻底废除并移除**悬浮工具条、键盘高度扩张约束、强制全屏深色注入及短语管理器。杜绝任何破坏原生界面视野与触摸链的做法。当前九键工具栏是**原地复用官方 G 图标 band**（G 图标 alpha 归零、工具条占同一段、空位不足即整条不显示），不新增视图高度、不位移任何原生容器。
 - **技术载体**：Objective-C 动态库注入（`libgkx.dylib`），在扩展初始化时进行最小必要生命周期 Hook。
 - **目标环境**：iOS 12.0 ~ iOS 18+，arm64 设备，支持 LCSign、SideStore、SideInstaller 等免越狱自签工具。
@@ -21,7 +24,7 @@
 ```
 gboard-gkx/
 ├── dylib/
-│   └── gkx.m                          # 核心动态库源码：万象词库部署 + 九键表情键重输/换行管理
+│   └── gkx.m                          # 核心动态库源码：词库部署 + 九键重输/换行 + G 图标 band 工具栏 + 分页裁剪 + 搜索历史单条删除
 ├── .github/workflows/
 │   └── build-dylib.yml                # CI 云端编译流：macOS-15 runner，原生 clang 编译 arm64，ldid 伪签名
 ├── tools/
@@ -81,7 +84,11 @@ gboard-gkx/
 * **历史教训**：曾试图通过给 `win` 或 `UIInputSetContainerView` 设置深色背景来消灭底栏浅色，结果导致键盘呼出时整块手机屏幕（上方聊天界面）变成一块不透明黑幕。
 * **开发准则**：全屏容器 `win.backgroundColor` 必须恒为 `[UIColor clearColor]`。键盘外观应跟随原生 UIKit 的 `traitCollection` 毛玻璃背景，严禁暴力递归覆盖。
 
-### 🚫 避坑 5：Windows 打包必须显式保留 Unix 权限（0o755 / 0o644）
+### 🚫 避坑 5：swizzle 必须按真实返回值类型声明原实现指针
+* **历史教训**：`GKBFeatureFlagManager` 的 `enableYouTubeMiniApp`／`enableContactsMiniApp` 名字像 BOOL，实际返回 `GKBBoolFeatureFlag` 对象。若把原实现指针声明成 `BOOL (*)(id, SEL)`，返回值被截断，hook 里拿到垃圾地址，必崩。
+* **开发准则**：写 hook 前先用 `dump_types.py` 查 method type encoding；`method_setImplementation` 的原实现指针签名必须与 encoding 严格一致。返回对象的 getter 想关掉功能时，优先改原对象的 `value`（保留对象身份），而不是伪造新对象。
+
+### 🚫 避坑 6：Windows 打包必须显式保留 Unix 权限（0o755 / 0o644）
 * **历史教训**：在 Windows 上用标准 zipfile 解包重打包后，所有文件的外部属性变为 `0o666`，丢失可执行权限（Execute 标志），导致真机加载 dylib 时报权限拒绝。
 * **开发准则**：`inject.py` 必须记录原包元数据，重打包时将 `create_system` 标记为 Unix(3)，主 App/扩展 Mach-O 与 `libgkx.dylib` 必须强制赋予 `0o755`，数据文件赋予 `0o644`。
 
@@ -102,13 +109,15 @@ git push origin main
 gh run download <RUN_ID> -n libgkx -D dist/artifact
 Copy-Item dist/artifact/libgkx.dylib dist/libgkx.dylib -Force
 
-# 4. 一键注入打包未签名 IPA（--app-group 必填，漏掉脚本直接退出）
+# 4. 一键注入打包未签名 IPA（--app-group 必填，漏掉脚本直接退出；--dict 漏掉词库不生效）
 python tools/inject.py `
   --ipa "<local>\Gboard_2.3.19.ipa" `
   --dylib "dist/libgkx.dylib" `
   --dict "dist/user_dictionary.db" `
   --app-group "group.zunbengege.top" `
   --out "dist/gboard-gkx-unsigned.ipa"
+#    若 dist 目录 ACL 拒绝创建临时目录（WinError 5），加 --keep 指向仓库外目录：
+#    --keep "<local>\gkx-pack-<tag>"，产物仍写 dist。
 
 # 5. 校验产物 Mach-O 与权限
 python tools/inspect_signed.py "dist/gboard-gkx-unsigned.ipa"

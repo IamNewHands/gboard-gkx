@@ -4,6 +4,8 @@
 //   1. 外部万象词库 (user_dictionary.db) 自动部署到 App Group 共享容器
 //   2. 九键界面回车键上方表情键替换为「重输」/「换行」动态切换按键
 //   3. 九键 G 图标 band 内嵌工具栏：全选/复制/粘贴/剪切/收起（原地复用，不加高度）
+//   4. G 图标展开页去掉 YouTube / 联系人两页
+//   5. 搜索历史每行右侧叠 ×，点掉即删（列表 + 持久化记录）
 // 其余一切界面与输入逻辑均完全保持 Gboard 官方原生！
 
 #import <UIKit/UIKit.h>
@@ -1126,6 +1128,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
 #pragma mark - 视图控制器生命周期 Hook
 
 static void GXKApplyTelemetryBlockIfNeeded(void);
+static void GXKApplyMiniAppAndSuggestionHooks(void);
 
 static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
     if (gOrigTextDidChange) gOrigTextDidChange(self, _cmd, textInput);
@@ -1159,6 +1162,7 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     gCurrentVC = (UIViewController *)self;
     GXKRefreshComposingState((UIViewController *)self); // 新会话先取一次真实组字状态。
     GXKApplyTelemetryBlockIfNeeded(); // 兜底：构造函数时framework若未就绪，这里补一次。
+    GXKApplyMiniAppAndSuggestionHooks(); // 分页裁剪与历史删除：类未就绪时下次出现再试。
 
     // 部署外部万象词库
     GXKEnsureUserDictionaryDeployed();
@@ -1190,6 +1194,292 @@ static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
         GXKUpdateToolbar((UIViewController *)self);
         GXKBumpPolling(GXK_POLL_BURST);
     }
+}
+
+#pragma mark - G 图标分页裁剪 + 搜索历史单条删除
+
+// 两件事都只改「原实现返回后的结果」，不碰布局、不加高度：
+//   1. 从 G 图标展开页的分页条里去掉 YouTube 与联系人两页（三层兜底）。
+//   2. 搜索历史每一行右侧叠一个 ×，点掉即从列表与持久化记录里删掉该条。
+// 任一类或方法在新版 Gboard 里消失就跳过，自然降级为原生行为。
+
+#define GXK_SUGGESTION_X_TAG 0x47584B58  // 'GXKX'
+static char GXKSuggestionTextKey;  // 关联对象键：必须用静态地址，字符串字面量会被合并。
+
+static BOOL gxk_mini_app_hooked = NO;
+static BOOL gxk_suggestion_hooked = NO;
+
+// 这两个 getter 返回 flag 对象，原实现指针必须按 id 返回声明，否则返回值被丢弃。
+static id (*gOrigEnableYouTubeMiniApp)(id, SEL);
+static id (*gOrigEnableContactsMiniApp)(id, SEL);
+static BOOL (*gOrigIsMiniAppEnabled)(id, SEL, id);
+static id (*gOrigAvailablePickerItems)(id, SEL);
+static void (*gOrigShowSuggestions)(id, SEL, id);
+static id (*gOrigCellForRow)(id, SEL, id, id);
+
+// 分页 identifier 判定：只看内容里有没有 youtube / contacts。
+// 常量符号在二进制里取不到可靠值，故一律用字符串包含匹配。
+static BOOL GXKIdentifierExcluded(id identifier) {
+    NSString *text = nil;
+    if ([identifier isKindOfClass:[NSString class]]) {
+        text = (NSString *)identifier;
+    } else if (identifier && [identifier respondsToSelector:@selector(identifier)]) {
+        id value = ((id (*)(id, SEL))objc_msgSend)(identifier, @selector(identifier));
+        if ([value isKindOfClass:[NSString class]]) text = value;
+    }
+    if (text.length == 0) return NO;
+    NSString *lower = [text lowercaseString];
+    return [lower rangeOfString:@"youtube"].location != NSNotFound ||
+           [lower rangeOfString:@"contacts"].location != NSNotFound;
+}
+
+// GKBFeatureFlagManager 的这两个 getter 返回的是 GKBBoolFeatureFlag 对象而非 BOOL，
+// 直接返回 NO 会类型错乱，这里返回一个 value==NO 的真实 flag 实例。
+static id GXKDisabledFeatureFlag(void) {
+    static id flag = nil;
+    static BOOL tried = NO;
+    if (!tried) {
+        tried = YES;
+        Class cls = NSClassFromString(@"GKBBoolFeatureFlag");
+        if (cls) {
+            id obj = [[cls alloc] init];
+            // 默认值本就是 NO，KVC 只是为了确保关闭；失败也照用该实例。
+            @try { [obj setValue:@NO forKey:@"value"]; } @catch (__unused NSException *e) {}
+            flag = obj;
+        }
+    }
+    return flag;
+}
+
+// 优先把原 flag 的 value 改成 NO（保留 key 与对象身份，外部观察者不会拿到 nil key）；
+// 改不动才退回一个自建 flag，最差情况由下面两层过滤兜住。
+static id GXKFlagTurnedOff(id original) {
+    if (original) {
+        @try {
+            [original setValue:@NO forKey:@"value"];
+            return original;
+        } @catch (__unused NSException *e) {}
+    }
+    return GXKDisabledFeatureFlag();
+}
+
+static id gxk_enableYouTubeMiniApp(id self, SEL _cmd) {
+    id original = gOrigEnableYouTubeMiniApp ? gOrigEnableYouTubeMiniApp(self, _cmd) : nil;
+    return GXKFlagTurnedOff(original);
+}
+
+static id gxk_enableContactsMiniApp(id self, SEL _cmd) {
+    id original = gOrigEnableContactsMiniApp ? gOrigEnableContactsMiniApp(self, _cmd) : nil;
+    return GXKFlagTurnedOff(original);
+}
+
+static BOOL gxk_isMiniAppEnabled(id self, SEL _cmd, id identifier) {
+    if (GXKIdentifierExcluded(identifier)) return NO;
+    return gOrigIsMiniAppEnabled ? gOrigIsMiniAppEnabled(self, _cmd, identifier) : YES;
+}
+
+static id gxk_availablePickerItems(id self, SEL _cmd) {
+    id items = gOrigAvailablePickerItems ? gOrigAvailablePickerItems(self, _cmd) : nil;
+    if (![items isKindOfClass:[NSArray class]]) return items;
+    NSArray *list = (NSArray *)items;
+    NSMutableArray *kept = [NSMutableArray arrayWithCapacity:list.count];
+    for (id item in list) {
+        if (!GXKIdentifierExcluded(item)) [kept addObject:item];
+    }
+    return kept;
+}
+
+static void GXKSwizzleOrSkip(NSString *className, NSString *selName, IMP imp, void **orig) {
+    Class cls = NSClassFromString(className);
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, NSSelectorFromString(selName));
+    if (!m) return;
+    if (orig) *orig = (void *)method_getImplementation(m);
+    method_setImplementation(m, imp);
+}
+
+static void GXKInstallMiniAppHooks(void) {
+    if (gxk_mini_app_hooked) return;
+    if (!NSClassFromString(@"GKBMiniAppManager")) return; // framework 还没加载，下次再试。
+    GXKSwizzleOrSkip(@"GKBFeatureFlagManager", @"enableYouTubeMiniApp",
+                     (IMP)gxk_enableYouTubeMiniApp, (void **)&gOrigEnableYouTubeMiniApp);
+    GXKSwizzleOrSkip(@"GKBFeatureFlagManager", @"enableContactsMiniApp",
+                     (IMP)gxk_enableContactsMiniApp, (void **)&gOrigEnableContactsMiniApp);
+    GXKSwizzleOrSkip(@"GKBMiniAppExtensionBase", @"isMiniAppEnabled:",
+                     (IMP)gxk_isMiniAppEnabled, (void **)&gOrigIsMiniAppEnabled);
+    GXKSwizzleOrSkip(@"GKBMiniAppManager", @"availablePickerItems",
+                     (IMP)gxk_availablePickerItems, (void **)&gOrigAvailablePickerItems);
+    gxk_mini_app_hooked = YES;
+    GXK_LOG(@"[*] 已裁剪 G 图标分页: 去掉 YouTube / 联系人");
+}
+
+static __weak id gSuggestionView;
+
+static void gxk_showSuggestions(id self, SEL _cmd, id suggestions) {
+    if (gOrigShowSuggestions) gOrigShowSuggestions(self, _cmd, suggestions);
+    gSuggestionView = self; // 只记宿主，删哪一条由点击时的显示文字决定。
+}
+
+static NSString *GXKSuggestionTextForCell(UIView *cell) {
+    if (!cell) return nil;
+    @try {
+        id label = [cell valueForKey:@"suggestionLabel"];
+        if ([label isKindOfClass:[UILabel class]]) {
+            NSString *text = ((UILabel *)label).text;
+            if (text.length > 0) return text;
+        }
+    } @catch (__unused NSException *e) {}
+    return nil;
+}
+
+// 从当前建议数组里按显示文字定位那一条：不猜行序，避免倒序排列时删错。
+static NSInteger GXKSuggestionIndexForText(id view, NSString *text) {
+    if (!view || text.length == 0) return NSNotFound;
+    id raw = nil;
+    @try { raw = [view valueForKey:@"suggestions"]; } @catch (__unused NSException *e) { return NSNotFound; }
+    if (![raw isKindOfClass:[NSArray class]]) return NSNotFound;
+    NSArray *list = (NSArray *)raw;
+    NSUInteger total = list.count;
+    for (NSUInteger i = 0; i < total; i++) {
+        id item = list[i];
+        NSString *candidate = nil;
+        @try {
+            id value = [item valueForKey:@"strippedText"];
+            if ([value isKindOfClass:[NSString class]]) candidate = value;
+        } @catch (__unused NSException *e) {}
+        if (candidate.length == 0 && [item isKindOfClass:[NSString class]]) candidate = item;
+        if (candidate.length == 0) continue;
+        if ([candidate isEqualToString:text]) return (NSInteger)i;
+    }
+    for (NSUInteger i = 0; i < total; i++) {
+        id item = list[i];
+        NSString *candidate = nil;
+        @try {
+            id value = [item valueForKey:@"strippedText"];
+            if ([value isKindOfClass:[NSString class]]) candidate = value;
+        } @catch (__unused NSException *e) {}
+        if (candidate.length == 0) continue;
+        if ([candidate rangeOfString:text].location != NSNotFound ||
+            [text rangeOfString:candidate].location != NSNotFound) return (NSInteger)i;
+    }
+    return NSNotFound;
+}
+
+// 只删不造：遍历所有带 RecentQueries 的键，命中才写回，没有命中一个字节都不动。
+static void GXKRemovePersistedRecentQuery(NSString *text) {
+    if (text.length == 0) return;
+    NSMutableArray *stores = [NSMutableArray array];
+    NSUserDefaults *standard = [NSUserDefaults standardUserDefaults];
+    if (standard) [stores addObject:standard];
+    NSUserDefaults *group = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+    if (group) [stores addObject:group];
+    for (NSUserDefaults *defaults in stores) {
+        NSDictionary *all = [defaults dictionaryRepresentation];
+        if (![all isKindOfClass:[NSDictionary class]]) continue;
+        for (NSString *key in all) {
+            if (![key isKindOfClass:[NSString class]]) continue;
+            if ([key rangeOfString:@"RecentQueries" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+            id value = all[key];
+            if (![value isKindOfClass:[NSArray class]]) continue;
+            NSArray *list = (NSArray *)value;
+            NSMutableArray *kept = [NSMutableArray arrayWithCapacity:list.count];
+            BOOL changed = NO;
+            for (id entry in list) {
+                if ([entry isKindOfClass:[NSString class]] && [(NSString *)entry isEqualToString:text]) {
+                    changed = YES;
+                    continue;
+                }
+                [kept addObject:entry];
+            }
+            if (changed) [defaults setObject:kept forKey:key];
+        }
+    }
+}
+
+@interface GXKSuggestionTarget : NSObject
+- (void)onDeleteSuggestion:(UIButton *)sender;
+@end
+
+static GXKSuggestionTarget *gSuggestionTarget;
+
+@implementation GXKSuggestionTarget
+- (void)onDeleteSuggestion:(UIButton *)sender {
+    id view = gSuggestionView;
+    NSString *text = objc_getAssociatedObject(sender, &GXKSuggestionTextKey);
+    if (!view || text.length == 0) return;
+    NSInteger index = GXKSuggestionIndexForText(view, text);
+    if (index == NSNotFound) return;
+    id raw = nil;
+    @try { raw = [view valueForKey:@"suggestions"]; } @catch (__unused NSException *e) { return; }
+    if (![raw isKindOfClass:[NSArray class]]) return;
+    NSMutableArray *next = [(NSArray *)raw mutableCopy];
+    if (index < 0 || (NSUInteger)index >= next.count) return;
+    [next removeObjectAtIndex:(NSUInteger)index];
+    GXKImpact(UIImpactFeedbackStyleLight);
+    if ([view respondsToSelector:@selector(showSuggestions:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(view, @selector(showSuggestions:), next);
+    }
+    GXKRemovePersistedRecentQuery(text);
+}
+@end
+
+static void GXKAttachSuggestionDelete(UIView *cell, UITableView *table) {
+    if (!cell) return;
+    UIView *host = cell.contentView ? cell.contentView : cell;
+    NSString *text = GXKSuggestionTextForCell(cell);
+    UIButton *button = [host viewWithTag:GXK_SUGGESTION_X_TAG];
+    if (text.length == 0) {
+        if (button) [button removeFromSuperview];
+        return;
+    }
+    if (!button) {
+        if (!gSuggestionTarget) gSuggestionTarget = [[GXKSuggestionTarget alloc] init];
+        button = [UIButton buttonWithType:UIButtonTypeSystem];
+        button.tag = GXK_SUGGESTION_X_TAG;
+        [button setTitle:@"×" forState:UIControlStateNormal];
+        button.titleLabel.font = [UIFont systemFontOfSize:19.0 weight:UIFontWeightRegular];
+        button.accessibilityLabel = @"删除这条搜索记录";
+        [button addTarget:gSuggestionTarget action:@selector(onDeleteSuggestion:)
+         forControlEvents:UIControlEventTouchUpInside];
+        [host addSubview:button];
+    }
+    objc_setAssociatedObject(button, &GXKSuggestionTextKey, text, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    CGFloat side = 28.0;
+    CGFloat width = CGRectGetWidth(cell.bounds);
+    if (width < side * 2.0 && table) width = CGRectGetWidth(table.bounds);
+    if (width < side * 2.0) width = 320.0;
+    CGFloat height = CGRectGetHeight(cell.bounds);
+    if (height <= 0) height = 44.0;
+    button.frame = CGRectMake(width - side - 4.0, (height - side) / 2.0, side, side);
+    button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin |
+                              UIViewAutoresizingFlexibleTopMargin |
+                              UIViewAutoresizingFlexibleBottomMargin;
+    if (host.subviews.lastObject != button) [host bringSubviewToFront:button];
+}
+
+static id gxk_cellForRow(id self, SEL _cmd, id tableView, id indexPath) {
+    id cell = gOrigCellForRow ? gOrigCellForRow(self, _cmd, tableView, indexPath) : nil;
+    if ([cell isKindOfClass:[UIView class]]) {
+        UITableView *table = [tableView isKindOfClass:[UITableView class]] ? (UITableView *)tableView : nil;
+        GXKAttachSuggestionDelete((UIView *)cell, table);
+    }
+    return cell;
+}
+
+static void GXKInstallSuggestionHooks(void) {
+    if (gxk_suggestion_hooked) return;
+    if (!NSClassFromString(@"GKBQuerySuggestionsView")) return;
+    GXKSwizzleOrSkip(@"GKBQuerySuggestionsView", @"showSuggestions:",
+                     (IMP)gxk_showSuggestions, (void **)&gOrigShowSuggestions);
+    GXKSwizzleOrSkip(@"GKBQuerySuggestionsView", @"tableView:cellForRowAtIndexPath:",
+                     (IMP)gxk_cellForRow, (void **)&gOrigCellForRow);
+    gxk_suggestion_hooked = YES;
+    GXK_LOG(@"[*] 搜索历史已加单条删除按钮");
+}
+
+static void GXKApplyMiniAppAndSuggestionHooks(void) {
+    GXKInstallMiniAppHooks();
+    GXKInstallSuggestionHooks();
 }
 
 #pragma mark - 隐私上报拦截 (只掐 clearcut 与 Breakpad 上报)

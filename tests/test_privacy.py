@@ -36,7 +36,7 @@ FORBIDDEN_SELECTORS = [
     "dealloc",
 ]
 
-# 正常功能域名：源码里一个都不许出现（禁止按域名拦截）
+# 正常功能域名：隐私上报段里一个都不许出现（禁止按域名拦截）
 FORBIDDEN_HOSTS = [
     "play.googleapis.com",
     "translation.googleapis.com",
@@ -44,6 +44,18 @@ FORBIDDEN_HOSTS = [
     "weather.com",
     "googleapis.com",
 ]
+
+# 只有真正属于"URL/域名"的串才做全文禁止；"youtube" 是普通单词，
+# G 图标分页裁剪需要按 mini app identifier 匹配它，那是另一件事。
+FORBIDDEN_URLS_ANYWHERE = [
+    "play.googleapis.com",
+    "translation.googleapis.com",
+    "weather.com",
+    "googleapis.com",
+]
+
+PRIVACY_SECTION_START = "#pragma mark - 隐私上报拦截"
+PRIVACY_SECTION_END = "#pragma mark - dylib 构造入口"
 
 
 def function_body(source: str, signature: str) -> str:
@@ -81,8 +93,16 @@ class PrivacyContracts(unittest.TestCase):
 
     def test_never_blocks_by_domain_or_url(self):
         stripped = re.sub(r"//[^\n]*", "", self.source)
+        start = stripped.index(PRIVACY_SECTION_START)
+        end = stripped.index(PRIVACY_SECTION_END)
+        privacy = stripped[start:end]
         for host in FORBIDDEN_HOSTS:
-            self.assertNotIn(host, stripped, f"must not filter by host: {host}")
+            self.assertNotIn(host, privacy, f"must not filter by host: {host}")
+
+    def test_no_url_is_referenced_anywhere(self):
+        stripped = re.sub(r"//[^\n]*", "", self.source)
+        for url in FORBIDDEN_URLS_ANYWHERE:
+            self.assertNotIn(url, stripped, f"must not reference url anywhere: {url}")
 
     def test_failure_is_safe_when_class_or_method_missing(self):
         helper = function_body(self.source, "static void GXKDisableOne(NSString *className, NSString *selName, IMP imp)")

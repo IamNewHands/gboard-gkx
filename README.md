@@ -26,8 +26,15 @@
 
 ### 3. 原生纯粹与零遮挡保障
 * **零界面遮挡**：不新增任何浮动工具条、不给键盘根视图加高度。九键工具栏只复用官方 G 图标原本占用的那一段空位（把 G 图标 alpha 归零后原地放入），左右边界各自停在相邻可见兄弟视图之前，绝不覆盖候选词栏、拼音 Preedit 行或右侧功能图标；空位不足 200pt 时整条不显示，完全保持原生。
-* **工具栏能力**：九键界面提供「全选／复制／粘贴／剪切／收起键盘」五个按钮。组字中拒绝改文本并提示"先完成拼音"；剪切仅在已有选区时生效，无选区只提示"先选中"，绝不做逐字符 `deleteBackward` 循环。
+* **工具栏能力**：九键界面提供「全选／复制／粘贴／剪切／收起」五个按钮。组字中拒绝改文本并提示"先完成拼音"；剪切仅在已有选区时生效，无选区只提示"先选中"，绝不做逐字符 `deleteBackward` 循环；「全选」后 15 秒内可直接「剪切」同一段文本。操作成功不弹提示（避免连点卡顿），只有失败才短暂改按钮标题。
+* **与语音图标不重叠**：工具条所在 band 内若存在带图片的小图标（如拼音顶栏的语音输入按钮），把它 `alpha` 归零让位，组字时自动还原；工具条撤走时一并恢复。
 * **滑行触摸链 100% 原生**：绝不全局 Hook `GKBSoftKeyView` 的触摸事件（`touchesBegan`/`touchesMoved`/`touchesEnded`），全键盘与九键滑行输入如丝顺滑。
+
+### 4. G 图标分页裁剪与搜索历史单条删除
+* **去掉两个分页**：G 图标展开页不再出现 YouTube 与联系人两页，三层兜底——`GKBFeatureFlagManager` 的 `enableYouTubeMiniApp`／`enableContactsMiniApp` 返回 `value = NO` 的 flag 对象、`GKBMiniAppExtensionBase` 的 `isMiniAppEnabled:` 对命中项返回 `NO`、`GKBMiniAppManager` 的 `availablePickerItems` 过滤掉这两项。任一类在新版 Gboard 中消失就自动跳过，降级为原生行为。
+* **identifier 按内容匹配**：mini app identifier 常量在二进制里取不到可靠值，一律用 `NSString` 小写包含匹配 `youtube`／`contacts`，不按域名或 URL 判断。
+* **搜索历史单条删除**：搜索分页每条历史记录右侧叠一个 28pt 的「×」，点击即从当前建议数组删掉该条并重刷列表，同时把持久化记录里同名的条目去掉（只删不造：只有键名含 `RecentQueries` 且确实命中才写回）。
+* **不碰 cell 布局**：× 是 `contentView` 上的叠加按钮（`autoresizingMask` 跟随），不参与原生自动布局、不改行高、不改约束。
 
 ---
 
