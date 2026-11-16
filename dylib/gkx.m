@@ -1425,7 +1425,12 @@ static GXKSuggestionTarget *gSuggestionTarget;
 
 static void GXKAttachSuggestionDelete(UIView *cell, UITableView *table) {
     if (!cell) return;
-    UIView *host = cell.contentView ? cell.contentView : cell;
+    // cell 在运行时是 UITableViewCell，但静态类型是 UIView：只有真是 cell 才取 contentView。
+    UIView *host = cell;
+    if ([cell isKindOfClass:[UITableViewCell class]]) {
+        UIView *content = ((UITableViewCell *)cell).contentView;
+        if (content) host = content;
+    }
     NSString *text = GXKSuggestionTextForCell(cell);
     UIButton *button = [host viewWithTag:GXK_SUGGESTION_X_TAG];
     if (text.length == 0) {
