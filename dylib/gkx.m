@@ -1846,6 +1846,7 @@ static BOOL gxk_phrases_hooked = NO;
 static BOOL gxk_appdelegate_hooked = NO;
 static BOOL gxk_settings_hooked = NO;
 static void (*gOrigMiniAppPickerDidSelect)(id, SEL, id, id, unsigned long long);
+static void (*gOrigArtMiniAppPickerDidSelect)(id, SEL, id, id, unsigned long long);
 static BOOL (*gOrigApplicationOpenURL)(id, SEL, id, id, id);
 static void (*gOrigSettingsViewDidLoad)(id, SEL);
 static __weak UIView *gPhrasesPanelView;
@@ -2144,6 +2145,11 @@ static void gxk_miniAppPickerDidSelect(id self, SEL _cmd, id picker, id item, un
         GXKShowPhrasesPanel(self);
         return;
     }
+    // 回落到「本次被替换的那一个」原实现：基类与艺术字扩展各有一份。
+    if (gOrigArtMiniAppPickerDidSelect && [self isKindOfClass:NSClassFromString(@"GKBArtExtension")]) {
+        gOrigArtMiniAppPickerDidSelect(self, _cmd, picker, item, index);
+        return;
+    }
     if (gOrigMiniAppPickerDidSelect) gOrigMiniAppPickerDidSelect(self, _cmd, picker, item, index);
 }
 
@@ -2152,6 +2158,9 @@ static void GXKInstallPhrasesHooks(void) {
     if (!NSClassFromString(@"GKBMiniAppExtensionBase")) return;
     GXKSwizzleOrSkip(@"GKBMiniAppExtensionBase", @"miniAppPicker:didSelectItem:atIndex:",
                      (IMP)gxk_miniAppPickerDidSelect, (void **)&gOrigMiniAppPickerDidSelect);
+    // GKBArtExtension 自己实现了一份 delegate，不挂它的话「常用语」在艺术字分页条上会变成死项。
+    GXKSwizzleOrSkip(@"GKBArtExtension", @"miniAppPicker:didSelectItem:atIndex:",
+                     (IMP)gxk_miniAppPickerDidSelect, (void **)&gOrigArtMiniAppPickerDidSelect);
     gxk_phrases_hooked = YES;
     GXK_LOG(@"[*] 常用语分页已接入 G 图标");
 }
