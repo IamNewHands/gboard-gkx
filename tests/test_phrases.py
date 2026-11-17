@@ -171,6 +171,23 @@ class PhrasesTest(unittest.TestCase):
         self.assertIn("GXKPhraseSave(", paste)
         self.assertIn("GXKPhrasesChangedNotification", paste)
 
+    def test_keyboard_extension_never_presents_alert(self) -> None:
+        # 剪贴板为空时也不能弹 alert：扩展里 present 任何控制器都会再拉一次呈现上下文，
+        # 真机实测照样闪退（空剪贴板点「+」）。提示改成导航标题闪一下。
+        paste = function_body(self.source, "- (void)gxkAddFromPasteboard")
+        self.assertNotIn("UIAlertController", paste)
+        self.assertNotIn("presentViewController:", paste)
+        self.assertIn("gxkFlashHint:", paste)
+        flash = function_body(self.source, "- (void)gxkFlashHint:")
+        self.assertIn("self.title", flash)
+        self.assertIn("dispatch_after", flash)
+        editor_source = self.source[self.source.index("@implementation GXKPhrasesEditorController"):]
+        edit = function_body(editor_source,
+                             "- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:")
+        keyboard_branch = edit[:edit.index("UIAlertController *alert")]
+        self.assertNotIn("UIAlertController", keyboard_branch)
+        self.assertNotIn("presentViewController:", keyboard_branch)
+
 
 if __name__ == "__main__":
     unittest.main()

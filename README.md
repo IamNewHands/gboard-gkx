@@ -50,9 +50,10 @@
   * 键盘面板右上角「编辑」→ 直接弹出编辑器，**不依赖主 App**，任何情况下都能增删改。
   * 主 App「设置 → Gboard」**主菜单里的一行「常用语」**，和「搜索设置」「键盘设置」同一层级。做法是 hook `GKBSettingsViewController` 的 `mainMenuPageDescriptor`，复制一条原生设置行（沿用它的 `type`／`settingID`）只换标题与 `key`，插到「搜索设置」后面；点击由 `GKBSettingsPageViewController` 的 `collectionView:didSelectItemAtIndexPath:` 认领，非本行原样回落原生。
   * 编辑器是 `GXKPhrasesEditorController`：`+` 新增，点行编辑，左滑删除，自带「完成」。改完发 `GXKPhrasesChangedNotification`，键盘面板收到即刷新。
-  * **键盘进程里没有任何「能打字」的入口**：点「+」/点行不再弹带输入框的 alert，改为读剪贴板——先把文字复制好，回来点「+」即新增、点某行即用剪贴板内容替换。原因见下条。
+  * **键盘进程里没有任何「能打字」的入口**：点「+」/点行不再弹带输入框的 alert，改为读剪贴板——先把文字复制好，回来点「+」即新增、点某行即用剪贴板内容替换。剪贴板为空时也不弹提示框，只让导航标题闪一下「先复制文字」。原因见下条。
   * 数据存 App Group 的 `GXKPhrases` 数组，键盘与主 App 共享同一份。
 * **一律全屏 modal，不 push**：主 App 的设置页跑在 Google 自绘的 `GOONavigationController` 里，往它上面 push 出来的控制器真机上是白屏（早先挂在「搜索设置」导航栏的那版就栽在这里）。所以编辑器统一包一层 `UINavigationController` + `UIModalPresentationFullScreen` present 出来。
+* **键盘扩展里连普通 alert 也不要弹**：不只是带输入框的 alert——扩展内 `presentViewController:` 任何控制器都会再拉一次呈现上下文，真机实测「剪贴板为空时点 +」照样闪退。键盘侧所有提示统一走 `gxkFlashHint:`（改 `self.title` 1.8 秒后复原），只有编辑器本身是唯一允许 present 的控制器。
 * **键盘扩展里绝不能弹输入框**：`UIAlertController` + `addTextFieldWithConfigurationHandler`（或任何内联 `UITextField`）会去要系统键盘，而系统键盘就是这个扩展自己，系统会递归激活同一扩展并杀掉进程。真机实测：G 图标 → 常用语 → 编辑 → 新增，必闪退；删除与上屏不受影响。所以 `GXKIsKeyboardExtension()` 为真时一律走剪贴板，主 App 侧（普通 App 进程）仍保留 alert 输入。
 * **为什么复制原生行而不是硬造**：二进制里查不到任何 `GKBSettingType*` 字符串，`GKBSettingsItem` 的 type 枚举值无法静态确定，硬塞会有崩风险；复制一条真实存在的行才能保证渲染、点击、埋点行为与原生完全一致。
 

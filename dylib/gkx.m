@@ -2127,6 +2127,18 @@ static void GXKInstallMainAppHooks(void) {
 // 键盘进程里没有任何"能打字"的入口：UIAlertController 带输入框、内联 UITextField 都会去要
 // 系统键盘，而系统键盘就是这个扩展自己，真机上必被系统杀掉（实测：点「新增」直接闪退）。
 // 所以键盘内新增/修改一律走剪贴板：先把文字复制好，再回来点按钮。这样全程不需要键盘。
+// 键盘进程里连"无输入框的 alert"都不能弹：扩展内 present 任何控制器都会再拉一次呈现上下文，
+// 真机上照样崩（实测：剪贴板为空时点「+」直接闪退）。所以提示一律改成导航标题闪一下。
+- (void)gxkFlashHint:(NSString *)text {
+    if (!text.length) return;
+    self.title = text;
+    __weak GXKPhrasesEditorController *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        weakSelf.title = @"常用语";
+    });
+}
+
 - (NSString *)gxkPasteboardCandidate {
     UIPasteboard *board = [UIPasteboard generalPasteboard];
     NSString *text = board.string;
@@ -2138,12 +2150,8 @@ static void GXKInstallMainAppHooks(void) {
 - (void)gxkAddFromPasteboard {
     NSString *text = [self gxkPasteboardCandidate];
     if (!text) {
-        UIAlertController *tip = [UIAlertController
-            alertControllerWithTitle:@"新增常用语"
-                             message:@"先把要用的文字复制到剪贴板，再回到这里点「新增」。键盘里不能弹输入框，只能这样加。"
-                      preferredStyle:UIAlertControllerStyleAlert];
-        [tip addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:tip animated:YES completion:nil];
+        [self gxkFlashHint:@"先复制文字"];
+        GXK_LOG(@"[*] 剪贴板为空，已提示先复制文字");
         return;
     }
     if (![self.items containsObject:text]) {
@@ -2211,12 +2219,8 @@ static void GXKInstallMainAppHooks(void) {
         // 键盘进程：用剪贴板内容替换这条，全程不弹输入框。
         NSString *text = [self gxkPasteboardCandidate];
         if (!text) {
-            UIAlertController *tip = [UIAlertController
-                alertControllerWithTitle:@"修改常用语"
-                                 message:@"先把新文字复制到剪贴板，再点这一条。键盘里不能弹输入框，只能这样改。"
-                          preferredStyle:UIAlertControllerStyleAlert];
-            [tip addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-            [self presentViewController:tip animated:YES completion:nil];
+            [self gxkFlashHint:@"先复制新文字"];
+            GXK_LOG(@"[*] 剪贴板为空，已提示先复制新文字");
             return;
         }
         [self.items replaceObjectAtIndex:indexPath.row withObject:text];
