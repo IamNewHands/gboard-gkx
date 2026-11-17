@@ -1952,6 +1952,8 @@ static void GXKInsertPhraseText(NSString *text) {
 
 // 编辑入口：主 App 设置页挂不上时，键盘面板里的「编辑」是始终可用的兜底维护入口。
 static void GXKPresentPhrasesEditor(UIViewController *from);
+// 导航项挂载：容器 VC 与真正上屏的 page VC 共用同一份实现。
+static void GXKAttachPhrasesEntry(UIViewController *vc);
 
 @interface GXKPhrasesPanel : UIView <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *table;
