@@ -51,6 +51,18 @@ class PhrasesTest(unittest.TestCase):
         self.assertIn("GXKPhrasesPickerItem()", body)
         self.assertIn("hasPhrases", body)
 
+    def test_picker_item_is_a_segmented_control_item(self) -> None:
+        # 分页条是 GKBExtensionSegmentedControl：建按钮时对每个 item 发 badgeableViewType /
+        # controlItemType / accessibilityIdentifier / accessibilityLabel。GKBAppStripItem
+        # 这四条一条都不响应，26 键第一次打开分页条就会 unrecognized selector 崩掉扩展。
+        body = function_body(self.source, "static id GXKPhrasesPickerItem(")
+        self.assertIn('NSClassFromString(@"GKBExtensionSegmentedControlItem")', body)
+        self.assertNotIn("GKBAppStripItem", body)
+        self.assertIn("setIdentifier:", body)
+        self.assertIn("setName:", body)
+        self.assertIn("setIcon:", body)
+        self.assertIn("setAccessibilityLabel:", body)
+
     def test_picker_selection_is_intercepted(self) -> None:
         body = function_body(self.source,
                              "static void gxk_miniAppPickerDidSelect(")

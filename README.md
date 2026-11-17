@@ -27,6 +27,7 @@
 
 ### 3. 原生纯粹与零遮挡保障
 * **零界面遮挡**：不新增任何浮动工具条、不给键盘根视图加高度。九键工具栏只复用官方 G 图标原本占用的那一段空位（把 G 图标 alpha 归零后原地放入），左右边界各自停在相邻可见兄弟视图之前，绝不覆盖候选词栏、拼音 Preedit 行或右侧功能图标；空位不足 200pt 时整条不显示，完全保持原生。
+* **工具栏外观跟皮肤走**：字体不再写死 13pt，改成读同键盘原生标签的 `font`（原生键帽是 Roboto 16pt，兜底同尺寸系统字体）；文字色同样取自原生标签。五个格子之间画 0.5pt 竖线（主文字色 18% 透明、上下各留 28% 内缩），让它读起来像原生分栏而不是五段浮空文字；分割线由按钮子类在 `layoutSubviews` 里摆位，不往 `UIStackView` 里塞额外视图（`FillEqually` 只均分 arrangedSubviews，多一个就把五个按钮挤歪）。主题切换时复用路径也会同步字体与分割线颜色。
 * **工具栏能力**：九键界面提供「全选／复制／粘贴／剪切／收起」五个按钮。组字中拒绝改文本并提示"先完成拼音"；剪切仅在已有选区时生效，无选区只提示"先选中"，绝不做逐字符 `deleteBackward` 循环；「全选」后 15 秒内可直接「剪切」同一段文本。操作成功不弹提示（避免连点卡顿），只有失败才短暂改按钮标题。
 * **与语音图标不重叠**：工具条所在 band 内若存在带图片的小图标（如拼音顶栏的语音输入按钮），把它 `alpha` 归零让位，组字时自动还原；工具条撤走时一并恢复。
 * **滑行触摸链 100% 原生**：绝不全局 Hook `GKBSoftKeyView` 的触摸事件（`touchesBegan`/`touchesMoved`/`touchesEnded`），全键盘与九键滑行输入如丝顺滑。
@@ -43,7 +44,8 @@
 * **回归护栏**：`tests/test_location_jump.py` 断言源码里不再出现 `GXKLocation*` / `prefs:root=Privacy` / `App-Prefs:root` / `UIApplicationOpenSettingsURLString` / `x-gxk-location`，避免这套无效方案被重新带回来。
 
 ### 6. 常用语分页（G 图标内，与搜索／翻译／地图同级）
-* **分页入口**：`GKBMiniAppManager` 的 `availablePickerItems` 末尾追加一项「常用语」（`GKBAppStripItem`，identifier `gxk_phrases`，图标用 `UIGraphicsImageRenderer` 现画「语」字，不依赖资源名）。`GKBMiniAppExtensionBase` 的 `miniAppPicker:didSelectItem:atIndex:` 命中该 identifier 时改为弹自己的面板，其余分页原样回落。
+* **分页入口**：`GKBMiniAppManager` 的 `availablePickerItems` 末尾追加一项「常用语」（`GKBExtensionSegmentedControlItem`，identifier `gxk_phrases`，图标用 `UIGraphicsImageRenderer` 现画「语」字，不依赖资源名）。`GKBMiniAppExtensionBase` 的 `miniAppPicker:didSelectItem:atIndex:` 命中该 identifier 时改为弹自己的面板，其余分页原样回落。
+* **分页项必须是 `GKBExtensionSegmentedControlItem`**（真机崩溃换来的结论）：分页条是 `GKBExtensionSegmentedControl`，它建按钮时对每个 item 依次发 `badgeableViewType`／`controlItemType`／`accessibilityIdentifier`／`accessibilityLabel`。早先用的 `GKBAppStripItem` 这四条一条都不响应，26 键点表情第一次打开分页条就 `-[GKBAppStripItem badgeableViewType]: unrecognized selector` 崩掉整个键盘扩展（九键的表情键被换成了重输/换行，所以历史版本从未走到这条链路）。该类只有无参 `init`，属性逐个 set；`setIdentifier:` 内部会同步 `accessibilityIdentifier`。
 * **面板是叠加层**：`GXKPhrasesPanel` 铺满键盘视图 `bounds`，`layoutSubviews` 手算 frame，**不新增任何约束、不改键盘高度**。顶部有标题、钉子按钮、「编辑」与关闭「×」，中间是常用语列表，底部一行提示。
 * **钉子固定**：钉子关闭（默认）时点一条常用语就上屏并立即关闭面板；钉子打开后点多少条都不关，可以连续输入。状态存 App Group 的 `GXKPhrasesPinned`。
 * **上屏方式**：通过 `UITextDocumentProxy` 的 `insertText:` 写入，和原生输入完全同一条路。

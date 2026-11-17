@@ -572,6 +572,8 @@ static BOOL gToolbarLogoWasHidden;
 static CGFloat gToolbarLogoWasAlpha = 1.0;
 static BOOL gUpdatingToolbar;
 static GXKToolbarTarget *gToolbarTarget;
+// 本拍工具条要用的字体：取自同键盘原生 UILabel，主题/字号变了跟着变。
+static UIFont *gToolbarFont;
 
 // band 内被工具条盖住的原生图标（九键顶部右侧语音按钮等）：挂载时 alpha=0，撤走时原样归还。
 static NSMutableArray<UIView *> *gToolbarHiddenViews;
@@ -713,8 +715,11 @@ static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIVi
     return YES;
 }
 
-// 文字色取同键盘原生键帽的 UILabel 颜色：Gboard 主题可能与系统外观不一致，不能靠 labelColor 猜。
-static UIColor *GXKToolbarTint(UIView *body) {
+// 文字色与字体都取同键盘原生键帽的 UILabel：Gboard 主题可能与系统外观不一致，
+// 字号也会随主题变（原生键帽是 Roboto 16pt）。只固定 13pt 会被一眼看出是外挂，
+// 所以一次遍历同时拿颜色与字体，不额外多走一遍 800 节点。
+static UIColor *GXKToolbarTextStyle(UIView *body, UIFont **outFont) {
+    if (outFont) *outFont = nil;
     if (body) {
         NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:body];
         NSUInteger visited = 0;
@@ -723,14 +728,22 @@ static UIColor *GXKToolbarTint(UIView *body) {
             [stack removeLastObject];
             if (view.isHidden || view.alpha < 0.05) continue;
             if ([view isKindOfClass:[UILabel class]]) {
-                UIColor *color = ((UILabel *)view).textColor;
-                if ([color isKindOfClass:[UIColor class]]) return color;
+                UILabel *label = (UILabel *)view;
+                UIColor *color = label.textColor;
+                if ([color isKindOfClass:[UIColor class]]) {
+                    if (outFont && [label.font isKindOfClass:[UIFont class]]) *outFont = label.font;
+                    return color;
+                }
             }
             [stack addObjectsFromArray:view.subviews];
         }
     }
     if (@available(iOS 13.0, *)) return [UIColor labelColor];
     return [UIColor darkGrayColor]; // 部署目标 12.0：labelColor 不可用。
+}
+
+static UIColor *GXKToolbarTint(UIView *body) {
+    return GXKToolbarTextStyle(body, NULL);
 }
 
 static void GXKRestoreToolbarDecorations(void) {
@@ -863,8 +876,28 @@ static void GXKDetachToolbar(void) {
     }
 }
 
+// 工具条按钮：只在右侧画一条细分割线，让五个格子读起来像原生分栏，而不是五段浮空文字。
+// 用子类而不是往 stack 里塞分隔视图：FillEqually 只均分 arrangedSubviews，
+// 多一个视图就把五个按钮的宽度挤歪了。
+@interface GXKToolbarButton : UIButton
+@property (nonatomic, strong) UIView *gxkDivider;
+@end
+
+@implementation GXKToolbarButton
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    UIView *divider = self.gxkDivider;
+    if (!divider) return;
+    CGFloat inset = floor(self.bounds.size.height * 0.28);
+    divider.frame = CGRectMake(self.bounds.size.width - 0.5, inset, 0.5,
+                               MAX(0.0, self.bounds.size.height - inset * 2.0));
+}
+@end
+
 static UIStackView *GXKMakeToolbar(UIView *row, UIColor *tint, UIColor *background) {
-    UIFont *font = [UIFont fontWithName:@"Roboto-Regular" size:13.0] ?: [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
+    // 字体优先用原生标签的字体（通常 Roboto 16pt），拿不到才退回同尺寸系统字体。
+    UIFont *font = gToolbarFont ?: ([UIFont fontWithName:@"Roboto-Regular" size:16.0] ?:
+                                    [UIFont systemFontOfSize:16.0 weight:UIFontWeightRegular]);
     NSArray<NSString *> *titles = @[@"全选", @"复制", @"粘贴", @"剪切", @"收起"];
     NSArray<NSString *> *actions = @[@"onSelectAll:", @"onCopy:", @"onPaste:", @"onCut:", @"onDismissKeyboard:"];
     UIStackView *stack = [[UIStackView alloc] initWithFrame:row.bounds];
@@ -875,16 +908,24 @@ static UIStackView *GXKMakeToolbar(UIView *row, UIColor *tint, UIColor *backgrou
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     stack.backgroundColor = background; // 遮住被隐藏的 G 图标，避免按钮透明处透出原生图形。
     for (NSUInteger i = 0; i < titles.count; i++) {
-        UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+        GXKToolbarButton *button = [GXKToolbarButton buttonWithType:UIButtonTypeCustom];
         button.backgroundColor = [UIColor clearColor];
         button.adjustsImageWhenHighlighted = NO;
         button.titleLabel.adjustsFontSizeToFitWidth = YES;
-        button.titleLabel.minimumScaleFactor = 0.7;
+        button.titleLabel.minimumScaleFactor = 0.75;
         button.titleLabel.font = font;
         [button setTitle:titles[i] forState:UIControlStateNormal];
         [button setTitleColor:tint forState:UIControlStateNormal];
         [button setTitleColor:[tint colorWithAlphaComponent:0.45] forState:UIControlStateHighlighted];
         button.accessibilityLabel = titles[i];
+        if (i + 1 < titles.count) {
+            // 分割线用主文字色降透明度，深浅两套主题都不用另配颜色。
+            UIView *divider = [[UIView alloc] initWithFrame:CGRectZero];
+            divider.backgroundColor = [tint colorWithAlphaComponent:0.18];
+            divider.userInteractionEnabled = NO;
+            [button addSubview:divider];
+            button.gxkDivider = divider;
+        }
         [button addTarget:gToolbarTarget action:NSSelectorFromString(actions[i]) forControlEvents:UIControlEventTouchUpInside];
         [stack addArrangedSubview:button];
     }
@@ -954,7 +995,9 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     if (!gToolbarTarget) gToolbarTarget = [[GXKToolbarTarget alloc] init];
     gToolbarTarget.controller = vc;
 
-    UIColor *tint = GXKToolbarTint(body);
+    UIFont *nativeFont = nil;
+    UIColor *tint = GXKToolbarTextStyle(body, &nativeFont);
+    gToolbarFont = nativeFont;
     UIColor *surface = GXKToolbarSurface(row, body) ?: [UIColor clearColor];
     UIStackView *stack = reuse ? gToolbarStack : GXKMakeToolbar(row, tint, surface);
     if (reuse) {
@@ -965,6 +1008,14 @@ static void GXKUpdateToolbar(UIViewController *vc) {
             UIButton *button = (UIButton *)arranged;
             [button setTitleColor:tint forState:UIControlStateNormal];
             [button setTitleColor:[tint colorWithAlphaComponent:0.45] forState:UIControlStateHighlighted];
+            // 主题切换会换字体，复用路径也要同步，否则文字仍停在上一套字号。
+            if (gToolbarFont && ![button.titleLabel.font isEqual:gToolbarFont]) {
+                button.titleLabel.font = gToolbarFont;
+            }
+            if ([button isKindOfClass:[GXKToolbarButton class]]) {
+                GXKToolbarButton *ours = (GXKToolbarButton *)button;
+                ours.gxkDivider.backgroundColor = [tint colorWithAlphaComponent:0.18];
+            }
         }
     }
     gToolbarStack = stack;
@@ -2079,17 +2130,37 @@ static NSString *GXKPickerItemIdentifier(id item) {
     return nil;
 }
 
+// 分页条只认 GKBExtensionSegmentedControlItem。GKBExtensionSegmentedControl 的
+// buttonWithControlItem: 与 addButtonsAndAutolayoutForNewItems: 会逐项发
+// badgeableViewType / controlItemType / accessibilityIdentifier / accessibilityLabel，
+// GKBAppStripItem 这几条一条都不响应；真机表现就是打开分页条即
+// "-[GKBAppStripItem badgeableViewType]: unrecognized selector" 崩掉整个键盘扩展。
+// 九键的表情键被换成了重输/换行，历史上从没打开过这条链路，所以 26 键第一次点表情才暴露。
 static id GXKPhrasesPickerItem(void) {
     static id item = nil;
     static BOOL tried = NO;
     if (tried) return item;
     tried = YES;
-    Class itemClass = NSClassFromString(@"GKBAppStripItem");
+    Class itemClass = NSClassFromString(@"GKBExtensionSegmentedControlItem");
     if (!itemClass) return nil;
     @try {
-        item = ((id (*)(id, SEL, id, id, id, id))objc_msgSend)(
-            [itemClass alloc], @selector(initWithIdentifier:name:icon:accessibilityLabel:),
-            GXK_PHRASES_IDENTIFIER, @"常用语", GXKPhrasesIcon(), @"常用语");
+        // 这个类只有无参 init，属性必须逐个 set；setIdentifier: 内部会同步
+        // accessibilityIdentifier，分页条按钮的可访问性标识因此与原生项一致。
+        id obj = [[itemClass alloc] init];
+        if ([obj respondsToSelector:@selector(setIdentifier:)]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(obj, @selector(setIdentifier:), GXK_PHRASES_IDENTIFIER);
+        }
+        if ([obj respondsToSelector:@selector(setName:)]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(obj, @selector(setName:), @"常用语");
+        }
+        if ([obj respondsToSelector:@selector(setIcon:)]) {
+            UIImage *icon = GXKPhrasesIcon();
+            if (icon) ((void (*)(id, SEL, id))objc_msgSend)(obj, @selector(setIcon:), icon);
+        }
+        if ([obj respondsToSelector:@selector(setAccessibilityLabel:)]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(obj, @selector(setAccessibilityLabel:), @"常用语");
+        }
+        item = obj;
     } @catch (__unused NSException *e) {
         item = nil;
     }
