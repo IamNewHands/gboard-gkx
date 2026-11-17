@@ -329,10 +329,27 @@ static void GXKPerformClearComposing(UIViewController *vc) {
 
 #pragma mark - 动作键目标与更新
 
+// 扫描热路径的类指针缓存：NSClassFromString 每次都要查运行时类表，
+// 而下面这些类名是在 1500 节点的循环里对每个软键都要用的，只解析一次就够。
+// 类晚于首次调用才加载时仍会重试，只有解析成功才写入缓存。
+static Class gCachedKeyClass;
+static Class gCachedNineKeyClass;
+static Class gCachedQwertyClass;
+static Class gCachedFixedLayoutClass;
+static Class gCachedLogoClass;
+static Class gCachedIconClass;
+
+static Class GXKClassCached(NSString *name, Class *slot) {
+    if (*slot) return *slot;
+    Class cls = NSClassFromString(name);
+    if (cls) *slot = cls;
+    return cls;
+}
+
 // 九键本身继承自26键类：必须先识别九键，再排除最近的26键祖先。
 static UIView *GXKNineKeyBodyForKey(UIView *key, UIView *root) {
-    Class nineClass = NSClassFromString(@"GKB9KeysSoftKeyboardView");
-    Class qwertyClass = NSClassFromString(@"GKBZhQwertySoftKeyboardView");
+    Class nineClass = GXKClassCached(@"GKB9KeysSoftKeyboardView", &gCachedNineKeyClass);
+    Class qwertyClass = GXKClassCached(@"GKBZhQwertySoftKeyboardView", &gCachedQwertyClass);
     for (UIView *v = key.superview; v; v = v.superview) {
         if (nineClass && [v isKindOfClass:nineClass]) return v;
         if (qwertyClass && [v isKindOfClass:qwertyClass]) return nil;
@@ -345,7 +362,7 @@ static UIView *GXKNineKeyBodyForKey(UIView *key, UIView *root) {
 // 所以按钮必须是键的祖先视图的子视图，才能成为命中链上最深的一层。
 static UIView *GXKActionHostForKey(UIView *key) {
     if (!key) return nil;
-    Class keyClass = NSClassFromString(@"GKBSoftKeyView");
+    Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
     for (UIView *v = key.superview; v; v = v.superview) {
         if (keyClass && [v isKindOfClass:keyClass]) continue; // 嵌套键：继续上浮到真正容器。
         return v;
@@ -368,10 +385,10 @@ static BOOL GXKKeyIsVisible(UIView *key, UIView *root) {
 }
 
 static UIView *GXKFindNineKeyEmojiKey(UIView *root) {
-    Class keyClass = NSClassFromString(@"GKBSoftKeyView");
-    Class nineClass = NSClassFromString(@"GKB9KeysSoftKeyboardView");
-    Class qwertyClass = NSClassFromString(@"GKBZhQwertySoftKeyboardView");
-    Class fixedClass = NSClassFromString(@"GKBSoftKeyboardViewWithFixedLayout");
+    Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
+    Class nineClass = GXKClassCached(@"GKB9KeysSoftKeyboardView", &gCachedNineKeyClass);
+    Class qwertyClass = GXKClassCached(@"GKBZhQwertySoftKeyboardView", &gCachedQwertyClass);
+    Class fixedClass = GXKClassCached(@"GKBSoftKeyboardViewWithFixedLayout", &gCachedFixedLayoutClass);
     if (!root || !root.window || !keyClass || !nineClass || !qwertyClass || !fixedClass) return nil;
 
     UIView *candidate = nil;
@@ -408,7 +425,7 @@ static UIView<GXKNativeIconContent> *GXKNativeIconForKey(UIView *key) {
     NSDictionary *contents = ((id<GXKNativeSoftKeyContent>)key).idToViewDict;
     if (![contents isKindOfClass:[NSDictionary class]]) return nil;
     UIView *icon = contents[@"image"];
-    Class iconClass = NSClassFromString(@"GKBImageViewWithBackground");
+    Class iconClass = GXKClassCached(@"GKBImageViewWithBackground", &gCachedIconClass);
     if (!iconClass || ![icon isKindOfClass:iconClass] || ![icon isDescendantOfView:key] ||
         ![icon respondsToSelector:@selector(image)] || ![icon respondsToSelector:@selector(setImage:)] ||
         ![icon respondsToSelector:@selector(highlightedImage)] ||
@@ -537,6 +554,20 @@ static __weak UIView *gToolbarRow;
 static __weak UIView *gToolbarLogoView;
 static __weak UIView *gToolbarNineBody;
 static CGRect gToolbarBand;
+// band 只由「宿主行尺寸 + G 图标位置 + 同行可见邻居」决定。后者的判定要沿父链 convertRect，
+// 是这条路径上唯一还会每拍重复的工作：用邻居几何算一个签名，签名没变就直接复用上次结果。
+static __weak UIView *gToolbarBandCacheRow;
+static __weak UIView *gToolbarBandCacheLogo;
+static CGSize gToolbarBandCacheRowSize;
+static CGRect gToolbarBandCacheLogoFrame;
+static NSUInteger gToolbarBandCacheHiddenCount;
+static NSUInteger gToolbarBandCacheSignature;
+static NSUInteger gToolbarBandCacheEpoch;
+static BOOL gToolbarBandCacheValid;
+static BOOL gToolbarBandCacheHit;
+static CGRect gToolbarBandCacheBand;
+// 挂载、撤走、归还装饰都会改变「谁挡在 band 里」，这些时机自增代次让缓存失效。
+static NSUInteger gToolbarBandEpoch;
 static BOOL gToolbarLogoWasHidden;
 static CGFloat gToolbarLogoWasAlpha = 1.0;
 static BOOL gUpdatingToolbar;
@@ -579,6 +610,31 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
     CGFloat width = row.bounds.size.width;
     CGFloat height = row.bounds.size.height;
     CGRect logoRect = logo.frame;
+    // 邻居签名：只读 frame/hidden/alpha，不做可见性上溯，代价是一次很短的循环。
+    NSUInteger signature = row.subviews.count * 2654435761u;
+    for (UIView *sibling in row.subviews) {
+        if (sibling == logo) continue;
+        CGRect sr = sibling.frame;
+        // 先落成有符号再转无符号：负坐标直接转 unsigned 是未定义行为。
+        signature = signature * 31u
+                  + (NSUInteger)(NSInteger)(CGRectGetMinX(sr) * 4.0)
+                  + (NSUInteger)(NSInteger)(CGRectGetMaxX(sr) * 4.0) * 7u
+                  + (NSUInteger)(NSInteger)(CGRectGetMinY(sr) * 4.0) * 13u
+                  + (NSUInteger)(NSInteger)(CGRectGetMaxY(sr) * 4.0) * 17u
+                  + (sibling.isHidden ? 1u : 0u) * 19u
+                  + (NSUInteger)(NSInteger)(sibling.alpha * 100.0) * 23u
+                  + (sibling == gToolbarStack ? 1u : 0u) * 29u;
+    }
+    NSUInteger hiddenCount = gToolbarHiddenViews.count;
+    if (gToolbarBandCacheValid && gToolbarBandCacheRow == row && gToolbarBandCacheLogo == logo &&
+        CGSizeEqualToSize(gToolbarBandCacheRowSize, row.bounds.size) &&
+        CGRectEqualToRect(gToolbarBandCacheLogoFrame, logoRect) &&
+        gToolbarBandCacheHiddenCount == hiddenCount &&
+        gToolbarBandCacheSignature == signature &&
+        gToolbarBandCacheEpoch == gToolbarBandEpoch) {
+        if (outBand) *outBand = gToolbarBandCacheBand;
+        return gToolbarBandCacheHit;
+    }
     CGFloat left = 0.0;
     CGFloat right = width;
     for (UIView *sibling in row.subviews) {
@@ -593,9 +649,19 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
         }
     }
     // 五个中文按钮最少要 200pt；不够就整条不显示，保持原生。
-    if (right - left < 200.0) return NO;
-    if (outBand) *outBand = CGRectMake(left, 0.0, right - left, height);
-    return YES;
+    BOOL hit = (right - left >= 200.0);
+    gToolbarBandCacheRow = row;
+    gToolbarBandCacheLogo = logo;
+    gToolbarBandCacheRowSize = row.bounds.size;
+    gToolbarBandCacheLogoFrame = logoRect;
+    gToolbarBandCacheHiddenCount = hiddenCount;
+    gToolbarBandCacheSignature = signature;
+    gToolbarBandCacheEpoch = gToolbarBandEpoch;
+    gToolbarBandCacheValid = YES;
+    gToolbarBandCacheHit = hit;
+    gToolbarBandCacheBand = hit ? CGRectMake(left, 0.0, right - left, height) : CGRectZero;
+    if (outBand) *outBand = gToolbarBandCacheBand;
+    return hit;
 }
 
 // 一次遍历同时判定：可见九键体、是否还有独立可见的 26 键体、G 图标行。
@@ -605,9 +671,9 @@ static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIVi
     if (outLogo) *outLogo = nil;
     if (outBody) *outBody = nil;
     if (outBand) *outBand = CGRectZero;
-    Class nineClass = NSClassFromString(@"GKB9KeysSoftKeyboardView");
-    Class qwertyClass = NSClassFromString(@"GKBZhQwertySoftKeyboardView");
-    Class logoClass = NSClassFromString(@"GKBHeaderLogoView");
+    Class nineClass = GXKClassCached(@"GKB9KeysSoftKeyboardView", &gCachedNineKeyClass);
+    Class qwertyClass = GXKClassCached(@"GKBZhQwertySoftKeyboardView", &gCachedQwertyClass);
+    Class logoClass = GXKClassCached(@"GKBHeaderLogoView", &gCachedLogoClass);
     if (!root || !root.window || !nineClass || !qwertyClass || !logoClass) return NO;
 
     UIView *body = nil;
@@ -676,6 +742,8 @@ static void GXKRestoreToolbarDecorations(void) {
     [gToolbarHiddenAlphas removeAllObjects];
     gToolbarDecorationsScanned = NO;
     gToolbarDecorationsBand = CGRectZero;
+    gToolbarBandEpoch++; // 装饰归还后 band 的可见邻居变了，缓存必须失效。
+    gToolbarBandCacheValid = NO;
 }
 
 static BOOL GXKViewHasImage(UIView *view) {
@@ -781,6 +849,8 @@ static void GXKDetachToolbar(void) {
     gToolbarLogoView = nil;
     gToolbarNineBody = nil;
     gToolbarBand = CGRectZero;
+    gToolbarBandEpoch++; // 撤走工具条后邻居集合变了，缓存必须失效。
+    gToolbarBandCacheValid = NO;
     [stack removeFromSuperview];
     if (gToolbarConstraints) {
         [NSLayoutConstraint deactivateConstraints:gToolbarConstraints];
@@ -1067,7 +1137,8 @@ static void GXKBumpPolling(NSInteger ticks) {
         GXKUpdateActionKey(vc);
         GXKUpdateToolbar(vc);
     }];
-    [[NSRunLoop mainRunLoop] addTimer:gStatePollTimer forMode:NSRunLoopCommonModes];
+    // scheduledTimerWithTimeInterval: 已经把表挂到默认模式；再挂 CommonModes 会让 0.2 秒轮询
+    // 在滚动、动画、触摸跟踪期间继续抢主线程，那正是「动画卡顿」的来源。只留默认模式。
 }
 
 @interface GXKActionKeyTarget : NSObject
@@ -1267,7 +1338,12 @@ static NSString *GXKPickerItemIdentifier(id item);
 static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
     if (gOrigTextDidChange) gOrigTextDidChange(self, _cmd, textInput);
     __weak UIViewController *weakVC = (UIViewController *)self;
+    // 同一帧内可能连来多次文本回调：只让最后一次真正刷新，前面排队的直接丢弃。
+    // 否则一次按键就能排出好几轮全量刷新，主线程被重复工作占满。
+    static NSUInteger gTextChangeSeq;
+    NSUInteger seq = ++gTextChangeSeq;
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (seq != gTextChangeSeq) return; // 后面还有更新的回调，交给它刷新。
         UIViewController *vc = weakVC;
         if (vc && vc == gCurrentVC) {
             BOOL wasComposing = gComposingActive;
@@ -1283,11 +1359,19 @@ static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
 
 static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
     if (gOrigViewDidLayoutSubviews) gOrigViewDidLayoutSubviews(self, _cmd);
-    if ((UIViewController *)self == gCurrentVC) {
-        GXKRefreshComposingState((UIViewController *)self);
-        GXKUpdateActionKey((UIViewController *)self);
-        GXKUpdateToolbar((UIViewController *)self);
-    }
+    if ((UIViewController *)self != gCurrentVC) return;
+    // 布局回调一帧内可能来几十次（任何 setNeedsLayout 都会触发）：
+    // 合并成一次异步刷新，只保留最后一次，避免同一帧反复全量重算。
+    static NSUInteger gLayoutSeq;
+    NSUInteger seq = ++gLayoutSeq;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (seq != gLayoutSeq) return;
+        UIViewController *vc = gCurrentVC;
+        if (!vc || !vc.isViewLoaded) return;
+        GXKRefreshComposingState(vc);
+        GXKUpdateActionKey(vc);
+        GXKUpdateToolbar(vc);
+    });
 }
 
 static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {

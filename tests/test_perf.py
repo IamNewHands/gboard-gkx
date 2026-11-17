@@ -229,6 +229,68 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("[fm fileExistsAtPath:candidate]", deploy)
         self.assertIn("../../Frameworks/user_dictionary.db", deploy)
 
+    def test_polling_never_joins_common_modes(self):
+        """0.2 秒轮询只挂默认模式：挂 CommonModes 会在滚动/动画期间继续抢主线程。"""
+        pump = function_body(self.source, "static void GXKBumpPolling(NSInteger ticks) {")
+        self.assertIn("scheduledTimerWithTimeInterval", pump)
+        self.assertNotIn("NSRunLoopCommonModes", pump)
+        self.assertNotIn("addTimer:", pump)
+        self.assertNotIn("NSRunLoopCommonModes", self.source)
+
+    def test_high_frequency_callbacks_coalesce_to_last_one(self):
+        """同一帧内多次文本/布局回调只让最后一次刷新，前面排队的直接丢弃。"""
+        typed = function_body(self.source, "static void gkx_textDidChange(id self, SEL _cmd, id textInput)")
+        self.assertIn("NSUInteger seq = ++gTextChangeSeq;", typed)
+        self.assertIn("if (seq != gTextChangeSeq) return;", typed)
+        # 丢弃判定必须在真正的刷新之前，否则合并没有意义。
+        self.assertLess(typed.index("if (seq != gTextChangeSeq) return;"),
+                        typed.index("GXKRefreshComposingState(vc)"))
+        layout = function_body(self.source, "static void gkx_viewDidLayoutSubviews(id self, SEL _cmd)")
+        self.assertIn("NSUInteger seq = ++gLayoutSeq;", layout)
+        self.assertIn("if (seq != gLayoutSeq) return;", layout)
+        self.assertLess(layout.index("if (seq != gLayoutSeq) return;"),
+                        layout.index("GXKRefreshComposingState(vc)"))
+        # 布局回调不得再同步跑全量刷新，必须整体挪进异步块。
+        sync_part = layout[:layout.index("dispatch_async")]
+        self.assertNotIn("GXKUpdateToolbar", sync_part)
+        self.assertNotIn("GXKUpdateActionKey", sync_part)
+
+    def test_hot_scan_paths_cache_class_pointers(self):
+        """扫描热路径只解析一次类指针，不在每个软键上重复 NSClassFromString。"""
+        self.assertIn("static Class GXKClassCached(NSString *name, Class *slot)", self.source)
+        helper = function_body(self.source, "static Class GXKClassCached(NSString *name, Class *slot)")
+        # 解析失败（类还没加载）不能写缓存，否则永远补不上。
+        self.assertIn("if (*slot) return *slot;", helper)
+        self.assertIn("if (cls) *slot = cls;", helper)
+        for signature in (
+            "static UIView *GXKNineKeyBodyForKey(UIView *key, UIView *root)",
+            "static UIView *GXKActionHostForKey(UIView *key)",
+            "static UIView *GXKFindNineKeyEmojiKey(UIView *root)",
+            "static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIView **outBody, CGRect *outBand)",
+            "static UIView<GXKNativeIconContent> *GXKNativeIconForKey(UIView *key)",
+        ):
+            body = function_body(self.source, signature)
+            self.assertNotIn("NSClassFromString", body, signature)
+            self.assertIn("GXKClassCached(", body, signature)
+
+    def test_toolbar_band_reuses_result_when_neighbours_unchanged(self):
+        """邻居几何没变就不重新沿父链算可见性，band 直接复用上次结果。"""
+        self.assertIn("static NSUInteger gToolbarBandEpoch;", self.source)
+        band = function_body(self.source, "static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outBand) {")
+        self.assertIn("gToolbarBandCacheSignature == signature", band)
+        self.assertIn("gToolbarBandCacheEpoch == gToolbarBandEpoch", band)
+        self.assertIn("CGSizeEqualToSize(gToolbarBandCacheRowSize, row.bounds.size)", band)
+        # 缓存命中必须提前返回，且返回的是上次的判定结果。
+        self.assertLess(band.index("if (gToolbarBandCacheValid &&"), band.index("CGFloat left = 0.0;"))
+        self.assertIn("return gToolbarBandCacheHit;", band)
+        # 挂载与撤走都会改变邻居集合，必须让缓存失效。
+        detach = function_body(self.source, "static void GXKDetachToolbar(void) {")
+        self.assertIn("gToolbarBandEpoch++;", detach)
+        self.assertIn("gToolbarBandCacheValid = NO;", detach)
+        restore = function_body(self.source, "static void GXKRestoreToolbarDecorations(void) {")
+        self.assertIn("gToolbarBandEpoch++;", restore)
+        self.assertIn("gToolbarBandCacheValid = NO;", restore)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
