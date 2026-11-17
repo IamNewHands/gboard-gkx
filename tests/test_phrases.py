@@ -81,6 +81,16 @@ class PhrasesTest(unittest.TestCase):
         self.assertIn("gxk_artSelectInFlight = YES;", body)
         self.assertIn("gxk_artSelectInFlight = NO;", body)
 
+    def test_picker_excludes_gif_and_sticker(self) -> None:
+        # 表情面板里 GIF 与贴纸两个分类保留原生实现，只把入口隐藏。
+        # 真实 identifier 是 "gif" 与 "sticker"（fw __data 里的 CFString 常量）。
+        body = function_body(self.source, "static BOOL GXKIdentifierExcluded(id identifier) {")
+        self.assertIn('[lower isEqualToString:@"gif"]', body)
+        self.assertIn('[lower isEqualToString:@"sticker"]', body)
+        # 仍保留原有的 youtube / contacts 过滤。
+        self.assertIn('rangeOfString:@"youtube"', body)
+        self.assertIn('rangeOfString:@"contacts"', body)
+
     def test_panel_is_overlay_without_layout_constraints(self) -> None:
         body = function_body(self.source, "static void GXKShowPhrasesPanel(")
         self.assertNotIn("NSLayoutConstraint", body)

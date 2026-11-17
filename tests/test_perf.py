@@ -182,7 +182,7 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("static NSArray<NSLayoutConstraint *> *gToolbarConstraints;", self.source)
         update = function_body(self.source, "static void GXKUpdateToolbar(UIViewController *vc) {")
         self.assertIn("BOOL reuse = (gToolbarStack && gToolbarRow == row", update)
-        self.assertIn("UIStackView *stack = reuse ? gToolbarStack : GXKMakeToolbar(row, tint, surface);", update)
+        self.assertIn("UIStackView *stack = reuse ? gToolbarStack : GXKMakeToolbar(row, tint);", update)
         self.assertIn("deactivateConstraints:gToolbarConstraints", update)
         self.assertIn("activateConstraints:gToolbarConstraints", update)
         # 重建路径必须先撤掉旧约束；两条路径都不得漏掉旧约束。
@@ -272,6 +272,31 @@ class PerfContracts(unittest.TestCase):
             body = function_body(self.source, signature)
             self.assertNotIn("NSClassFromString", body, signature)
             self.assertIn("GXKClassCached(", body, signature)
+
+    def test_toolbar_band_starts_right_of_logo_and_matches_icon_height(self):
+        """工具条贴 G 图标右侧、竖向对齐图标本身，而不是另起一条横贯整行的带。"""
+        band = function_body(self.source, "static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outBand) {")
+        # 左边界必须被推到 G 图标右缘之后：压在图标上就得把图标 alpha 归零，
+        # 而归零后会露出图标底图，真机上表现为"条下面又冒出半个 G"。
+        self.assertIn("CGFloat iconRight = CGRectGetMaxX(logoRect);", band)
+        self.assertIn("if (iconRight > left) left = iconRight + 4.0;", band)
+        # 竖向取图标高度并居中；拿不到图标高度才退回整行。
+        self.assertIn("CGFloat barHeight = logoRect.size.height;", band)
+        self.assertIn("CGFloat top = CGRectGetMidY(logoRect) - barHeight * 0.5;", band)
+        self.assertIn("CGRectMake(left, top, right - left, barHeight)", band)
+        # 不再整行满高：满高就是用户截图里那条突兀的横带。
+        self.assertNotIn("CGRectMake(left, 0.0, right - left, height)", band)
+
+    def test_toolbar_has_no_opaque_background(self):
+        """工具条不铺不透明底色，也不再对 G 图标做 alpha 归零。"""
+        self.assertNotIn("GXKToolbarSurface", self.source)
+        make = function_body(self.source, "static UIStackView *GXKMakeToolbar(UIView *row, UIColor *tint) {")
+        self.assertIn("stack.backgroundColor = [UIColor clearColor];", make)
+        update = function_body(self.source, "static void GXKUpdateToolbar(UIViewController *vc) {")
+        self.assertIn("stack.backgroundColor = [UIColor clearColor];", update)
+        self.assertNotIn("logo.alpha = 0.0;", update)
+        # 挂载点必须用 band 的竖向偏移，否则 band 算对了也贴不到图标那一行。
+        self.assertIn("constraintEqualToAnchor:row.topAnchor constant:band.origin.y", update)
 
     def test_toolbar_band_reuses_result_when_neighbours_unchanged(self):
         """邻居几何没变就不重新沿父链算可见性，band 直接复用上次结果。"""

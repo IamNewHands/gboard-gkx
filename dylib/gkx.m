@@ -650,6 +650,17 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
             if (CGRectGetMinX(r) < right) right = CGRectGetMinX(r);
         }
     }
+    // G 图标自己那一格永远留出来：工具条从图标右侧起算，绝不压在图标上，
+    // 也就不必再把图标 alpha 归零——"条下面露出半个 G"就是归零后露出的底图。
+    CGFloat iconRight = CGRectGetMaxX(logoRect);
+    if (iconRight > left) left = iconRight + 4.0;
+    // 竖向贴住 G 图标本身：高度取图标高度（拿不到才退整行），垂直居中。
+    // 这样五个字读起来是 G 图标同一行的原生文字，而不是另起一条横带。
+    CGFloat barHeight = logoRect.size.height;
+    if (barHeight < 18.0 || barHeight > height) barHeight = height;
+    CGFloat top = CGRectGetMidY(logoRect) - barHeight * 0.5;
+    if (top < 0.0) top = 0.0;
+    if (top + barHeight > height) top = MAX(0.0, height - barHeight);
     // 五个中文按钮最少要 200pt；不够就整条不显示，保持原生。
     BOOL hit = (right - left >= 200.0);
     gToolbarBandCacheRow = row;
@@ -661,7 +672,7 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
     gToolbarBandCacheEpoch = gToolbarBandEpoch;
     gToolbarBandCacheValid = YES;
     gToolbarBandCacheHit = hit;
-    gToolbarBandCacheBand = hit ? CGRectMake(left, 0.0, right - left, height) : CGRectZero;
+    gToolbarBandCacheBand = hit ? CGRectMake(left, top, right - left, barHeight) : CGRectZero;
     if (outBand) *outBand = gToolbarBandCacheBand;
     return hit;
 }
@@ -828,30 +839,6 @@ static void GXKSyncToolbarDecorations(BOOL composing) {
     }
 }
 
-// 工具条底色取键盘自身的表面色，而不是透明：万一 band 里还有没被让位的原生素材，
-// 也不会从按钮缝隙里透出来。取面积最大的一块不透明背景，比按类名猜稳。
-static UIColor *GXKToolbarSurface(UIView *row, UIView *body) {
-    UIColor *rowColor = row.backgroundColor;
-    if ([rowColor isKindOfClass:[UIColor class]] && CGColorGetAlpha(rowColor.CGColor) > 0.9) return rowColor;
-    if (!body) return nil;
-    UIColor *best = nil;
-    CGFloat bestArea = 0.0;
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:body];
-    NSUInteger visited = 0;
-    while (stack.count && visited++ < 800) {
-        UIView *view = stack.lastObject;
-        [stack removeLastObject];
-        if (view.isHidden || view.alpha < 0.05) continue;
-        UIColor *color = view.backgroundColor;
-        if ([color isKindOfClass:[UIColor class]] && CGColorGetAlpha(color.CGColor) > 0.9) {
-            CGFloat area = view.bounds.size.width * view.bounds.size.height;
-            if (area > bestArea) { bestArea = area; best = color; }
-        }
-        [stack addObjectsFromArray:view.subviews];
-    }
-    return best;
-}
-
 static void GXKDetachToolbar(void) {
     UIStackView *stack = gToolbarStack;
     UIView *logo = gToolbarLogoView;
@@ -894,7 +881,7 @@ static void GXKDetachToolbar(void) {
 }
 @end
 
-static UIStackView *GXKMakeToolbar(UIView *row, UIColor *tint, UIColor *background) {
+static UIStackView *GXKMakeToolbar(UIView *row, UIColor *tint) {
     // 字体优先用原生标签的字体（通常 Roboto 16pt），拿不到才退回同尺寸系统字体。
     UIFont *font = gToolbarFont ?: ([UIFont fontWithName:@"Roboto-Regular" size:16.0] ?:
                                     [UIFont systemFontOfSize:16.0 weight:UIFontWeightRegular]);
@@ -906,7 +893,9 @@ static UIStackView *GXKMakeToolbar(UIView *row, UIColor *tint, UIColor *backgrou
     stack.alignment = UIStackViewAlignmentFill;
     stack.spacing = 0;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
-    stack.backgroundColor = background; // 遮住被隐藏的 G 图标，避免按钮透明处透出原生图形。
+    // 不铺不透明底色：底色一铺就是一条"新增横带"，和原生顶栏割裂。
+    // 文字色本来就取自原生标签，透明底反而最像原生。
+    stack.backgroundColor = [UIColor clearColor];
     for (NSUInteger i = 0; i < titles.count; i++) {
         GXKToolbarButton *button = [GXKToolbarButton buttonWithType:UIButtonTypeCustom];
         button.backgroundColor = [UIColor clearColor];
@@ -954,7 +943,9 @@ static void GXKUpdateToolbar(UIViewController *vc) {
         CGRect band = CGRectZero;
         if (GXKToolbarBand(gToolbarRow, gToolbarLogoView, root, &band) &&
             fabs(band.origin.x - gToolbarBand.origin.x) < 0.5 &&
-            fabs(band.size.width - gToolbarBand.size.width) < 0.5) {
+            fabs(band.size.width - gToolbarBand.size.width) < 0.5 &&
+            fabs(band.origin.y - gToolbarBand.origin.y) < 0.5 &&
+            fabs(band.size.height - gToolbarBand.size.height) < 0.5) {
             UIStackView *stack = gToolbarStack;
             if (stack.superview != gToolbarRow) [gToolbarRow addSubview:stack];
             if (stack.hidden) stack.hidden = NO;
@@ -998,11 +989,10 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     UIFont *nativeFont = nil;
     UIColor *tint = GXKToolbarTextStyle(body, &nativeFont);
     gToolbarFont = nativeFont;
-    UIColor *surface = GXKToolbarSurface(row, body) ?: [UIColor clearColor];
-    UIStackView *stack = reuse ? gToolbarStack : GXKMakeToolbar(row, tint, surface);
+    UIStackView *stack = reuse ? gToolbarStack : GXKMakeToolbar(row, tint);
     if (reuse) {
         // 复用只同步配色：文字、字体、target 都没变，无需重设。
-        if ([surface isKindOfClass:[UIColor class]]) stack.backgroundColor = surface;
+        stack.backgroundColor = [UIColor clearColor];
         for (UIView *arranged in stack.arrangedSubviews) {
             if (![arranged isKindOfClass:[UIButton class]]) continue;
             UIButton *button = (UIButton *)arranged;
@@ -1027,8 +1017,8 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     }
     gToolbarNineBody = body;
     gToolbarBand = band;
-    // 用 alpha 而不是 hidden：hidden 在 UIStackView 里会把兄弟视图重排，band 一变就反复重挂。
-    logo.alpha = 0.0; // 只藏 G 图标本身，同行预编辑/候选视图一律不碰。
+    // G 图标保持原样：band 从它右侧起算，不再需要 alpha 归零。
+    // 归零会把图标底下的圆形底图单独露出来，看着就像"条下面又冒出一个 G"。
     stack.hidden = composing;
     if (stack.superview != row) [row addSubview:stack];
     // 只占 band 那一段：左右各贴住相邻可见兄弟的边界，绝不覆盖同行其它内容。
@@ -1040,7 +1030,7 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     gToolbarConstraints = @[
         [stack.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:band.origin.x],
         [stack.widthAnchor constraintEqualToConstant:band.size.width],
-        [stack.topAnchor constraintEqualToAnchor:row.topAnchor],
+        [stack.topAnchor constraintEqualToAnchor:row.topAnchor constant:band.origin.y],
         [stack.heightAnchor constraintEqualToConstant:band.size.height],
     ];
     [NSLayoutConstraint activateConstraints:gToolbarConstraints];
@@ -1502,8 +1492,9 @@ static id (*gOrigAvailablePickerItems)(id, SEL);
 static void (*gOrigShowSuggestions)(id, SEL, id);
 static id (*gOrigCellForRow)(id, SEL, id, id);
 
-// 分页 identifier 判定：只看内容里有没有 youtube / contacts。
-// 常量符号在二进制里取不到可靠值，故一律用字符串包含匹配。
+// 分页 identifier 判定：youtube / contacts / gif / sticker 四类一律不放行。
+// 常量符号在二进制里取不到可靠值，故用字符串匹配；gif 与 sticker 用整词判，
+// 避免包含匹配把 "gift" 这类无关分页一起误杀。
 static BOOL GXKIdentifierExcluded(id identifier) {
     NSString *text = nil;
     if ([identifier isKindOfClass:[NSString class]]) {
@@ -1514,6 +1505,7 @@ static BOOL GXKIdentifierExcluded(id identifier) {
     }
     if (text.length == 0) return NO;
     NSString *lower = [text lowercaseString];
+    if ([lower isEqualToString:@"gif"] || [lower isEqualToString:@"sticker"]) return YES;
     return [lower rangeOfString:@"youtube"].location != NSNotFound ||
            [lower rangeOfString:@"contacts"].location != NSNotFound;
 }
