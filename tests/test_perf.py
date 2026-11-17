@@ -297,15 +297,23 @@ class PerfContracts(unittest.TestCase):
         # 而 logo.frame 本身也可能偏上一截，所以两者都不能直接信。
         glyph = function_body(self.source, "static BOOL GXKToolbarGlyphRect(UIView *view, UIView *base, CGRect *outRect) {")
         self.assertIn("GXKToolbarGlyphCollect(view, base, found)", glyph)
-        self.assertIn("if (area > bestArea) {", glyph)
+        # 竖向跟「最靠下的图形」而不是面积最大的：logo 容器常是整行高，上面还压着
+        # 字标/阴影/整行底图等更大的图片，按面积挑会把文字抬到 G 图标上一行。
+        self.assertIn("CGFloat bottom = CGRectGetMaxY(rect);", glyph)
+        self.assertIn("bottom > bestBottom + 0.5", glyph)
+        self.assertIn("if (better) {", glyph)
+        self.assertNotIn("if (area > bestArea) {", glyph)
         self.assertIn("if (!CGRectIsEmpty(own) && !CGRectIntersectsRect(rect, own)) continue;", glyph)
         self.assertNotIn("CGRectUnion", glyph)
-        # logo 在真机上会出现两次（头行一个、候选行一个），必须按图形面积挑，
+        # logo 在真机上会出现两次（头行一个、候选行一个），必须等找到九键体再挑，
         # 不能"第一个命中就用"。
         scan = function_body(self.source, "static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIView **outBody, CGRect *outBand) {")
-        self.assertIn("CGFloat bestGlyphArea = 0.0;", scan)
-        self.assertIn("if (better) {", scan)
-        self.assertIn("bestGlyphArea = area;", scan)
+        # logo 候选先全收，等找到九键体再按「离键位最近」挑，不靠遍历顺序也不靠面积。
+        self.assertIn("NSMutableArray<NSArray *> *logoCandidates = [NSMutableArray array];", scan)
+        self.assertIn("if (!body || qwertyVisible || !logoCandidates.count) return NO;", scan)
+        self.assertIn("CGRect bodyRect = [body convertRect:body.bounds toView:root];", scan)
+        self.assertIn("CGFloat gap = CGRectGetMinY(bodyRect) - CGRectGetMaxY(glyph);", scan)
+        self.assertIn("BOOL better = (!logo || gap < bestGap - 0.5) ||", scan)
         self.assertNotIn("if (!logo && [view isKindOfClass:logoClass]", scan)
         collect = function_body(self.source, "static void GXKToolbarGlyphCollect(UIView *view, UIView *base, NSMutableArray<NSValue *> *out) {")
         self.assertIn("isKindOfClass:[UIImageView class]", collect)

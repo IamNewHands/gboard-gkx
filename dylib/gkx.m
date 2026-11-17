@@ -635,27 +635,39 @@ static void GXKToolbarGlyphCollect(UIView *view, UIView *base, NSMutableArray<NS
 // 取"用户真正看见的那个 G"：在 logo 子树里挑面积最大的图标级图片矩形。
 // 不能信 logo.frame——它可能是整行容器，也可能比里面的圆形图标偏上一截，
 // 竖向跟着它走，文字就会浮在 G 图标上一行（真机实测差 24pt）。
-// 只取面积最大的那个：徽标、角标、阴影都比主图形小。
+// 只取最靠下的那个：徽标、角标、阴影都压在容器上半部，主图形贴底。
 static BOOL GXKToolbarGlyphRect(UIView *view, UIView *base, CGRect *outRect) {
     if (!view || !base) return NO;
     CGRect own = [view convertRect:view.bounds toView:base];
     NSMutableArray<NSValue *> *found = [NSMutableArray array];
     GXKToolbarGlyphCollect(view, base, found);
     CGRect best = CGRectZero;
+    CGFloat bestBottom = -CGFLOAT_MAX;
     CGFloat bestArea = 0.0;
     for (NSValue *value in found) {
         CGRect rect = value.CGRectValue;
         // 只看落在 logo 自己范围内的图形，避免捡到同一行别处的图标。
         if (!CGRectIsEmpty(own) && !CGRectIntersectsRect(rect, own)) continue;
+        CGFloat bottom = CGRectGetMaxY(rect);
         CGFloat area = rect.size.width * rect.size.height;
-        if (area > bestArea) {
+        // 取「最靠下」的图形，不是面积最大的：logo 容器常是整行高，上面还压着字标、
+        // 阴影、整行底图等更大的图片。按面积挑会把竖向中心拉到容器中部，文字就浮到
+        // G 图标上一行（真机实测差 24~33px）。用户看见的 G 永远贴在容器底部。
+        BOOL better = (bestBottom == -CGFLOAT_MAX) || (bottom > bestBottom + 0.5) ||
+                      (fabs(bottom - bestBottom) <= 0.5 && area > bestArea);
+        if (better) {
+            bestBottom = bottom;
             bestArea = area;
             best = rect;
         }
     }
     if (bestArea <= 0.0) {
         if (CGRectIsEmpty(own)) return NO;
-        best = own; // 子树里没有图片（纯绘制图标）：只能退回视图自身。
+        // 子树里没有图片（纯绘制图标）：在左下角取一个图标大小的方框贴住容器底边。
+        // 不能退回整行宽的 own：那样 left 会被推到行末，band 宽度不足 200pt，工具条整条消失。
+        CGFloat side = MIN(own.size.height, 44.0);
+        if (side < 8.0) side = 8.0;
+        best = CGRectMake(CGRectGetMinX(own), CGRectGetMaxY(own) - side, side, side);
     }
     if (outRect) *outRect = best;
     return YES;
@@ -755,11 +767,10 @@ static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIVi
     if (!root || !root.window || !nineClass || !qwertyClass || !logoClass) return NO;
 
     UIView *body = nil;
-    UIView *logo = nil;
-    // G 图标在树里可能出现两次（真机实测：头行一个 26pt、候选行一个 44pt），
-    // 先命中的往往不是用户看见的那个。按「图形面积最大、同面积取更靠下」挑。
-    CGFloat bestGlyphArea = 0.0;
-    CGFloat bestGlyphBottom = -CGFLOAT_MAX;
+    // G 图标在树里会出现多次（真机实测至少两处：头行一个、候选行一个）。先命中的往往
+    // 不是用户看见的那个，挂错了整条工具条就高出一行。先把候选全收下来，等找到九键体
+    // 再按"离键位最近的那个 G"挑，不靠遍历顺序。
+    NSMutableArray<NSArray *> *logoCandidates = [NSMutableArray array];
     BOOL qwertyVisible = NO;
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     NSUInteger visited = 0;
@@ -777,23 +788,36 @@ static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIVi
         }
         if ([view isKindOfClass:logoClass] && (ownLogo || GXKKeyIsVisible(view, root))) {
             CGRect glyph = CGRectZero;
-            if (GXKToolbarGlyphRect(view, root, &glyph) && !CGRectIsEmpty(glyph)) {
-                CGFloat area = glyph.size.width * glyph.size.height;
-                CGFloat bottom = CGRectGetMaxY(glyph);
-                BOOL better = (!logo || area > bestGlyphArea + 0.5) ||
-                              (fabs(area - bestGlyphArea) <= 0.5 && bottom > bestGlyphBottom);
-                if (better) {
-                    logo = view;
-                    bestGlyphArea = area;
-                    bestGlyphBottom = bottom;
-                }
-            } else if (!logo) {
-                logo = view; // 拿不到图形就先占位，后续若出现更优候选会被替换。
+            if (!GXKToolbarGlyphRect(view, root, &glyph) || CGRectIsEmpty(glyph)) {
+                glyph = [view convertRect:view.bounds toView:root]; // 拿不到图片就退回视图自身。
+            }
+            if (!CGRectIsEmpty(glyph)) {
+                [logoCandidates addObject:@[view, [NSValue valueWithCGRect:glyph]]];
             }
         }
         [stack addObjectsFromArray:view.subviews];
     }
-    if (!body || qwertyVisible || !logo) return NO;
+    if (!body || qwertyVisible || !logoCandidates.count) return NO;
+
+    // 挑"落在九键体正上方、离它最近"的那个 G：工具栏必须和键位同一条竖线，不能高一行。
+    CGRect bodyRect = [body convertRect:body.bounds toView:root];
+    UIView *logo = nil;
+    CGFloat bestGap = CGFLOAT_MAX;
+    CGFloat bestBottom = -CGFLOAT_MAX;
+    for (NSArray *entry in logoCandidates) {
+        UIView *candidate = entry[0];
+        CGRect glyph = [entry[1] CGRectValue];
+        CGFloat gap = CGRectGetMinY(bodyRect) - CGRectGetMaxY(glyph);
+        if (gap < -8.0) gap = -8.0; // 压进键位体里的不算更近，但也不排除。
+        BOOL better = (!logo || gap < bestGap - 0.5) ||
+                      (fabs(gap - bestGap) <= 0.5 && CGRectGetMaxY(glyph) > bestBottom);
+        if (better) {
+            logo = candidate;
+            bestGap = gap;
+            bestBottom = CGRectGetMaxY(glyph);
+        }
+    }
+    if (!logo) return NO;
 
     UIView *row = logo.superview;
     if (!row || row == root || !GXKKeyIsVisible(row, root)) return NO;
