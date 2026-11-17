@@ -1527,7 +1527,7 @@ static BOOL gxk_phrases_hooked = NO;
 static BOOL gxk_settings_hooked = NO;
 static void (*gOrigMiniAppPickerDidSelect)(id, SEL, id, id, unsigned long long);
 static void (*gOrigArtMiniAppPickerDidSelect)(id, SEL, id, id, unsigned long long);
-static void (*gOrigSettingsMainMenu)(id, SEL);
+static id (*gOrigSettingsMainMenu)(id, SEL); // mainMenuPageDescriptor 返回 id。
 static void (*gOrigSettingsPageDidSelect)(id, SEL, id, id);
 static __weak UIView *gPhrasesPanelView;
 static __weak id gPhrasesMiniAppHost;
@@ -1900,25 +1900,42 @@ static void GXKInstallPhrasesHooks(void) {
 // 复制一行原生条目（沿用它的 type / settingID，渲染与原生完全一致），只换标题与 key。
 static NSString *const GXKPhrasesRowKey = @"GXKPhrasesRow";
 
+// 这些类在 dylib 里没有头文件，一律用 objc_msgSend 显式取，避免编译器按静态类型挑方法。
+static NSArray *GXKSectionsOf(id object) {
+    if (!object || ![object respondsToSelector:@selector(sections)]) return nil;
+    id sections = ((id (*)(id, SEL))objc_msgSend)(object, @selector(sections));
+    return [sections isKindOfClass:[NSArray class]] ? (NSArray *)sections : nil;
+}
+
+static NSArray *GXKRowsOf(id object) {
+    if (!object || ![object respondsToSelector:@selector(rows)]) return nil;
+    id rows = ((id (*)(id, SEL))objc_msgSend)(object, @selector(rows));
+    return [rows isKindOfClass:[NSArray class]] ? (NSArray *)rows : nil;
+}
+
+static NSString *GXKKeyOf(id object) {
+    if (!object || ![object respondsToSelector:@selector(key)]) return nil;
+    id key = ((id (*)(id, SEL))objc_msgSend)(object, @selector(key));
+    return [key isKindOfClass:[NSString class]] ? (NSString *)key : nil;
+}
+
 // 从现有条目里挑一个样板：优先「搜索设置」，退而键盘/主题/语言，都没有就取第一条带 key 的行。
 static id GXKPhrasesRowTemplate(NSArray *sections, id *outSection) {
     NSArray *preferred = @[@"SearchSettings", @"KeyboardSettings", @"Themes", @"Languages"];
     id fallback = nil;
     id fallbackSection = nil;
     for (id section in sections) {
-        if (![section respondsToSelector:@selector(rows)]) continue;
-        id rows = [section rows];
-        if (![rows isKindOfClass:[NSArray class]]) continue;
-        for (id row in (NSArray *)rows) {
-            if (![row respondsToSelector:@selector(key)]) continue;
-            id key = [row key];
-            if (![key isKindOfClass:[NSString class]]) continue;
+        NSArray *rows = GXKRowsOf(section);
+        if (!rows) continue;
+        for (id row in rows) {
+            NSString *key = GXKKeyOf(row);
+            if (!key) continue;
             if (!fallback) {
                 fallback = row;
                 fallbackSection = section;
             }
             for (NSString *needle in preferred) {
-                if ([(NSString *)key rangeOfString:needle].location != NSNotFound) {
+                if ([key rangeOfString:needle].location != NSNotFound) {
                     if (outSection) *outSection = section;
                     return row;
                 }
@@ -1930,10 +1947,8 @@ static id GXKPhrasesRowTemplate(NSArray *sections, id *outSection) {
 }
 
 static BOOL GXKSettingsRowIsOurs(id row) {
-    if (![row respondsToSelector:@selector(key)]) return NO;
-    id key = [row key];
-    if (![key isKindOfClass:[NSString class]]) return NO;
-    return [(NSString *)key isEqualToString:GXKPhrasesRowKey];
+    NSString *key = GXKKeyOf(row);
+    return key ? [key isEqualToString:GXKPhrasesRowKey] : NO;
 }
 
 static id GXKPhrasesSettingsRow(id template) {
@@ -1955,17 +1970,16 @@ static id GXKPhrasesSettingsRow(id template) {
 
 // 幂等：descriptor 每次打开设置都会重新生成，所以每次调用都检查一遍。
 static void GXKInjectPhrasesRow(id descriptor) {
-    if (![descriptor respondsToSelector:@selector(sections)]) return;
-    NSArray *sections = [descriptor sections];
-    if (![sections isKindOfClass:[NSArray class]] || sections.count == 0) return;
+    NSArray *sections = GXKSectionsOf(descriptor);
+    if (sections.count == 0) return;
     id targetSection = nil;
     id template = GXKPhrasesRowTemplate(sections, &targetSection);
     if (!template || !targetSection) {
         GXK_LOG(@"[!] 设置主菜单里找不到可复制的行，跳过常用语入口");
         return;
     }
-    NSArray *rows = [targetSection rows];
-    if (![rows isKindOfClass:[NSArray class]]) return;
+    NSArray *rows = GXKRowsOf(targetSection);
+    if (!rows) return;
     NSMutableArray *newRows = [NSMutableArray arrayWithCapacity:rows.count + 1];
     NSUInteger insertAt = rows.count;
     for (NSUInteger i = 0; i < rows.count; i++) {
@@ -1978,7 +1992,8 @@ static void GXKInjectPhrasesRow(id descriptor) {
     if (!ours) return;
     if (insertAt > newRows.count) insertAt = newRows.count;
     [newRows insertObject:ours atIndex:insertAt];
-    [targetSection setRows:newRows];
+    if (![targetSection respondsToSelector:@selector(setRows:)]) return;
+    ((void (*)(id, SEL, id))objc_msgSend)(targetSection, @selector(setRows:), newRows);
     GXK_LOG(@"[*] 设置主菜单已插入「常用语」一行");
 }
 
@@ -1992,26 +2007,21 @@ static id gxk_settingsMainMenu(id self, SEL _cmd) {
 static void gxk_settingsPageDidSelect(id self, SEL _cmd, id collectionView, id indexPath) {
     if ([indexPath isKindOfClass:[NSIndexPath class]] && [self respondsToSelector:@selector(pageDescriptor)]) {
         id descriptor = ((id (*)(id, SEL))objc_msgSend)(self, @selector(pageDescriptor));
-        if ([descriptor respondsToSelector:@selector(sections)]) {
-            NSArray *sections = [descriptor sections];
-            NSInteger section = ((NSInteger (*)(id, SEL))objc_msgSend)(indexPath, @selector(section));
-            NSInteger row = ((NSInteger (*)(id, SEL))objc_msgSend)(indexPath, @selector(row));
-            if ([sections isKindOfClass:[NSArray class]] && section >= 0 && (NSUInteger)section < sections.count) {
-                id sec = sections[(NSUInteger)section];
-                if ([sec respondsToSelector:@selector(rows)]) {
-                    NSArray *rows = [sec rows];
-                    if ([rows isKindOfClass:[NSArray class]] && row >= 0 && (NSUInteger)row < rows.count) {
-                        if (GXKSettingsRowIsOurs(rows[(NSUInteger)row])) {
-                            if ([collectionView respondsToSelector:@selector(deselectItemAtIndexPath:animated:)]) {
-                                ((void (*)(id, SEL, id, BOOL))objc_msgSend)(
-                                    collectionView, @selector(deselectItemAtIndexPath:animated:), indexPath, NO);
-                            }
-                            if ([self isKindOfClass:[UIViewController class]]) {
-                                GXKPresentPhrasesEditor((UIViewController *)self);
-                            }
-                            return;
-                        }
+        NSArray *sections = GXKSectionsOf(descriptor);
+        NSInteger section = ((NSInteger (*)(id, SEL))objc_msgSend)(indexPath, @selector(section));
+        NSInteger row = ((NSInteger (*)(id, SEL))objc_msgSend)(indexPath, @selector(row));
+        if (sections && section >= 0 && (NSUInteger)section < sections.count) {
+            NSArray *rows = GXKRowsOf(sections[(NSUInteger)section]);
+            if (rows && row >= 0 && (NSUInteger)row < rows.count) {
+                if (GXKSettingsRowIsOurs(rows[(NSUInteger)row])) {
+                    if ([collectionView respondsToSelector:@selector(deselectItemAtIndexPath:animated:)]) {
+                        ((void (*)(id, SEL, id, BOOL))objc_msgSend)(
+                            collectionView, @selector(deselectItemAtIndexPath:animated:), indexPath, NO);
                     }
+                    if ([self isKindOfClass:[UIViewController class]]) {
+                        GXKPresentPhrasesEditor((UIViewController *)self);
+                    }
+                    return;
                 }
             }
         }
