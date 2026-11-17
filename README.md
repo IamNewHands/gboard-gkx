@@ -45,10 +45,14 @@
 
 ### 6. 常用语分页（G 图标内，与搜索／翻译／地图同级）
 * **分页入口**：`GKBMiniAppManager` 的 `availablePickerItems` 末尾追加一项「常用语」（`GKBAppStripItem`，identifier `gxk_phrases`，图标用 `UIGraphicsImageRenderer` 现画「语」字，不依赖资源名）。`GKBMiniAppExtensionBase` 的 `miniAppPicker:didSelectItem:atIndex:` 命中该 identifier 时改为弹自己的面板，其余分页原样回落。
-* **面板是叠加层**：`GXKPhrasesPanel` 铺满键盘视图 `bounds`，`layoutSubviews` 手算 frame，**不新增任何约束、不改键盘高度**。顶部有标题、钉子按钮与关闭「×」，中间是常用语列表，底部一行提示。
+* **面板是叠加层**：`GXKPhrasesPanel` 铺满键盘视图 `bounds`，`layoutSubviews` 手算 frame，**不新增任何约束、不改键盘高度**。顶部有标题、钉子按钮、「编辑」与关闭「×」，中间是常用语列表，底部一行提示。
 * **钉子固定**：钉子关闭（默认）时点一条常用语就上屏并立即关闭面板；钉子打开后点多少条都不关，可以连续输入。状态存 App Group 的 `GXKPhrasesPinned`。
 * **上屏方式**：通过 `UITextDocumentProxy` 的 `insertText:` 写入，和原生输入完全同一条路。
-* **维护入口在主 App**：主 App 的「设置 → Gboard」页导航栏右侧多一个「常用语」按钮，进去是增／删／改列表（`UIAlertController` 输入，左滑删除）。数据存 App Group 的 `GXKPhrases` 数组，键盘与主 App 共享同一份。
+* **维护入口两处，键盘里那个才是保底**：
+  * 键盘面板右上角「编辑」→ 直接弹出编辑器，**不依赖主 App**，任何情况下都能增删改。
+  * 主 App「设置 → Gboard」页导航栏右侧的「常用语」按钮（`GKBSettingsPageViewController` 的 `viewDidAppear:` 挂，不是容器 `GKBSettingsViewController`，否则真机看不到）。
+  * 编辑器是 `GXKPhrasesEditorController`：`+` 用 `UIAlertController` 新增，点行编辑，左滑删除，modal 时自带「完成」。改完发 `GXKPhrasesChangedNotification`，键盘面板收到即刷新。
+  * 数据存 App Group 的 `GXKPhrases` 数组，键盘与主 App 共享同一份。
 * **为什么不用设置项枚举**：二进制里查不到任何 `GKBSettingType*` 字符串，`GKBSettingsItem` 的 type 枚举值无法静态确定，硬塞会有崩风险，所以入口挂在导航栏而不是插进设置主页列表。
 
 ---

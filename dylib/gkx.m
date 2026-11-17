@@ -1223,6 +1223,7 @@ static void gkx_viewDidAppear(id self, SEL _cmd, BOOL animated) {
 #define GXK_PHRASES_TITLE_TAG   0x47584B54
 #define GXK_PHRASES_TABLE_TAG   0x47584B55
 #define GXK_PHRASES_HINT_TAG    0x47584B56
+#define GXK_PHRASES_EDIT_TAG    0x47584B57
 #define GXK_PHRASES_CELL_ID     @"GXKPhraseCell"
 #define GXK_PHRASES_IDENTIFIER  @"gxk_phrases"
 
@@ -1839,16 +1840,20 @@ static void GXKInstallLocationHooks(void) {
 
 static NSString *const GXKPhrasesKey = @"GXKPhrases";
 static NSString *const GXKPhrasesPinnedKey = @"GXKPhrasesPinned";
+// 编辑器改完通知键盘面板刷新，避免两处入口看到不同步的列表。
+static NSString *const GXKPhrasesChangedNotification = @"GXKPhrasesChangedNotification";
 
 static char GXKPhrasesSettingsKey;  // 关联对象键：必须是静态地址。
 
 static BOOL gxk_phrases_hooked = NO;
 static BOOL gxk_appdelegate_hooked = NO;
 static BOOL gxk_settings_hooked = NO;
+static BOOL gxk_settingspage_hooked = NO;
 static void (*gOrigMiniAppPickerDidSelect)(id, SEL, id, id, unsigned long long);
 static void (*gOrigArtMiniAppPickerDidSelect)(id, SEL, id, id, unsigned long long);
 static BOOL (*gOrigApplicationOpenURL)(id, SEL, id, id, id);
 static void (*gOrigSettingsViewDidLoad)(id, SEL);
+static void (*gOrigSettingsPageViewDidAppear)(id, SEL, BOOL);
 static __weak UIView *gPhrasesPanelView;
 static __weak id gPhrasesMiniAppHost;
 
@@ -1945,12 +1950,18 @@ static void GXKInsertPhraseText(NSString *text) {
     ((void (*)(id, SEL, id))objc_msgSend)(proxy, @selector(insertText:), text);
 }
 
+// 编辑入口：主 App 设置页挂不上时，键盘面板里的「编辑」是始终可用的兜底维护入口。
+static void GXKPresentPhrasesEditor(UIViewController *from);
+
 @interface GXKPhrasesPanel : UIView <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSMutableArray<NSString *> *items;
 @property (nonatomic, strong) UIButton *pinButton;
 - (void)reloadItems;
 - (void)dismissPanel;
+- (void)onEdit:(UIButton *)sender;
+- (void)onPhrasesChanged:(NSNotification *)note;
+- (UIViewController *)gxkHostController;
 @end
 
 @implementation GXKPhrasesPanel
@@ -1985,6 +1996,15 @@ static void GXKInsertPhraseText(NSString *text) {
     [close addTarget:self action:@selector(onClose:) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:close];
 
+    // 维护入口：不依赖主 App 设置页，键盘里就能增删改。
+    UIButton *edit = [UIButton buttonWithType:UIButtonTypeSystem];
+    edit.tag = GXK_PHRASES_EDIT_TAG;
+    [edit setTitle:@"编辑" forState:UIControlStateNormal];
+    edit.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
+    edit.accessibilityLabel = @"管理常用语";
+    [edit addTarget:self action:@selector(onEdit:) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:edit];
+
     UITableView *table = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     table.tag = GXK_PHRASES_TABLE_TAG;
     table.dataSource = self;
@@ -1997,15 +2017,27 @@ static void GXKInsertPhraseText(NSString *text) {
 
     UILabel *hint = [[UILabel alloc] initWithFrame:CGRectZero];
     hint.tag = GXK_PHRASES_HINT_TAG;
-    hint.text = @"还没有常用语。打开 Gboard App → 设置 → 右上角「常用语」添加。";
+    hint.text = @"还没有常用语。点右上角「编辑」添加，或打开 Gboard App → 设置 → 右上角「常用语」。";
     hint.font = [UIFont systemFontOfSize:13.0];
     hint.textColor = [UIColor grayColor];
     hint.numberOfLines = 0;
     hint.textAlignment = NSTextAlignmentCenter;
     [self addSubview:hint];
 
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onPhrasesChanged:)
+                                                 name:GXKPhrasesChangedNotification
+                                               object:nil];
     [self reloadItems];
     return self;
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)onPhrasesChanged:(NSNotification *)note {
+    [self reloadItems];
 }
 
 - (void)layoutSubviews {
@@ -2014,9 +2046,11 @@ static void GXKInsertPhraseText(NSString *text) {
     CGFloat height = CGRectGetHeight(self.bounds);
     UIView *title = [self viewWithTag:GXK_PHRASES_TITLE_TAG];
     title.frame = CGRectMake(16.0, 8.0, 120.0, 24.0);
-    self.pinButton.frame = CGRectMake(MAX(width - 160.0, 120.0), 6.0, 100.0, 28.0);
     UIButton *close = (UIButton *)[self viewWithTag:GXK_PHRASES_CLOSE_TAG];
-    close.frame = CGRectMake(MAX(width - 48.0, 200.0), 4.0, 36.0, 32.0);
+    close.frame = CGRectMake(MAX(width - 44.0, 200.0), 4.0, 36.0, 32.0);
+    UIButton *edit = (UIButton *)[self viewWithTag:GXK_PHRASES_EDIT_TAG];
+    edit.frame = CGRectMake(MAX(width - 92.0, 150.0), 6.0, 44.0, 28.0);
+    self.pinButton.frame = CGRectMake(MAX(width - 168.0, 96.0), 6.0, 72.0, 28.0);
     self.table.frame = CGRectMake(0.0, 38.0, width, MAX(height - 38.0, 0.0));
     UIView *hint = [self viewWithTag:GXK_PHRASES_HINT_TAG];
     hint.frame = CGRectMake(24.0, 44.0, MAX(width - 48.0, 0.0), 60.0);
@@ -2047,6 +2081,25 @@ static void GXKInsertPhraseText(NSString *text) {
 - (void)onClose:(UIButton *)sender {
     GXKImpact(UIImpactFeedbackStyleLight);
     [self dismissPanel];
+}
+
+- (void)onEdit:(UIButton *)sender {
+    GXKImpact(UIImpactFeedbackStyleLight);
+    UIViewController *host = [self gxkHostController];
+    if (!host) {
+        GXK_LOG(@"[!] 常用语编辑：找不到宿主控制器");
+        return;
+    }
+    GXKPresentPhrasesEditor(host);
+}
+
+- (UIViewController *)gxkHostController {
+    UIResponder *responder = self;
+    while (responder) {
+        if ([responder isKindOfClass:[UIViewController class]]) return (UIViewController *)responder;
+        responder = responder.nextResponder;
+    }
+    return gCurrentVC;
 }
 
 - (void)dismissPanel {
@@ -2208,6 +2261,8 @@ static BOOL gxk_applicationOpenURL(id self, SEL _cmd, id app, id url, id options
 @interface GXKPhrasesEditorController : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSMutableArray<NSString *> *items;
+// 以 modal 方式包在 UINavigationController 里时，自己给一个「完成」按钮关掉。
+@property (nonatomic, assign) BOOL dismissable;
 @end
 
 @implementation GXKPhrasesEditorController
@@ -2233,7 +2288,7 @@ static BOOL gxk_applicationOpenURL(id self, SEL _cmd, id app, id url, id options
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
                                                       target:self
                                                       action:@selector(onAdd:)];
-    if (self.presentingViewController && !self.navigationController) {
+    if (self.dismissable) {
         self.navigationItem.leftBarButtonItem =
             [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
                                                           target:self
@@ -2261,6 +2316,7 @@ static BOOL gxk_applicationOpenURL(id self, SEL _cmd, id app, id url, id options
         [weakSelf.items addObject:text];
         GXKPhraseSave(weakSelf.items);
         [weakSelf.table reloadData];
+        [[NSNotificationCenter defaultCenter] postNotificationName:GXKPhrasesChangedNotification object:nil];
     }]];
     [self presentViewController:alert animated:YES completion:nil];
 }
@@ -2285,6 +2341,7 @@ static BOOL gxk_applicationOpenURL(id self, SEL _cmd, id app, id url, id options
     [self.items removeObjectAtIndex:indexPath.row];
     GXKPhraseSave(self.items);
     [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
+    [[NSNotificationCenter defaultCenter] postNotificationName:GXKPhrasesChangedNotification object:nil];
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -2306,11 +2363,28 @@ static BOOL gxk_applicationOpenURL(id self, SEL _cmd, id app, id url, id options
         [weakSelf.items replaceObjectAtIndex:indexPath.row withObject:text];
         GXKPhraseSave(weakSelf.items);
         [weakSelf.table reloadData];
+        [[NSNotificationCenter defaultCenter] postNotificationName:GXKPhrasesChangedNotification object:nil];
     }]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
 @end
+
+// 统一入口：设置页 push，键盘里 present。两处都走这里，行为一致。
+static void GXKPresentPhrasesEditor(UIViewController *from) {
+    if (!from) return;
+    GXKPhrasesEditorController *editor = [[GXKPhrasesEditorController alloc] init];
+    UINavigationController *nav = from.navigationController;
+    if (nav && nav.view.window) {
+        [nav pushViewController:editor animated:YES];
+        return;
+    }
+    editor.dismissable = YES;
+    UINavigationController *wrapper = [[UINavigationController alloc] initWithRootViewController:editor];
+    wrapper.modalPresentationStyle = UIModalPresentationFullScreen;
+    [from presentViewController:wrapper animated:YES completion:nil];
+    GXK_LOG(@"[*] 常用语编辑器已弹出（键盘内入口）");
+}
 
 @interface GXKPhrasesSettingsTarget : NSObject
 @property (nonatomic, weak) UIViewController *controller;
@@ -2320,16 +2394,7 @@ static BOOL gxk_applicationOpenURL(id self, SEL _cmd, id app, id url, id options
 @implementation GXKPhrasesSettingsTarget
 
 - (void)onOpenPhrasesEditor:(id)sender {
-    UIViewController *vc = self.controller;
-    if (!vc) return;
-    GXKPhrasesEditorController *editor = [[GXKPhrasesEditorController alloc] init];
-    UINavigationController *nav = vc.navigationController;
-    if (nav) {
-        [nav pushViewController:editor animated:YES];
-        return;
-    }
-    UINavigationController *wrapper = [[UINavigationController alloc] initWithRootViewController:editor];
-    [vc presentViewController:wrapper animated:YES completion:nil];
+    GXKPresentPhrasesEditor(self.controller);
 }
 
 @end
@@ -2337,7 +2402,18 @@ static BOOL gxk_applicationOpenURL(id self, SEL _cmd, id app, id url, id options
 static void gxk_settingsViewDidLoad(id self, SEL _cmd) {
     if (gOrigSettingsViewDidLoad) gOrigSettingsViewDidLoad(self, _cmd);
     if (![self isKindOfClass:[UIViewController class]]) return;
-    UIViewController *vc = (UIViewController *)self;
+    GXKAttachPhrasesEntry((UIViewController *)self);
+}
+
+// 真正显示在屏幕上的是 GKBSettingsPageViewController（每个设置页一个），
+// GKBSettingsViewController 只是容器，往它身上挂 rightBarButtonItem 真机看不到。
+// 所以主入口挂在 page VC 的 viewDidAppear:，每页出现时补一次，避免被 GOO 自绘导航栏覆盖。
+static void GXKAttachPhrasesEntry(UIViewController *vc) {
+    if (!vc || ![vc isKindOfClass:[UIViewController class]]) return;
+    if (objc_getAssociatedObject(vc, &GXKPhrasesSettingsKey)) {
+        // 已挂过，但导航项可能被 GOO 重置，确保还在。
+        if (vc.navigationItem.rightBarButtonItem) return;
+    }
     GXKPhrasesSettingsTarget *target = [[GXKPhrasesSettingsTarget alloc] init];
     target.controller = vc;
     objc_setAssociatedObject(vc, &GXKPhrasesSettingsKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -2347,7 +2423,19 @@ static void gxk_settingsViewDidLoad(id self, SEL _cmd) {
                                                            action:@selector(onOpenPhrasesEditor:)];
     item.accessibilityLabel = @"常用语管理";
     vc.navigationItem.rightBarButtonItem = item;
-    GXK_LOG(@"[*] 主 App 设置页已加「常用语」入口");
+    // GOO 自绘导航栏是 KVO 驱动的，显式催一次布局，避免首帧不刷新。
+    @try {
+        UINavigationBar *bar = vc.navigationController.navigationBar;
+        if (bar) [bar setNeedsLayout];
+    } @catch (__unused NSException *e) {}
+    GXK_LOG(@"[*] 设置页 %@ 已挂「常用语」入口 (nav=%@)", NSStringFromClass([vc class]),
+            vc.navigationController ? NSStringFromClass([vc.navigationController class]) : @"nil");
+}
+
+static void gxk_settingsPageViewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (gOrigSettingsPageViewDidAppear) gOrigSettingsPageViewDidAppear(self, _cmd, animated);
+    if (![self isKindOfClass:[UIViewController class]]) return;
+    GXKAttachPhrasesEntry((UIViewController *)self);
 }
 
 static void GXKInstallMainAppHooks(void) {
@@ -2360,6 +2448,11 @@ static void GXKInstallMainAppHooks(void) {
         GXKSwizzleOrSkip(@"GKBSettingsViewController", @"viewDidLoad",
                          (IMP)gxk_settingsViewDidLoad, (void **)&gOrigSettingsViewDidLoad);
         gxk_settings_hooked = YES;
+    }
+    if (!gxk_settingspage_hooked && NSClassFromString(@"GKBSettingsPageViewController")) {
+        GXKSwizzleOrSkip(@"GKBSettingsPageViewController", @"viewDidAppear:",
+                         (IMP)gxk_settingsPageViewDidAppear, (void **)&gOrigSettingsPageViewDidAppear);
+        gxk_settingspage_hooked = YES;
     }
 }
 

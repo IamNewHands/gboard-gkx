@@ -81,13 +81,30 @@ class PhrasesTest(unittest.TestCase):
         self.assertIn("standardUserDefaults", body)
 
     def test_main_app_editor_entry_exists(self) -> None:
-        body = function_body(self.source, "static void gxk_settingsViewDidLoad(")
+        # 导航项挂在真正上屏的 page VC 上：helper 负责建按钮，两处 hook 都走它。
+        body = function_body(self.source, "static void GXKAttachPhrasesEntry(")
         self.assertIn("rightBarButtonItem", body)
+        self.assertIn("onOpenPhrasesEditor:", body)
+        container = function_body(self.source, "static void gxk_settingsViewDidLoad(")
+        self.assertIn("GXKAttachPhrasesEntry(", container)
+        page = function_body(self.source, "static void gxk_settingsPageViewDidAppear(")
+        self.assertIn("GXKAttachPhrasesEntry(", page)
+        self.assertIn("gOrigSettingsPageViewDidAppear", page)
         push = function_body(self.source, "- (void)onOpenPhrasesEditor:")
-        self.assertIn("GXKPhrasesEditorController", push)
+        self.assertIn("GXKPresentPhrasesEditor(", push)
+        helper = function_body(self.source, "static void GXKPresentPhrasesEditor(")
+        self.assertIn("GXKPhrasesEditorController", helper)
+        self.assertIn("presentViewController:", helper)
+        # 键盘内兜底入口：面板自己带「编辑」，不依赖主 App 设置页。
+        edit = function_body(self.source, "- (void)onEdit:")
+        self.assertIn("GXKPresentPhrasesEditor(", edit)
+        init = function_body(self.source, "- (instancetype)initWithFrame:(CGRect)frame")
+        self.assertIn("onEdit:", init)
+        self.assertIn("GXK_PHRASES_EDIT_TAG", init)
         install = function_body(self.source, "static void GXKInstallMainAppHooks(")
         self.assertIn("AppDelegate", install)
         self.assertIn("GKBSettingsViewController", install)
+        self.assertIn("GKBSettingsPageViewController", install)
 
     def test_main_app_hooks_install_from_constructor(self) -> None:
         # 主 App 进程没有键盘控制器，viewWillAppear 那套接线永远不触发。
