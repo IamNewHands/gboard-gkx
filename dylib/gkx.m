@@ -6,7 +6,7 @@
 //   3. 九键 G 图标 band 内嵌工具栏：全选/复制/粘贴/剪切/收起（原地复用，不加高度）
 //   4. G 图标展开页去掉 YouTube / 联系人两页
 //   5. 搜索历史每行右侧叠 ×，点掉即删（列表 + 持久化记录）
-//   6. 地图分页：定位关闭时的链接改为经主 App 中转打开设置（键盘扩展只放行宿主 scheme）
+//   6. 地图分页定位链接经主 App 中转：拉起 App 后由用户点「去系统设置」（键盘扩展只放行宿主 scheme）
 //   7. G 图标「常用语」分页：点一条直接上屏，可固定面板连续输入；主 App 设置里维护
 // 其余一切界面与输入逻辑均完全保持 Gboard 官方原生！
 
@@ -1131,8 +1131,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
 
 static void GXKApplyTelemetryBlockIfNeeded(void);
 static void GXKApplyMiniAppAndSuggestionHooks(void);
-static void GXKInstallLocationHooks(void);
-static void GXKDetachLocationButton(void);
+static void GXKInstallLocationStampHooks(void);
 static void GXKInstallPhrasesHooks(void);
 static void GXKInstallMainAppHooks(void);
 static void GXKDetachPhrasesPanel(void);
@@ -1172,7 +1171,7 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     GXKRefreshComposingState((UIViewController *)self); // 新会话先取一次真实组字状态。
     GXKApplyTelemetryBlockIfNeeded(); // 兜底：构造函数时framework若未就绪，这里补一次。
     GXKApplyMiniAppAndSuggestionHooks(); // 分页裁剪与历史删除：类未就绪时下次出现再试。
-    GXKInstallLocationHooks(); // 地图分页定位跳转：同上，类未就绪时下次出现再试。
+    GXKInstallLocationStampHooks(); // 定位意图标记：只记时间戳，不改界面。
     GXKInstallPhrasesHooks(); // 常用语分页：同上。
     GXKInstallMainAppHooks(); // 主 App 侧入口（键盘进程里类不存在，自然跳过）。
 
@@ -1193,7 +1192,6 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
         GXKStopPolling();
         GXKDetachActionKey();
         GXKDetachToolbar(); // 扩展隐藏后工具条随宿主一起撤走，下次出现重新定位。
-        GXKDetachLocationButton(); // 定位按钮随地图分页一起撤走。
         GXKDetachPhrasesPanel(); // 常用语面板随扩展隐藏一起撤走。
         GXKReleaseHaptics(); // 扩展隐藏后不常驻触觉引擎。
     }
@@ -1518,319 +1516,42 @@ static void GXKApplyMiniAppAndSuggestionHooks(void) {
     GXKInstallSuggestionHooks();
 }
 
-#pragma mark - 地图分页：定位设置快捷跳转
+#pragma mark - 定位意图标记（键盘侧只写时间戳，不改界面）
 
-// 目标：地图分页在定位关闭时会显示「开启位置信息服务」链接，原生实现跳到 Gboard 自己的
-// 搜索设置页。这里接管这条链路，改为打开 iOS 的定位服务设置页（等价于快捷指令
-// prefs:root=Privacy&path=LOCATION）：
-//   1. hook 权限卡片的「去设置」处理器：命中就直接开定位设置页，不再走原生错误地址。
-//   2. 在卡片里找到那条链接文字，原位置叠一个同文案按钮，点它同样跳定位设置页。
-// 通道按可用性级联（扩展上下文 → framework 通道 → 系统 openURL），全失败才回落原生。
-// 每一步都打日志，真机看 Console 里 [GXK] 前缀即可判断走到哪一层。
+// 地图分页点「开启位置信息服务」时原生会拉起 Gboard 主 App。这里只记一个时间戳到
+// App Group，主 App 激活时据此弹「去系统设置」选项；键盘侧外观与行为完全保持原生。
+static NSString *const GXKLocationStampKey = @"GXKLocationIntentAt";
 
-#define GXK_LOCATION_BUTTON_TAG 0x47584B4C  // 'GXKL'
-#define GXK_LOCATION_MAX_NODES 1500
+static BOOL gxk_locationstamp_hooked = NO;
+static void (*gOrigLocationGoToSettingsStamp)(id, SEL, id, id);
+static void (*gOrigLocationPermissionTapStamp)(id, SEL, id, id);
 
-static BOOL gxk_location_hooked = NO;
-static BOOL gUpdatingLocationButton = NO;
-static void (*gOrigLocationGoToSettings)(id, SEL, id, id);
-static void (*gOrigLocationPermissionTap)(id, SEL, id, id);
-static void (*gOrigLocationCardLoad)(id, SEL, id, BOOL);
-static void (*gOrigLocationCardLayout)(id, SEL);
-static __weak UIView *gLocationCardView;
-static __weak UIButton *gLocationJumpButton;
-static __weak UIView *gLocationLinkView; // 缓存找到的链接视图，布局回调里不再全树重扫。
-
-// 在子类上新增覆盖方法，绝不改父类实现：loadWithModel:toShare: 与 layoutSubviews
-// 都来自父类，直接 setImplementation 会污染所有卡片。
-static void GXKOverrideOrSkip(NSString *className, NSString *selName, IMP imp, void **orig) {
-    Class cls = NSClassFromString(className);
-    if (!cls) return;
-    SEL sel = NSSelectorFromString(selName);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
-    if (orig) *orig = (void *)method_getImplementation(m);
-    if (!class_addMethod(cls, sel, imp, method_getTypeEncoding(m))) {
-        method_setImplementation(m, imp);
-    }
+static void GXKMarkLocationIntent(void) {
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+    if (!defaults) defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setDouble:[[NSDate date] timeIntervalSince1970] forKey:GXKLocationStampKey];
+    GXK_LOG(@"[*] 已记录定位意图时间戳");
 }
 
-static NSArray<NSString *> *GXKLocationURLStrings(void) {
-    // A 路线：键盘扩展只被放行宿主 App 自己的 scheme，设置类 scheme 一律被沙盒拒绝。
-    // 这里只发一个中转地址，由主 App 侧接住后再尝试打开系统设置（最后一级是「设置 → Gboard」）。
-    return @[@"gboard://x-gxk-location"];
+static void gxk_locationStampGoToSettings(id self, SEL _cmd, id first, id second) {
+    GXKMarkLocationIntent();
+    if (gOrigLocationGoToSettingsStamp) gOrigLocationGoToSettingsStamp(self, _cmd, first, second);
 }
 
-// 通道 1：NSExtensionContext。键盘扩展唯一官方支持的打开 URL 方式（需 RequestsOpenAccess）。
-static BOOL GXKOpenViaExtensionContext(id host, NSURL *url) {
-    if (!host || !url) return NO;
-    id context = nil;
-    if ([host respondsToSelector:@selector(extensionContext)]) {
-        context = ((id (*)(id, SEL))objc_msgSend)(host, @selector(extensionContext));
-    }
-    if (!context || ![context respondsToSelector:@selector(openURL:completionHandler:)]) return NO;
-    @try {
-        void (^completion)(BOOL) = ^(BOOL ok) {
-            GXK_LOG(@"[*] 扩展上下文跳转回调 success=%d", ok ? 1 : 0);
-        };
-        ((void (*)(id, SEL, id, id))objc_msgSend)(context, @selector(openURL:completionHandler:),
-                                                  url, (id)completion);
-        return YES;
-    } @catch (NSException *e) {
-        GXK_LOG(@"[!] 扩展上下文打开异常: %@", e.reason);
-        return NO;
-    }
+static void gxk_locationStampPermissionTap(id self, SEL _cmd, id first, id second) {
+    GXKMarkLocationIntent();
+    if (gOrigLocationPermissionTapStamp) gOrigLocationPermissionTapStamp(self, _cmd, first, second);
 }
 
-// 通道 2：Gboard framework 自带的 gkb_openURL: 分类方法。
-static BOOL GXKOpenViaFramework(id host, NSURL *url) {
-    if (!host || !url) return NO;
-    if (![host respondsToSelector:@selector(gkb_openURL:)]) return NO;
-    @try {
-        ((void (*)(id, SEL, id))objc_msgSend)(host, @selector(gkb_openURL:), url);
-        return YES;
-    } @catch (NSException *e) {
-        GXK_LOG(@"[!] framework 打开异常: %@", e.reason);
-        return NO;
-    }
-}
-
-// 通道 3：系统 openURL。扩展里通常无效，但保留兜底，异常一律吞掉。
-static BOOL GXKOpenViaApplication(NSURL *url) {
-    if (!url) return NO;
-    Class appClass = NSClassFromString(@"UIApplication");
-    if (!appClass) return NO;
-    id app = nil;
-    @try {
-        app = ((id (*)(id, SEL))objc_msgSend)(appClass, @selector(sharedApplication));
-    } @catch (NSException *e) {
-        app = nil;
-    }
-    if (!app) return NO;
-    SEL sel = @selector(openURL:options:completionHandler:);
-    if (![app respondsToSelector:sel]) return NO;
-    @try {
-        ((void (*)(id, SEL, id, id, id))objc_msgSend)(app, sel, url, @{}, nil);
-        return YES;
-    } @catch (NSException *e) {
-        return NO;
-    }
-}
-
-static BOOL GXKOpenLocationSettings(void) {
-    id host = gCurrentVC;
-    if (!host) return NO;
-    for (NSString *text in GXKLocationURLStrings()) {
-        NSURL *url = [NSURL URLWithString:text];
-        if (!url) continue;
-        if (GXKOpenViaExtensionContext(host, url)) {
-            GXK_LOG(@"[*] 定位设置跳转: 扩展上下文 %@", text);
-            return YES;
-        }
-        if (GXKOpenViaFramework(host, url)) {
-            GXK_LOG(@"[*] 定位设置跳转: framework %@", text);
-            return YES;
-        }
-        if (GXKOpenViaApplication(url)) {
-            GXK_LOG(@"[*] 定位设置跳转: 系统 openURL %@", text);
-            return YES;
-        }
-        GXK_LOG(@"[!] 该地址所有通道均不可用: %@", text);
-    }
-    return NO;
-}
-
-// 卡片里那条链接的文字：命中「开启/设置/位置信息/定位/location」都算候选。
-static NSString *GXKViewPlainText(UIView *view) {
-    if ([view isKindOfClass:[UILabel class]]) {
-        UILabel *label = (UILabel *)view;
-        // 原生那条链接是 attributedText 拼的，.text 可能是 nil，必须先读 attributedText.string。
-        if (label.text.length > 0) return label.text;
-        return label.attributedText.string;
-    }
-    if ([view isKindOfClass:[UIButton class]]) {
-        UIButton *button = (UIButton *)view;
-        NSString *title = [button titleForState:UIControlStateNormal];
-        return title.length ? title : button.currentTitle;
-    }
-    return nil;
-}
-
-static BOOL GXKTextLooksLikeLocationLink(NSString *text) {
-    if (text.length == 0) return NO;
-    return [text rangeOfString:@"位置信息"].location != NSNotFound ||
-           [text rangeOfString:@"定位"].location != NSNotFound ||
-           [text rangeOfString:@"Location"].location != NSNotFound ||
-           [text rangeOfString:@"location"].location != NSNotFound;
-}
-
-// 找面积最小的那条链接文字，优先带「开启」「设置」字样的，避免命中卡片正文。
-static UIView *GXKFindLocationLink(UIView *root) {
-    if (!root) return nil;
-    UIView *best = nil;
-    CGFloat bestArea = CGFLOAT_MAX;
-    int bestScore = -1;
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    NSUInteger visited = 0;
-    while (stack.count > 0 && visited < GXK_LOCATION_MAX_NODES) {
-        UIView *view = stack.lastObject;
-        [stack removeLastObject];
-        visited++;
-        for (UIView *child in view.subviews) [stack addObject:child];
-        if (view == gLocationJumpButton) continue;
-        if (view.hidden || view.alpha < 0.05) continue;
-        NSString *text = GXKViewPlainText(view);
-        if (!GXKTextLooksLikeLocationLink(text)) continue;
-        int score = 0;
-        if ([text rangeOfString:@"开启"].location != NSNotFound) score += 2;
-        if ([text rangeOfString:@"设置"].location != NSNotFound) score += 1;
-        CGFloat area = CGRectGetWidth(view.frame) * CGRectGetHeight(view.frame);
-        if (score > bestScore || (score == bestScore && area < bestArea)) {
-            best = view;
-            bestScore = score;
-            bestArea = area;
-        }
-    }
-    return best;
-}
-
-@interface GXKLocationTarget : NSObject
-- (void)onJumpToLocationSettings:(UIButton *)sender;
-@end
-
-@implementation GXKLocationTarget
-
-- (void)onJumpToLocationSettings:(UIButton *)sender {
-    GXKImpact(UIImpactFeedbackStyleLight);
-    GXK_LOG(@"[*] 点了「去开启定位」");
-    if (GXKOpenLocationSettings()) {
-        GXKFlashTitle(sender, @"已打开 Gboard");
-        return;
-    }
-    GXK_LOG(@"[!] gboard:// 中转打不开，提示用户手动去设置");
-    GXKFlashTitle(sender, @"请手动打开");
-}
-
-@end
-
-static GXKLocationTarget *gLocationTarget = nil;
-
-// 在找到的链接原位置叠一个同文案按钮：不加高度、不改约束，只覆盖那条链接。
-static void GXKAttachLocationJump(UIView *card) {
-    if (!card || gUpdatingLocationButton) return;
-    gUpdatingLocationButton = YES;
-    UIView *link = gLocationLinkView;
-    if (!link || link.window != card.window || ![link isDescendantOfView:card]) {
-        link = GXKFindLocationLink(card);
-        gLocationLinkView = link;
-    }
-    NSString *title = GXKViewPlainText(link);
-    if (title.length == 0) title = @"去 Gboard 设置开启定位";
-    if (!link) {
-        // 找不到那条链接也照挂：贴在卡片底部，保证有可见入口可点。
-        GXK_LOG(@"[*] 未匹配到定位链接，按钮改贴卡片底部");
-    }
-    UIButton *button = gLocationJumpButton;
-    if (!button || button.superview != card) {
-        if (button) [button removeFromSuperview];
-        if (!gLocationTarget) gLocationTarget = [[GXKLocationTarget alloc] init];
-        button = [UIButton buttonWithType:UIButtonTypeCustom];
-        button.tag = GXK_LOCATION_BUTTON_TAG;
-        button.adjustsImageWhenHighlighted = NO;
-        button.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
-        button.titleLabel.minimumScaleFactor = 0.7;
-        button.titleLabel.adjustsFontSizeToFitWidth = YES;
-        button.accessibilityLabel = @"去开启定位（跳系统定位设置）";
-        [button addTarget:gLocationTarget action:@selector(onJumpToLocationSettings:)
-         forControlEvents:UIControlEventTouchUpInside];
-        [card addSubview:button];
-        gLocationJumpButton = button;
-        GXK_LOG(@"[*] 已叠「%@」按钮", title);
-    }
-    [button setTitle:title forState:UIControlStateNormal];
-    UIColor *tint = nil;
-    if ([link isKindOfClass:[UILabel class]]) tint = ((UILabel *)link).textColor;
-    if (!tint) tint = [UIColor colorWithRed:0.26 green:0.52 blue:0.96 alpha:1.0];
-    [button setTitleColor:tint forState:UIControlStateNormal];
-    [button setTitleColor:[tint colorWithAlphaComponent:0.5] forState:UIControlStateHighlighted];
-    CGRect rect;
-    if (link) {
-        rect = [link convertRect:link.bounds toView:card];
-        rect = CGRectInset(rect, -6.0, -4.0);
-    } else {
-        CGFloat cardWidth = CGRectGetWidth(card.bounds);
-        CGFloat cardHeight = CGRectGetHeight(card.bounds);
-        rect = CGRectMake(8.0, cardHeight - 34.0, MAX(cardWidth - 16.0, 80.0), 28.0);
-    }
-    if (!CGRectEqualToRect(button.frame, rect)) button.frame = rect;
-    button.autoresizingMask = UIViewAutoresizingNone;
-    if (card.subviews.lastObject != button) [card bringSubviewToFront:button];
-    gUpdatingLocationButton = NO;
-}
-
-static void gxk_locationGoToSettings(id self, SEL _cmd, id first, id second) {
-    GXK_LOG(@"[*] 原生「开启位置信息服务」被点击，尝试改跳系统定位设置");
-    if (GXKOpenLocationSettings()) {
-        GXK_LOG(@"[*] 已接管该链接，不再跳 Gboard 搜索设置");
-        return;
-    }
-    GXK_LOG(@"[!] 定位设置无法打开，回落原生行为");
-    if (gOrigLocationGoToSettings) gOrigLocationGoToSettings(self, _cmd, first, second);
-}
-
-// 点「开启位置信息服务」走的另一条入口：先试定位设置页，失败再回落原生请求权限。
-static void gxk_locationPermissionTap(id self, SEL _cmd, id first, id second) {
-    GXK_LOG(@"[*] 原生定位权限入口被点击，先试跳系统定位设置");
-    if (GXKOpenLocationSettings()) {
-        GXK_LOG(@"[*] 已接管该入口");
-        return;
-    }
-    GXK_LOG(@"[!] 定位设置无法打开，回落原生请求权限");
-    if (gOrigLocationPermissionTap) gOrigLocationPermissionTap(self, _cmd, first, second);
-}
-
-static void gxk_locationCardLoad(id self, SEL _cmd, id model, BOOL toShare) {
-    if (gOrigLocationCardLoad) gOrigLocationCardLoad(self, _cmd, model, toShare);
-    if (![self isKindOfClass:[UIView class]]) return;
-    gLocationCardView = (UIView *)self;
-    GXKAttachLocationJump((UIView *)self);
-    // 文案可能异步填充，补一次。
-    __weak UIView *weakCard = (UIView *)self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UIView *card = weakCard;
-        if (card) GXKAttachLocationJump(card);
-    });
-}
-
-static void gxk_locationCardLayout(id self, SEL _cmd) {
-    if (gOrigLocationCardLayout) gOrigLocationCardLayout(self, _cmd);
-    if (![self isKindOfClass:[UIView class]]) return;
-    if ((UIView *)self != gLocationCardView) return;
-    GXKAttachLocationJump((UIView *)self);
-}
-
-static void GXKDetachLocationButton(void) {
-    UIButton *button = gLocationJumpButton;
-    if (button) [button removeFromSuperview];
-    gLocationJumpButton = nil;
-    gLocationCardView = nil;
-    gLocationLinkView = nil;
-}
-
-static void GXKInstallLocationHooks(void) {
-    if (gxk_location_hooked) return;
+static void GXKInstallLocationStampHooks(void) {
+    if (gxk_locationstamp_hooked) return;
     if (!NSClassFromString(@"GKBLocationPermissionCardView")) return;
-    GXKOverrideOrSkip(@"GKBLocationPermissionCardView", @"handleGoToSettings:handler:",
-                      (IMP)gxk_locationGoToSettings, (void **)&gOrigLocationGoToSettings);
-    GXKOverrideOrSkip(@"GKBLocationPermissionCardView", @"handleLocationPermissionTap:handler:",
-                      (IMP)gxk_locationPermissionTap, (void **)&gOrigLocationPermissionTap);
-    GXKOverrideOrSkip(@"GKBLocationPermissionCardView", @"loadWithModel:toShare:",
-                      (IMP)gxk_locationCardLoad, (void **)&gOrigLocationCardLoad);
-    GXKOverrideOrSkip(@"GKBLocationPermissionCardView", @"layoutSubviews",
-                      (IMP)gxk_locationCardLayout, (void **)&gOrigLocationCardLayout);
-    gxk_location_hooked = YES;
-    GXK_LOG(@"[*] 地图分页定位跳转已接管");
+    GXKSwizzleOrSkip(@"GKBLocationPermissionCardView", @"handleGoToSettings:handler:",
+                     (IMP)gxk_locationStampGoToSettings, (void **)&gOrigLocationGoToSettingsStamp);
+    GXKSwizzleOrSkip(@"GKBLocationPermissionCardView", @"handleLocationPermissionTap:handler:",
+                     (IMP)gxk_locationStampPermissionTap, (void **)&gOrigLocationPermissionTapStamp);
+    gxk_locationstamp_hooked = YES;
+    GXK_LOG(@"[*] 定位意图标记已接入（不改界面，只记时间戳）");
 }
 
 #pragma mark - G 图标「常用语」分页 + 主 App 维护入口
@@ -1852,6 +1573,7 @@ static BOOL gxk_settingspage_hooked = NO;
 static void (*gOrigMiniAppPickerDidSelect)(id, SEL, id, id, unsigned long long);
 static void (*gOrigArtMiniAppPickerDidSelect)(id, SEL, id, id, unsigned long long);
 static BOOL (*gOrigApplicationOpenURL)(id, SEL, id, id, id);
+static void (*gOrigApplicationDidBecomeActive)(id, SEL, id);
 static void (*gOrigSettingsViewDidLoad)(id, SEL);
 static void (*gOrigSettingsPageViewDidAppear)(id, SEL, BOOL);
 static __weak UIView *gPhrasesPanelView;
@@ -2233,31 +1955,101 @@ static BOOL GXKIsLocationRelayURL(NSURL *url) {
     return NO;
 }
 
-// 主 App 内逐级尝试：定位页 → 隐私页 → 本 App 设置页（最后一级必然能开）。
-static BOOL GXKMainAppOpenLocationSettings(void) {
-    NSMutableArray *candidates = [NSMutableArray array];
-    [candidates addObject:@"prefs:root=Privacy&path=LOCATION"];
-    [candidates addObject:@"App-Prefs:root=Privacy&path=LOCATION"];
-    if (UIApplicationOpenSettingsURLString.length) [candidates addObject:UIApplicationOpenSettingsURLString];
-    for (NSString *text in candidates) {
-        NSURL *url = [NSURL URLWithString:text];
-        if (!url) continue;
-        if (GXKOpenViaApplication(url)) {
-            GXK_LOG(@"[*] 主 App 已打开设置: %@", text);
-            return YES;
-        }
-        GXK_LOG(@"[!] 主 App 打不开: %@", text);
+// 主 App 里唯一合法的一步：UIApplicationOpenSettingsURLString 打开「设置 → Gboard」。
+// prefs:/App-Prefs: 这类深链第三方 App 一律被系统静默拒绝，所以不做无效尝试。
+static BOOL GXKMainAppOpenSettingsPage(void) {
+    NSString *text = UIApplicationOpenSettingsURLString;
+    NSURL *url = text.length ? [NSURL URLWithString:text] : nil;
+    if (!url) {
+        GXK_LOG(@"[!] 系统设置页地址不可用");
+        return NO;
     }
-    return NO;
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return NO;
+    __block BOOL handed = NO;
+    [app openURL:url options:@{} completionHandler:^(BOOL success) {
+        GXK_LOG(@"[*] 打开系统设置页 %@ => %@", text, success ? @"成功" : @"被拒绝");
+    }];
+    handed = YES;
+    return handed;
+}
+
+// 从根视图控制器往上找当前真正在屏幕上的那一个，避免把 alert 挂在被覆盖的控制器上。
+static UIViewController *GXKTopViewController(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    UIWindow *window = app.keyWindow;
+    if (!window) {
+        for (UIWindow *candidate in app.windows) {
+            if (candidate.isKeyWindow) { window = candidate; break; }
+        }
+    }
+    if (!window) window = app.windows.firstObject;
+    UIViewController *vc = window.rootViewController;
+    while (vc) {
+        UIViewController *next = nil;
+        if (vc.presentedViewController) next = vc.presentedViewController;
+        else if ([vc isKindOfClass:[UINavigationController class]])
+            next = ((UINavigationController *)vc).topViewController;
+        else if ([vc isKindOfClass:[UITabBarController class]])
+            next = ((UITabBarController *)vc).selectedViewController;
+        if (!next || next == vc) break;
+        vc = next;
+    }
+    return vc;
+}
+
+// 冷启动时窗口可能还没就绪，重试几轮再弹；只弹一次，不打扰后续使用。
+static void GXKPresentLocationSettingsAlert(void) {
+    static BOOL shown = NO;
+    static NSInteger tries = 0;
+    if (shown) return;
+    UIViewController *host = GXKTopViewController();
+    if (!host || !host.view.window) {
+        if (tries >= 20) { GXK_LOG(@"[!] 找不到可弹窗的控制器，放弃提示"); return; }
+        tries++;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ GXKPresentLocationSettingsAlert(); });
+        return;
+    }
+    shown = YES;
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"开启定位"
+                                             message:@"Gboard 的定位权限在系统设置里。点「去系统设置」打开 Gboard 设置页，再进「位置」把定位打开。"
+                                      preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"去系统设置"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        GXKMainAppOpenSettingsPage();
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [host presentViewController:alert animated:YES completion:nil];
+    GXK_LOG(@"[*] 已弹出「去系统设置」提示");
 }
 
 static BOOL gxk_applicationOpenURL(id self, SEL _cmd, id app, id url, id options) {
     if (GXKIsLocationRelayURL((NSURL *)url)) {
         GXK_LOG(@"[*] 主 App 收到定位中转: %@", url);
-        GXKMainAppOpenLocationSettings();
+        GXKPresentLocationSettingsAlert();
         return YES;
     }
     return gOrigApplicationOpenURL ? gOrigApplicationOpenURL(self, _cmd, app, url, options) : NO;
+}
+
+// 键盘侧记的时间戳只有 2 分钟内算数，用过即清零，避免之后每次打开 Gboard 都弹。
+static BOOL GXKConsumeLocationIntent(void) {
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+    if (!defaults) defaults = [NSUserDefaults standardUserDefaults];
+    double stamp = [defaults doubleForKey:GXKLocationStampKey];
+    if (stamp <= 0.0) return NO;
+    [defaults setDouble:0.0 forKey:GXKLocationStampKey];
+    NSTimeInterval age = [[NSDate date] timeIntervalSince1970] - stamp;
+    GXK_LOG(@"[*] 读到定位意图时间戳，距今 %.1fs", age);
+    return age >= 0.0 && age <= 120.0;
+}
+
+static void gxk_applicationDidBecomeActive(id self, SEL _cmd, id app) {
+    if (gOrigApplicationDidBecomeActive) gOrigApplicationDidBecomeActive(self, _cmd, app);
+    if (GXKConsumeLocationIntent()) GXKPresentLocationSettingsAlert();
 }
 
 @interface GXKPhrasesEditorController : UIViewController <UITableViewDataSource, UITableViewDelegate>
@@ -2444,6 +2236,8 @@ static void GXKInstallMainAppHooks(void) {
     if (!gxk_appdelegate_hooked && NSClassFromString(@"AppDelegate")) {
         GXKSwizzleOrSkip(@"AppDelegate", @"application:openURL:options:",
                          (IMP)gxk_applicationOpenURL, (void **)&gOrigApplicationOpenURL);
+        GXKSwizzleOrSkip(@"AppDelegate", @"applicationDidBecomeActive:",
+                         (IMP)gxk_applicationDidBecomeActive, (void **)&gOrigApplicationDidBecomeActive);
         gxk_appdelegate_hooked = YES;
     }
     if (!gxk_settings_hooked && NSClassFromString(@"GKBSettingsViewController")) {

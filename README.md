@@ -36,12 +36,11 @@
 * **搜索历史单条删除**：搜索分页每条历史记录右侧叠一个 28pt 的「×」，点击即从当前建议数组删掉该条并重刷列表，同时把持久化记录里同名的条目去掉（只删不造：只有键名含 `RecentQueries` 且确实命中才写回）。
 * **不碰 cell 布局**：× 是 `contentView` 上的叠加按钮（`autoresizingMask` 跟随），不参与原生自动布局、不改行高、不改约束。
 
-### 5. 地图分页一键去开定位（A 路线：经宿主 App 中转）
-* **为什么不是直接跳**：键盘扩展的 `NSExtensionContext` 只放行宿主 App 自己的 URL scheme，`prefs:` 与 `App-Prefs:` 一律被沙盒拒绝（实测点击无任何反应）。快捷指令能跳是因为它有独立授权，键盘扩展没有。因此键盘侧只发一个中转地址 `gboard://x-gxk-location`。
-* **两个接管点**：`GKBLocationPermissionCardView` 的 `handleGoToSettings:handler:` 与 `handleLocationPermissionTap:handler:`——命中就发中转地址，不再走官方那个错误的 Gboard 搜索设置页。
-* **找不到原生链接也照挂**：地图卡片里的「开启位置信息服务」是运行时拼的 attributed string，扫描可能落空，所以按文字匹配不到时就在卡片底部固定位置叠一个「去 Gboard 设置开启定位」按钮（`autoresizingMask = None`，不加约束、不改行高、不改容器）。文案读取同时兼容 `UILabel.text` 与 `attributedText.string`。
-* **主 App 三级级联**：同一个 dylib 也注入主 App，`AppDelegate` 的 `application:openURL:options:` 接住中转后依次尝试 `prefs:root=Privacy&path=LOCATION` → `App-Prefs:root=Privacy&path=LOCATION` → `UIApplicationOpenSettingsURLString`（最后一级必然能打开「设置 → Gboard」）。每一步都写 `[GXK]` 日志。
-* **绝不污染父类**：`loadWithModel:toShare:` 与 `layoutSubviews` 都来自 `GKBCardView` 父类，一律用 `class_addMethod` 在子类新增覆盖；新增失败才退到 `method_setImplementation`。
+### 5. 地图分页定位：键盘保持原生，主 App 给一个「去系统设置」
+* **键盘侧完全不接管**：地图分页的「开启位置信息服务」回到 Gboard 原生行为，不装 hook、不叠按钮、不改卡片布局。（早先那版接管在真机上点击毫无反应，已整体删除。）
+* **为什么不能直接跳**：键盘扩展的 `NSExtensionContext` 只放行宿主 App 自己的 URL scheme，`prefs:` 与 `App-Prefs:` 一律被沙盒静默拒绝；快捷指令能跳是因为它有独立授权。
+* **主 App 只做一件事**：同一个 dylib 也注入主 App，`AppDelegate` 的 `application:openURL:options:` 接住 `gboard://x-gxk-location` 后弹一个提示——「去系统设置」（调 `UIApplicationOpenSettingsURLString` 打开「设置 → Gboard」）或「取消」。不自动跳，不写无效的 `prefs:` 尝试。
+* **弹窗只弹一次**：等窗口就绪（最多重试 20 次 × 0.25s），并从根控制器沿 presented／导航栈／tab 找到真正在屏幕上的那个再 present，避免挂在被覆盖的控制器上。
 
 ### 6. 常用语分页（G 图标内，与搜索／翻译／地图同级）
 * **分页入口**：`GKBMiniAppManager` 的 `availablePickerItems` 末尾追加一项「常用语」（`GKBAppStripItem`，identifier `gxk_phrases`，图标用 `UIGraphicsImageRenderer` 现画「语」字，不依赖资源名）。`GKBMiniAppExtensionBase` 的 `miniAppPicker:didSelectItem:atIndex:` 命中该 identifier 时改为弹自己的面板，其余分页原样回落。

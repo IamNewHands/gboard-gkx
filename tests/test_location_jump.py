@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""地图分页定位跳转（A 路线）的静态契约测试。
+"""地图分页定位链路的静态契约测试。
 
-键盘扩展只被放行宿主 App 自己的 URL scheme，prefs: 与 App-Prefs: 会被沙盒拒绝，
-所以键盘侧只发 gboard:// 中转，真正的设置跳转由主 App 代跑。这里锁住这条链路。
+键盘扩展只被放行宿主 App 自己的 URL scheme，prefs: 与 App-Prefs: 会被沙盒静默拒绝，
+所以键盘侧不做任何接管（还原原生「开启位置信息服务」），只有主 App 在中转被拉起后
+弹一个「去系统设置」提示，再由用户点进 UIApplicationOpenSettingsURLString。
 """
 import pathlib
 import unittest
@@ -38,55 +39,62 @@ class LocationJumpTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.source = SOURCE.read_text(encoding="utf-8")
 
-    def test_module_is_wired_into_lifecycle(self) -> None:
-        self.assertIn("GXKInstallLocationHooks();", self.source)
+    def test_keyboard_side_keeps_native_behaviour(self) -> None:
+        """键盘侧不改界面：不叠按钮、不接管跳转，只记一个时间戳。"""
+        self.assertNotIn("GXKInstallLocationHooks", self.source)
+        self.assertNotIn("GXKDetachLocationButton", self.source)
+        self.assertNotIn("GXKAttachLocationJump", self.source)
+        self.assertNotIn("GXK_LOCATION_BUTTON_TAG", self.source)
+        self.assertNotIn("GXKOpenLocationSettings", self.source)
+        self.assertNotIn("UIButton", function_body(self.source, "static void GXKInstallLocationStampHooks(void)"))
+
+    def test_keyboard_side_stamps_intent_only(self) -> None:
+        stamp = function_body(self.source, "static void GXKMarkLocationIntent(void)")
+        self.assertIn("GXKLocationStampKey", stamp)
+        self.assertIn("setDouble:", stamp)
+        go = function_body(self.source, "static void gxk_locationStampGoToSettings(")
+        self.assertIn("GXKMarkLocationIntent();", go)
+        # 必须回落原生，绝不吞掉原行为。
+        self.assertIn("gOrigLocationGoToSettingsStamp(self, _cmd, first, second);", go)
         appear = function_body(self.source, "static void gkx_viewWillAppear(")
-        self.assertIn("GXKInstallLocationHooks();", appear)
-        disappear = function_body(self.source, "static void gkx_viewWillDisappear(")
-        self.assertIn("GXKDetachLocationButton();", disappear)
+        self.assertIn("GXKInstallLocationStampHooks();", appear)
 
-    def test_keyboard_side_only_sends_host_scheme(self) -> None:
-        body = function_body(self.source, "static NSArray<NSString *> *GXKLocationURLStrings(void)")
-        self.assertIn("gboard://x-gxk-location", body)
-        # 键盘扩展里绝不直接开 prefs: —— 沙盒会拒绝，用户只会看到「点了没反应」。
-        self.assertNotIn("@\"prefs:root=Privacy", body)
-        self.assertNotIn("@\"App-Prefs:root", body)
-        self.assertNotIn("searchSettingsURL", body)
-
-    def test_main_app_relay_cascades_to_settings(self) -> None:
-        body = function_body(self.source, "static BOOL GXKMainAppOpenLocationSettings(void)")
-        self.assertIn("prefs:root=Privacy&path=LOCATION", body)
-        self.assertIn("App-Prefs:root=Privacy&path=LOCATION", body)
-        # 最后一级必须是本 App 设置页，保证 100% 能打开。
-        self.assertIn("UIApplicationOpenSettingsURLString", body)
-        self.assertIn("return NO;", body)
-
-    def test_relay_url_is_recognised(self) -> None:
+    def test_relay_url_is_still_recognised(self) -> None:
         body = function_body(self.source, "static BOOL GXKIsLocationRelayURL(NSURL *url)")
         self.assertIn("x-gxk-location", body)
         self.assertIn("gboard", body)
 
-    def test_native_handlers_fall_back_when_jump_fails(self) -> None:
-        go = function_body(self.source, "static void gxk_locationGoToSettings(")
-        self.assertIn("gOrigLocationGoToSettings(self, _cmd, first, second);", go)
-        tap = function_body(self.source, "static void gxk_locationPermissionTap(")
-        self.assertIn("gOrigLocationPermissionTap(self, _cmd, first, second);", tap)
+    def test_main_app_only_opens_settings_page(self) -> None:
+        body = function_body(self.source, "static BOOL GXKMainAppOpenSettingsPage(void)")
+        self.assertIn("UIApplicationOpenSettingsURLString", body)
+        # 第三方 App 调 prefs:/App-Prefs: 会被静默拒绝，绝不写进代码。
+        self.assertNotIn("prefs:root=Privacy", body)
+        self.assertNotIn("App-Prefs:root", body)
+        self.assertIn("openURL:url options:", body)
+        self.assertGreaterEqual(body.count("GXK_LOG("), 1)
 
-    def test_overlay_does_not_change_card_layout(self) -> None:
-        body = function_body(self.source, "static void GXKAttachLocationJump(UIView *card)")
-        self.assertNotIn("NSLayoutConstraint", body)
-        self.assertNotIn("addConstraint", body)
-        self.assertNotIn("sizeToFit", body)
-        self.assertIn("UIViewAutoresizingNone", body)
+    def test_relay_presents_choice_instead_of_jumping(self) -> None:
+        """被中转拉起后先弹选项，不自动跳设置。"""
+        body = function_body(self.source, "static void GXKPresentLocationSettingsAlert(void)")
+        self.assertIn("UIAlertController", body)
+        self.assertIn('@"去系统设置"', body)
+        self.assertIn('@"取消"', body)
+        self.assertIn("GXKMainAppOpenSettingsPage()", body)
+        handler = function_body(self.source, "static BOOL gxk_applicationOpenURL(")
+        self.assertIn("GXKPresentLocationSettingsAlert();", handler)
+        self.assertNotIn("GXKMainAppOpenSettingsPage();", handler)
 
-    def test_override_never_pollutes_parent_class(self) -> None:
-        body = function_body(self.source, "static void GXKOverrideOrSkip(")
-        self.assertIn("class_addMethod", body)
-        self.assertIn("method_setImplementation", body)
+    def test_alert_is_presented_once_and_waits_for_window(self) -> None:
+        body = function_body(self.source, "static void GXKPresentLocationSettingsAlert(void)")
+        self.assertIn("if (shown) return;", body)
+        self.assertIn("host.view.window", body)
+        self.assertIn("dispatch_after", body)
 
-    def test_every_attempt_is_logged(self) -> None:
-        body = function_body(self.source, "static BOOL GXKMainAppOpenLocationSettings(void)")
-        self.assertGreaterEqual(body.count("GXK_LOG("), 2)
+    def test_top_controller_walks_presentation_chain(self) -> None:
+        body = function_body(self.source, "static UIViewController *GXKTopViewController(void)")
+        self.assertIn("presentedViewController", body)
+        self.assertIn("UINavigationController", body)
+        self.assertIn("UITabBarController", body)
 
 
 if __name__ == "__main__":
