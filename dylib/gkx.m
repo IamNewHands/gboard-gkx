@@ -604,6 +604,38 @@ static void GXKFlashTitle(UIButton *button, NSString *text) {
     });
 }
 
+// G 图标那一格里真正画出来的图形往往只占视图的一小块：GKBHeaderLogoView 经常是整行宽，
+// 彩色 G 只是它内部的一个 UIImageView。band 必须从「图形右缘」起算，用视图右缘会把 left
+// 推到整行之外，宽度不足 200pt，整条工具条就直接不显示了。
+static BOOL GXKToolbarGlyphRect(UIView *view, UIView *base, CGRect *outRect) {
+    if (!view || !base) return NO;
+    BOOL found = NO;
+    CGRect unionRect = CGRectZero;
+    for (UIView *sub in view.subviews) {
+        if (sub.isHidden || sub.alpha < 0.05) continue;
+        BOOL draws = [sub isKindOfClass:[UIImageView class]];
+        if (!draws && [sub respondsToSelector:@selector(image)]) {
+            id image = [(id)sub image];
+            draws = [image isKindOfClass:[UIImage class]];
+        }
+        if (draws) {
+            CGRect rect = [sub convertRect:sub.bounds toView:base];
+            if (!CGRectIsEmpty(rect)) {
+                unionRect = found ? CGRectUnion(unionRect, rect) : rect;
+                found = YES;
+                continue; // 图形子树已经计入，不再往下找。
+            }
+        }
+        CGRect deeper = CGRectZero;
+        if (GXKToolbarGlyphRect(sub, base, &deeper) && !CGRectIsEmpty(deeper)) {
+            unionRect = found ? CGRectUnion(unionRect, deeper) : deeper;
+            found = YES;
+        }
+    }
+    if (found && outRect) *outRect = unionRect;
+    return found;
+}
+
 // 只借 G 图标那一段空白：左右边界各自停在最近一个可见兄弟视图之前。
 // 宁可窄到不显示，也绝不盖住候选栏或右侧功能图标。
 static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outBand) {
@@ -650,15 +682,18 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
             if (CGRectGetMinX(r) < right) right = CGRectGetMinX(r);
         }
     }
-    // G 图标自己那一格永远留出来：工具条从图标右侧起算，绝不压在图标上，
-    // 也就不必再把图标 alpha 归零——"条下面露出半个 G"就是归零后露出的底图。
-    CGFloat iconRight = CGRectGetMaxX(logoRect);
+    // 用图形矩形而不是 logo 视图矩形：视图常是整行宽，图形只占左边一小块。
+    // 用视图右缘算 left 会把它推到整行之外，band 宽度不足 200pt，工具条整条消失。
+    CGRect glyph = logoRect;
+    CGRect glyphInRow = CGRectZero;
+    if (GXKToolbarGlyphRect(logo, row, &glyphInRow)) glyph = glyphInRow;
+    CGFloat iconRight = CGRectGetMaxX(glyph);
     if (iconRight > left) left = iconRight + 4.0;
-    // 竖向贴住 G 图标本身：高度取图标高度（拿不到才退整行），垂直居中。
+    // 竖向贴住图形本身：高度取图形高度（拿不到才退整行），垂直居中。
     // 这样五个字读起来是 G 图标同一行的原生文字，而不是另起一条横带。
-    CGFloat barHeight = logoRect.size.height;
+    CGFloat barHeight = glyph.size.height;
     if (barHeight < 18.0 || barHeight > height) barHeight = height;
-    CGFloat top = CGRectGetMidY(logoRect) - barHeight * 0.5;
+    CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;
     if (top < 0.0) top = 0.0;
     if (top + barHeight > height) top = MAX(0.0, height - barHeight);
     // 五个中文按钮最少要 200pt；不够就整条不显示，保持原生。

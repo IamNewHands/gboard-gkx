@@ -276,13 +276,21 @@ class PerfContracts(unittest.TestCase):
     def test_toolbar_band_starts_right_of_logo_and_matches_icon_height(self):
         """工具条贴 G 图标右侧、竖向对齐图标本身，而不是另起一条横贯整行的带。"""
         band = function_body(self.source, "static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outBand) {")
-        # 左边界必须被推到 G 图标右缘之后：压在图标上就得把图标 alpha 归零，
+        # 左边界必须被推到 G 图形右缘之后：压在图形上就得把它 alpha 归零，
         # 而归零后会露出图标底图，真机上表现为"条下面又冒出半个 G"。
-        self.assertIn("CGFloat iconRight = CGRectGetMaxX(logoRect);", band)
+        # 必须用图形矩形而不是 logo 视图矩形：视图常是整行宽，用视图右缘会把
+        # left 推到整行之外，宽度不足 200pt，工具条整条消失（真机实测）。
+        self.assertIn("if (GXKToolbarGlyphRect(logo, row, &glyphInRow)) glyph = glyphInRow;", band)
+        self.assertIn("CGFloat iconRight = CGRectGetMaxX(glyph);", band)
         self.assertIn("if (iconRight > left) left = iconRight + 4.0;", band)
-        # 竖向取图标高度并居中；拿不到图标高度才退回整行。
-        self.assertIn("CGFloat barHeight = logoRect.size.height;", band)
-        self.assertIn("CGFloat top = CGRectGetMidY(logoRect) - barHeight * 0.5;", band)
+        # 竖向取图形高度并居中；拿不到图形高度才退回整行。
+        self.assertIn("CGFloat barHeight = glyph.size.height;", band)
+        self.assertIn("CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;", band)
+        # 图形矩形必须由含图片的子树算出来，不能直接信 logo.frame。
+        glyph = function_body(self.source, "static BOOL GXKToolbarGlyphRect(UIView *view, UIView *base, CGRect *outRect) {")
+        self.assertIn("isKindOfClass:[UIImageView class]", glyph)
+        self.assertIn("convertRect:sub.bounds toView:base", glyph)
+        self.assertIn("CGRectUnion", glyph)
         self.assertIn("CGRectMake(left, top, right - left, barHeight)", band)
         # 不再整行满高：满高就是用户截图里那条突兀的横带。
         self.assertNotIn("CGRectMake(left, 0.0, right - left, height)", band)
