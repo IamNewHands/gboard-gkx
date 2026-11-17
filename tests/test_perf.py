@@ -281,16 +281,39 @@ class PerfContracts(unittest.TestCase):
         # 必须用图形矩形而不是 logo 视图矩形：视图常是整行宽，用视图右缘会把
         # left 推到整行之外，宽度不足 200pt，工具条整条消失（真机实测）。
         self.assertIn("if (GXKToolbarGlyphRect(logo, row, &glyphInRow)) glyph = glyphInRow;", band)
+        # 邻居左右也按图形矩形判：logo 视图整行宽时，右边界会落到行末盖住功能图标。
+        self.assertIn("if (CGRectGetMaxX(r) <= CGRectGetMinX(glyph) + 0.5) {", band)
+        self.assertIn("} else if (CGRectGetMinX(r) >= CGRectGetMaxX(glyph) - 0.5) {", band)
+        self.assertLess(band.index("if (GXKToolbarGlyphRect(logo, row, &glyphInRow))"), band.index("CGFloat left = 0.0;"))
         self.assertIn("CGFloat iconRight = CGRectGetMaxX(glyph);", band)
         self.assertIn("if (iconRight > left) left = iconRight + 4.0;", band)
         # 竖向取图形高度并居中；拿不到图形高度才退回整行。
         self.assertIn("CGFloat barHeight = glyph.size.height;", band)
+        # 图形可能只有 20pt，条高兜底 28pt，否则 16pt 的字会被挤扁。
+        self.assertIn("if (barHeight < 28.0) barHeight = 28.0;", band)
         self.assertIn("CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;", band)
-        # 图形矩形必须由含图片的子树算出来，不能直接信 logo.frame。
+        # 图形矩形取 logo 子树里面积最大的图标级图片矩形。
+        # 真机实测：并集整行底图会把竖向中心拉到行中间，文字比 G 图标高一行；
+        # 而 logo.frame 本身也可能偏上一截，所以两者都不能直接信。
         glyph = function_body(self.source, "static BOOL GXKToolbarGlyphRect(UIView *view, UIView *base, CGRect *outRect) {")
-        self.assertIn("isKindOfClass:[UIImageView class]", glyph)
-        self.assertIn("convertRect:sub.bounds toView:base", glyph)
-        self.assertIn("CGRectUnion", glyph)
+        self.assertIn("GXKToolbarGlyphCollect(view, base, found)", glyph)
+        self.assertIn("if (area > bestArea) {", glyph)
+        self.assertIn("if (!CGRectIsEmpty(own) && !CGRectIntersectsRect(rect, own)) continue;", glyph)
+        self.assertNotIn("CGRectUnion", glyph)
+        # logo 在真机上会出现两次（头行一个、候选行一个），必须按图形面积挑，
+        # 不能"第一个命中就用"。
+        scan = function_body(self.source, "static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIView **outBody, CGRect *outBand) {")
+        self.assertIn("CGFloat bestGlyphArea = 0.0;", scan)
+        self.assertIn("if (better) {", scan)
+        self.assertIn("bestGlyphArea = area;", scan)
+        self.assertNotIn("if (!logo && [view isKindOfClass:logoClass]", scan)
+        collect = function_body(self.source, "static void GXKToolbarGlyphCollect(UIView *view, UIView *base, NSMutableArray<NSValue *> *out) {")
+        self.assertIn("isKindOfClass:[UIImageView class]", collect)
+        self.assertIn("convertRect:sub.bounds toView:base", collect)
+        # 整行宽的底图不是图标，必须按尺寸排除，否则竖向中心会被它拉偏。
+        sized = function_body(self.source, "static BOOL GXKToolbarIconSized(CGRect rect) {")
+        self.assertIn("size.width <= 64.0", sized)
+        self.assertIn("size.height <= 64.0", sized)
         self.assertIn("CGRectMake(left, top, right - left, barHeight)", band)
         # 不再整行满高：满高就是用户截图里那条突兀的横带。
         self.assertNotIn("CGRectMake(left, 0.0, right - left, height)", band)

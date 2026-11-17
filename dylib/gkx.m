@@ -607,10 +607,15 @@ static void GXKFlashTitle(UIButton *button, NSString *text) {
 // G 图标那一格里真正画出来的图形往往只占视图的一小块：GKBHeaderLogoView 经常是整行宽，
 // 彩色 G 只是它内部的一个 UIImageView。band 必须从「图形右缘」起算，用视图右缘会把 left
 // 推到整行之外，宽度不足 200pt，整条工具条就直接不显示了。
-static BOOL GXKToolbarGlyphRect(UIView *view, UIView *base, CGRect *outRect) {
-    if (!view || !base) return NO;
-    BOOL found = NO;
-    CGRect unionRect = CGRectZero;
+static BOOL GXKToolbarIconSized(CGRect rect) {
+    CGSize size = rect.size;
+    return size.width >= 8.0 && size.height >= 8.0 && size.width <= 64.0 && size.height <= 64.0;
+}
+
+// 收集 logo 子树里"像图标"的图片矩形。整行宽的底图不算：它会把竖向中心拉到行中间，
+// 文字就跑到 G 图标上一行去了（真机实测：文字比图标高 24pt）。
+static void GXKToolbarGlyphCollect(UIView *view, UIView *base, NSMutableArray<NSValue *> *out) {
+    if (!view || !base || !out) return;
     for (UIView *sub in view.subviews) {
         if (sub.isHidden || sub.alpha < 0.05) continue;
         BOOL draws = [sub isKindOfClass:[UIImageView class]];
@@ -618,22 +623,42 @@ static BOOL GXKToolbarGlyphRect(UIView *view, UIView *base, CGRect *outRect) {
             id image = [(id)sub image];
             draws = [image isKindOfClass:[UIImage class]];
         }
-        if (draws) {
-            CGRect rect = [sub convertRect:sub.bounds toView:base];
-            if (!CGRectIsEmpty(rect)) {
-                unionRect = found ? CGRectUnion(unionRect, rect) : rect;
-                found = YES;
-                continue; // 图形子树已经计入，不再往下找。
-            }
+        CGRect rect = [sub convertRect:sub.bounds toView:base];
+        if (draws && !CGRectIsEmpty(rect) && GXKToolbarIconSized(rect)) {
+            [out addObject:[NSValue valueWithCGRect:rect]];
+            continue; // 图标子树已经计入，不再往下找。
         }
-        CGRect deeper = CGRectZero;
-        if (GXKToolbarGlyphRect(sub, base, &deeper) && !CGRectIsEmpty(deeper)) {
-            unionRect = found ? CGRectUnion(unionRect, deeper) : deeper;
-            found = YES;
+        GXKToolbarGlyphCollect(sub, base, out);
+    }
+}
+
+// 取"用户真正看见的那个 G"：在 logo 子树里挑面积最大的图标级图片矩形。
+// 不能信 logo.frame——它可能是整行容器，也可能比里面的圆形图标偏上一截，
+// 竖向跟着它走，文字就会浮在 G 图标上一行（真机实测差 24pt）。
+// 只取面积最大的那个：徽标、角标、阴影都比主图形小。
+static BOOL GXKToolbarGlyphRect(UIView *view, UIView *base, CGRect *outRect) {
+    if (!view || !base) return NO;
+    CGRect own = [view convertRect:view.bounds toView:base];
+    NSMutableArray<NSValue *> *found = [NSMutableArray array];
+    GXKToolbarGlyphCollect(view, base, found);
+    CGRect best = CGRectZero;
+    CGFloat bestArea = 0.0;
+    for (NSValue *value in found) {
+        CGRect rect = value.CGRectValue;
+        // 只看落在 logo 自己范围内的图形，避免捡到同一行别处的图标。
+        if (!CGRectIsEmpty(own) && !CGRectIntersectsRect(rect, own)) continue;
+        CGFloat area = rect.size.width * rect.size.height;
+        if (area > bestArea) {
+            bestArea = area;
+            best = rect;
         }
     }
-    if (found && outRect) *outRect = unionRect;
-    return found;
+    if (bestArea <= 0.0) {
+        if (CGRectIsEmpty(own)) return NO;
+        best = own; // 子树里没有图片（纯绘制图标）：只能退回视图自身。
+    }
+    if (outRect) *outRect = best;
+    return YES;
 }
 
 // 只借 G 图标那一段空白：左右边界各自停在最近一个可见兄弟视图之前。
@@ -669,6 +694,13 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
         if (outBand) *outBand = gToolbarBandCacheBand;
         return gToolbarBandCacheHit;
     }
+    // 用图形矩形而不是 logo 视图矩形：视图常是整行宽，图形只占左边一小块。
+    // 用视图右缘算 left 会把它推到整行之外，band 宽度不足 200pt，工具条整条消失。
+    // 邻居也按图形矩形判左右：视图整行宽时，右侧功能图标会被误判成"在视图里面"，
+    // 右边界就落到行末，工具条会盖住它们。
+    CGRect glyph = logoRect;
+    CGRect glyphInRow = CGRectZero;
+    if (GXKToolbarGlyphRect(logo, row, &glyphInRow)) glyph = glyphInRow;
     CGFloat left = 0.0;
     CGFloat right = width;
     for (UIView *sibling in row.subviews) {
@@ -676,23 +708,21 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
         if (sibling.isHidden || sibling.alpha < 0.05) continue;
         if (!GXKKeyIsVisible(sibling, root)) continue;
         CGRect r = sibling.frame;
-        if (CGRectGetMaxX(r) <= CGRectGetMinX(logoRect) + 0.5) {
+        if (CGRectGetMaxX(r) <= CGRectGetMinX(glyph) + 0.5) {
             if (CGRectGetMaxX(r) > left) left = CGRectGetMaxX(r);
-        } else if (CGRectGetMinX(r) >= CGRectGetMaxX(logoRect) - 0.5) {
+        } else if (CGRectGetMinX(r) >= CGRectGetMaxX(glyph) - 0.5) {
             if (CGRectGetMinX(r) < right) right = CGRectGetMinX(r);
         }
     }
-    // 用图形矩形而不是 logo 视图矩形：视图常是整行宽，图形只占左边一小块。
-    // 用视图右缘算 left 会把它推到整行之外，band 宽度不足 200pt，工具条整条消失。
-    CGRect glyph = logoRect;
-    CGRect glyphInRow = CGRectZero;
-    if (GXKToolbarGlyphRect(logo, row, &glyphInRow)) glyph = glyphInRow;
     CGFloat iconRight = CGRectGetMaxX(glyph);
     if (iconRight > left) left = iconRight + 4.0;
     // 竖向贴住图形本身：高度取图形高度（拿不到才退整行），垂直居中。
     // 这样五个字读起来是 G 图标同一行的原生文字，而不是另起一条横带。
     CGFloat barHeight = glyph.size.height;
-    if (barHeight < 18.0 || barHeight > height) barHeight = height;
+    // 高度至少 28pt：图形本身可能只有 20pt（图标留白），按它做条会挤到字。
+    // 仍以图形中心为准做垂直居中，所以视觉上还是"和 G 同一行"。
+    if (barHeight < 28.0) barHeight = 28.0;
+    if (barHeight > height) barHeight = height;
     CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;
     if (top < 0.0) top = 0.0;
     if (top + barHeight > height) top = MAX(0.0, height - barHeight);
@@ -726,6 +756,10 @@ static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIVi
 
     UIView *body = nil;
     UIView *logo = nil;
+    // G 图标在树里可能出现两次（真机实测：头行一个 26pt、候选行一个 44pt），
+    // 先命中的往往不是用户看见的那个。按「图形面积最大、同面积取更靠下」挑。
+    CGFloat bestGlyphArea = 0.0;
+    CGFloat bestGlyphBottom = -CGFLOAT_MAX;
     BOOL qwertyVisible = NO;
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     NSUInteger visited = 0;
@@ -741,7 +775,22 @@ static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIVi
         } else if ([view isKindOfClass:qwertyClass] && GXKKeyIsVisible(view, root)) {
             qwertyVisible = YES; // 九键继承 26 键类，所以九键必须走上面那条分支。
         }
-        if (!logo && [view isKindOfClass:logoClass] && (ownLogo || GXKKeyIsVisible(view, root))) logo = view;
+        if ([view isKindOfClass:logoClass] && (ownLogo || GXKKeyIsVisible(view, root))) {
+            CGRect glyph = CGRectZero;
+            if (GXKToolbarGlyphRect(view, root, &glyph) && !CGRectIsEmpty(glyph)) {
+                CGFloat area = glyph.size.width * glyph.size.height;
+                CGFloat bottom = CGRectGetMaxY(glyph);
+                BOOL better = (!logo || area > bestGlyphArea + 0.5) ||
+                              (fabs(area - bestGlyphArea) <= 0.5 && bottom > bestGlyphBottom);
+                if (better) {
+                    logo = view;
+                    bestGlyphArea = area;
+                    bestGlyphBottom = bottom;
+                }
+            } else if (!logo) {
+                logo = view; // 拿不到图形就先占位，后续若出现更优候选会被替换。
+            }
+        }
         [stack addObjectsFromArray:view.subviews];
     }
     if (!body || qwertyVisible || !logo) return NO;
