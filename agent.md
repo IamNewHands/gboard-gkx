@@ -13,8 +13,8 @@
   3. **九键工具栏**（全选／复制／粘贴／剪切／收起），复用官方 G 图标 band，不加高度；
   4. **G 图标展开页裁剪**：去掉 YouTube 与联系人两页；
   5. **搜索历史单条删除**：每条历史右侧叠「×」，点掉即删（列表 + 持久化记录）；
-  6. **地图分页定位**：键盘侧保持原生（不接管、不叠按钮）；主 App 收到 `gboard://x-gxk-location` 中转后弹一次「去系统设置 / 取消」，确认才打开 `UIApplicationOpenSettingsURLString`；
-  7. **常用语分页**：G 图标内与搜索／翻译／地图同级，叠加层展示已维护的短语，点击即上屏；钉子固定后连续输入，未固定点一条即关；维护入口两处——键盘面板右上角「编辑」（保底，不依赖主 App），以及主 App「设置 → Gboard」页导航栏右侧「常用语」（挂 `GKBSettingsPageViewController` 的 `viewDidAppear:`）。
+  6. **常用语分页**：G 图标内与搜索／翻译／地图同级，叠加层展示已维护的短语，点击即上屏；钉子固定后连续输入，未固定点一条即关；维护入口两处——键盘面板右上角「编辑」（保底，不依赖主 App），以及主 App「设置 → Gboard」主菜单里的一行「常用语」（hook `mainMenuPageDescriptor` 复制原生行）。
+- **已移除**：地图分页的定位跳转（键盘接管、`prefs:` 级联、主 App 中转 alert）在真机上达不到目的，已整体删除，详见避坑 7。
 - **极简原则**：**已彻底废除并移除**悬浮工具条、键盘高度扩张约束、强制全屏深色注入及短语管理器。杜绝任何破坏原生界面视野与触摸链的做法。当前九键工具栏是**原地复用官方 G 图标 band**（G 图标 alpha 归零、工具条占同一段、空位不足即整条不显示），不新增视图高度、不位移任何原生容器。
 - **技术载体**：Objective-C 动态库注入（`libgkx.dylib`），在扩展初始化时进行最小必要生命周期 Hook。
 - **目标环境**：iOS 12.0 ~ iOS 18+，arm64 设备，支持 LCSign、SideStore、SideInstaller 等免越狱自签工具。
@@ -26,7 +26,7 @@
 ```
 gboard-gkx/
 ├── dylib/
-│   └── gkx.m                          # 核心动态库源码：词库部署 + 九键重输/换行 + G 图标 band 工具栏 + 分页裁剪 + 搜索历史单条删除 + 地图定位中转 + 常用语分页/维护
+│   └── gkx.m                          # 核心动态库源码：词库部署 + 九键重输/换行 + G 图标 band 工具栏 + 分页裁剪 + 搜索历史单条删除 + 常用语分页/设置主菜单维护
 ├── .github/workflows/
 │   └── build-dylib.yml                # CI 云端编译流：macOS-15 runner，原生 clang 编译 arm64，ldid 伪签名
 ├── tools/
@@ -90,10 +90,10 @@ gboard-gkx/
 * **历史教训**：`GKBFeatureFlagManager` 的 `enableYouTubeMiniApp`／`enableContactsMiniApp` 名字像 BOOL，实际返回 `GKBBoolFeatureFlag` 对象。若把原实现指针声明成 `BOOL (*)(id, SEL)`，返回值被截断，hook 里拿到垃圾地址，必崩。
 * **开发准则**：写 hook 前先用 `dump_types.py` 查 method type encoding；`method_setImplementation` 的原实现指针签名必须与 encoding 严格一致。返回对象的 getter 想关掉功能时，优先改原对象的 `value`（保留对象身份），而不是伪造新对象。
 
-### 🚫 避坑 7：键盘扩展不能打开系统设置页，必须走宿主 App 中转
-* **历史教训**：曾试图在键盘扩展里直接开 `prefs:root=Privacy&path=LOCATION` 跳 iOS 定位设置，真机点击**毫无反应**。原因是 `NSExtensionContext` 的 `openURL:` 只放行宿主 App 自己的 URL scheme，`prefs:`／`App-Prefs:` 一律被沙盒静默拒绝；快捷指令能跳是因为它有独立授权。三层通道（extensionContext → `gkb_openURL:` → `UIApplication`）全都过不去。
-* **开发准则**：需要跳出键盘打开任何系统页面时，一律先发宿主 scheme（本项目用 `gboard://x-gxk-<功能>`）唤起主 App，主 App 侧的同一个 dylib 在 `AppDelegate` 的 `application:openURL:options:` 里接住。主 App 里也只有 `UIApplicationOpenSettingsURLString` 可用——`prefs:root=Privacy&path=LOCATION` 对第三方 App 同样是静默拒绝，别再写无效级联。接住后先给用户一个可见选项（alert「去系统设置 / 取消」），确认再跳。
-* **配套教训（2026-11-17）**：键盘侧那套接管（hook `GKBLocationPermissionCardView` + 叠按钮 + 三通道）在真机上点击毫无反应，已整体删除。真机没反应时不要再叠第二层，先确认通道本身是否被系统拒绝。
+### 🚫 避坑 7：定位设置页跳不过去，别再尝试（已整条删除）
+* **历史教训（2026-11-17）**：为「G 图标 → 地图 → 开启位置信息服务」做过三轮尝试，全部真机无效并已删除：① 键盘扩展里直接开 `prefs:root=Privacy&path=LOCATION`（hook `GKBLocationPermissionCardView` + 叠按钮 + 三通道 extensionContext → `gkb_openURL:` → `UIApplication`），点击毫无反应；② 改为只记时间戳、由主 App 被中转拉起后弹「去系统设置」，用户判定"不符合需求，做了也没什么用"；③ 主 App 侧同样打不开 `prefs:`。
+* **根因**：`NSExtensionContext` 的 `openURL:` 只放行宿主 App 自己的 URL scheme；`prefs:`／`App-Prefs:` 对第三方 App 也被系统静默拒绝。唯一能开的 `UIApplicationOpenSettingsURLString` 只到「设置 → Gboard」，进不了定位页。快捷指令能跳是因为它有独立授权。
+* **开发准则**：涉及 iOS 隐私设置深链的需求先明确拒绝并说明原因，不要用「中转 + 弹窗」包装成看起来能用的方案。`tests/test_location_jump.py` 会断言这些符号不再出现，改动时不要绕过它。
 * **配套准则**：用户不接 Console.app，所以任何"看日志判断"的设计都不可执行——失败必须画在屏幕上（改按钮标题等），日志只作辅助。
 
 ### 🚫 避坑 6：Windows 打包必须显式保留 Unix 权限（0o755 / 0o644）

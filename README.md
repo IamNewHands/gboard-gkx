@@ -36,11 +36,10 @@
 * **搜索历史单条删除**：搜索分页每条历史记录右侧叠一个 28pt 的「×」，点击即从当前建议数组删掉该条并重刷列表，同时把持久化记录里同名的条目去掉（只删不造：只有键名含 `RecentQueries` 且确实命中才写回）。
 * **不碰 cell 布局**：× 是 `contentView` 上的叠加按钮（`autoresizingMask` 跟随），不参与原生自动布局、不改行高、不改约束。
 
-### 5. 地图分页定位：键盘保持原生，主 App 给一个「去系统设置」
-* **键盘侧完全不接管**：地图分页的「开启位置信息服务」回到 Gboard 原生行为，不装 hook、不叠按钮、不改卡片布局。（早先那版接管在真机上点击毫无反应，已整体删除。）
-* **为什么不能直接跳**：键盘扩展的 `NSExtensionContext` 只放行宿主 App 自己的 URL scheme，`prefs:` 与 `App-Prefs:` 一律被沙盒静默拒绝；快捷指令能跳是因为它有独立授权。
-* **主 App 只做一件事**：同一个 dylib 也注入主 App，`AppDelegate` 的 `application:openURL:options:` 接住 `gboard://x-gxk-location` 后弹一个提示——「去系统设置」（调 `UIApplicationOpenSettingsURLString` 打开「设置 → Gboard」）或「取消」。不自动跳，不写无效的 `prefs:` 尝试。
-* **弹窗只弹一次**：等窗口就绪（最多重试 20 次 × 0.25s），并从根控制器沿 presented／导航栈／tab 找到真正在屏幕上的那个再 present，避免挂在被覆盖的控制器上。
+### 5. 地图分页定位：完全还原原生（不做任何跳转）
+* **一行代码都不留**：地图分页的「开启位置信息服务」就是 Gboard 原生行为。不装 hook、不叠按钮、不改卡片布局，也不做任何「先唤起主 App 再弹提示」的中转——这套方案在真机上达不到目的，已整体删除。
+* **为什么做不到**：键盘扩展的 `NSExtensionContext` 只放行宿主 App 自己的 URL scheme；主 App 里 `prefs:root=Privacy&path=LOCATION` 同样被系统静默拒绝，唯一能开的 `UIApplicationOpenSettingsURLString` 只到「设置 → Gboard」，进不了定位页。快捷指令能跳是因为它有独立授权，第三方 App 与键盘扩展都没有。
+* **回归护栏**：`tests/test_location_jump.py` 断言源码里不再出现 `GXKLocation*` / `prefs:root=Privacy` / `App-Prefs:root` / `UIApplicationOpenSettingsURLString` / `x-gxk-location`，避免这套无效方案被重新带回来。
 
 ### 6. 常用语分页（G 图标内，与搜索／翻译／地图同级）
 * **分页入口**：`GKBMiniAppManager` 的 `availablePickerItems` 末尾追加一项「常用语」（`GKBAppStripItem`，identifier `gxk_phrases`，图标用 `UIGraphicsImageRenderer` 现画「语」字，不依赖资源名）。`GKBMiniAppExtensionBase` 的 `miniAppPicker:didSelectItem:atIndex:` 命中该 identifier 时改为弹自己的面板，其余分页原样回落。
@@ -49,10 +48,11 @@
 * **上屏方式**：通过 `UITextDocumentProxy` 的 `insertText:` 写入，和原生输入完全同一条路。
 * **维护入口两处，键盘里那个才是保底**：
   * 键盘面板右上角「编辑」→ 直接弹出编辑器，**不依赖主 App**，任何情况下都能增删改。
-  * 主 App「设置 → Gboard」页导航栏右侧的「常用语」按钮（`GKBSettingsPageViewController` 的 `viewDidAppear:` 挂，不是容器 `GKBSettingsViewController`，否则真机看不到）。
-  * 编辑器是 `GXKPhrasesEditorController`：`+` 用 `UIAlertController` 新增，点行编辑，左滑删除，modal 时自带「完成」。改完发 `GXKPhrasesChangedNotification`，键盘面板收到即刷新。
+  * 主 App「设置 → Gboard」**主菜单里的一行「常用语」**，和「搜索设置」「键盘设置」同一层级。做法是 hook `GKBSettingsViewController` 的 `mainMenuPageDescriptor`，复制一条原生设置行（沿用它的 `type`／`settingID`）只换标题与 `key`，插到「搜索设置」后面；点击由 `GKBSettingsPageViewController` 的 `collectionView:didSelectItemAtIndexPath:` 认领，非本行原样回落原生。
+  * 编辑器是 `GXKPhrasesEditorController`：`+` 用 `UIAlertController` 新增，点行编辑，左滑删除，自带「完成」。改完发 `GXKPhrasesChangedNotification`，键盘面板收到即刷新。
   * 数据存 App Group 的 `GXKPhrases` 数组，键盘与主 App 共享同一份。
-* **为什么不用设置项枚举**：二进制里查不到任何 `GKBSettingType*` 字符串，`GKBSettingsItem` 的 type 枚举值无法静态确定，硬塞会有崩风险，所以入口挂在导航栏而不是插进设置主页列表。
+* **一律全屏 modal，不 push**：主 App 的设置页跑在 Google 自绘的 `GOONavigationController` 里，往它上面 push 出来的控制器真机上是白屏（早先挂在「搜索设置」导航栏的那版就栽在这里）。所以编辑器统一包一层 `UINavigationController` + `UIModalPresentationFullScreen` present 出来。
+* **为什么复制原生行而不是硬造**：二进制里查不到任何 `GKBSettingType*` 字符串，`GKBSettingsItem` 的 type 枚举值无法静态确定，硬塞会有崩风险；复制一条真实存在的行才能保证渲染、点击、埋点行为与原生完全一致。
 
 ---
 

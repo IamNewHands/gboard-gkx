@@ -2,7 +2,8 @@
 """「常用语」分页与主 App 维护入口的静态契约测试。
 
 本机没有 clang，真机行为靠 GitHub Actions 编译后再验；这里锁住几条硬约束：
-分页是叠加层不改原生布局、数据只存 App Group、未固定时点一条即关、固定后连续输入。
+分页是叠加层不改原生布局、数据只存 App Group、未固定时点一条即关、固定后连续输入，
+主 App 的维护入口是设置主菜单里的一行（不是导航栏按钮）。
 """
 import pathlib
 import unittest
@@ -80,31 +81,53 @@ class PhrasesTest(unittest.TestCase):
         self.assertIn("initWithSuiteName:GXKGroup", body)
         self.assertIn("standardUserDefaults", body)
 
-    def test_main_app_editor_entry_exists(self) -> None:
-        # 导航项挂在真正上屏的 page VC 上：helper 负责建按钮，两处 hook 都走它。
-        body = function_body(self.source, "static void GXKAttachPhrasesEntry(")
-        self.assertIn("rightBarButtonItem", body)
-        self.assertIn("onOpenPhrasesEditor:", body)
-        container = function_body(self.source, "static void gxk_settingsViewDidLoad(")
-        self.assertIn("GXKAttachPhrasesEntry(", container)
-        page = function_body(self.source, "static void gxk_settingsPageViewDidAppear(")
-        self.assertIn("GXKAttachPhrasesEntry(", page)
-        self.assertIn("gOrigSettingsPageViewDidAppear", page)
-        push = function_body(self.source, "- (void)onOpenPhrasesEditor:")
-        self.assertIn("GXKPresentPhrasesEditor(", push)
+    def test_settings_row_is_cloned_from_native_template(self) -> None:
+        # 设置主菜单是 descriptor 驱动的；复制一条原生行（沿用 type/settingID）再换标题，
+        # 避免硬塞未知的 type 枚举值导致崩溃。
+        body = function_body(self.source, "static id GXKPhrasesSettingsRow(")
+        self.assertIn("initWithType:settingID:title:accessibilityIdentifier:key:", body)
+        self.assertIn("GKBSettingsItem", body)
+        inject = function_body(self.source, "static void GXKInjectPhrasesRow(")
+        self.assertIn("sections", inject)
+        self.assertIn("setRows:", inject)
+        self.assertIn("GXKSettingsRowIsOurs", inject)
+        self.assertIn("GXKPhrasesRowTemplate", inject)
+
+    def test_main_menu_descriptor_hook_injects_row(self) -> None:
+        body = function_body(self.source, "static id gxk_settingsMainMenu(")
+        self.assertIn("gOrigSettingsMainMenu", body)
+        self.assertIn("GXKInjectPhrasesRow(", body)
+
+    def test_row_tap_opens_editor(self) -> None:
+        body = function_body(self.source, "static void gxk_settingsPageDidSelect(")
+        self.assertIn("GXKSettingsRowIsOurs", body)
+        self.assertIn("GXKPresentPhrasesEditor(", body)
+        # 非本行必须回落原生，绝不吞掉其他设置项。
+        self.assertIn("gOrigSettingsPageDidSelect", body)
+
+    def test_editor_is_presented_not_pushed(self) -> None:
+        # GOO 自绘导航容器里 push 出来的控制器会白屏，统一走全屏 modal。
         helper = function_body(self.source, "static void GXKPresentPhrasesEditor(")
         self.assertIn("GXKPhrasesEditorController", helper)
         self.assertIn("presentViewController:", helper)
-        # 键盘内兜底入口：面板自己带「编辑」，不依赖主 App 设置页。
+        self.assertNotIn("pushViewController:", helper)
+        self.assertIn("dismissable = YES", helper)
+
+    def test_install_hooks_target_settings_classes(self) -> None:
+        install = function_body(self.source, "static void GXKInstallMainAppHooks(")
+        self.assertIn("mainMenuPageDescriptor", install)
+        self.assertIn("collectionView:didSelectItemAtIndexPath:", install)
+        self.assertIn("GKBSettingsViewController", install)
+        self.assertIn("GKBSettingsPageViewController", install)
+        # 导航栏按钮那条路已废弃（真机点开白屏）。
+        self.assertNotIn("rightBarButtonItem", install)
+
+    def test_keyboard_panel_keeps_edit_entry(self) -> None:
         edit = function_body(self.source, "- (void)onEdit:")
         self.assertIn("GXKPresentPhrasesEditor(", edit)
         init = function_body(self.source, "- (instancetype)initWithFrame:(CGRect)frame")
         self.assertIn("onEdit:", init)
         self.assertIn("GXK_PHRASES_EDIT_TAG", init)
-        install = function_body(self.source, "static void GXKInstallMainAppHooks(")
-        self.assertIn("AppDelegate", install)
-        self.assertIn("GKBSettingsViewController", install)
-        self.assertIn("GKBSettingsPageViewController", install)
 
     def test_main_app_hooks_install_from_constructor(self) -> None:
         # 主 App 进程没有键盘控制器，viewWillAppear 那套接线永远不触发。

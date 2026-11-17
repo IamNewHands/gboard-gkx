@@ -6,8 +6,7 @@
 //   3. 九键 G 图标 band 内嵌工具栏：全选/复制/粘贴/剪切/收起（原地复用，不加高度）
 //   4. G 图标展开页去掉 YouTube / 联系人两页
 //   5. 搜索历史每行右侧叠 ×，点掉即删（列表 + 持久化记录）
-//   6. 地图分页定位链接经主 App 中转：拉起 App 后由用户点「去系统设置」（键盘扩展只放行宿主 scheme）
-//   7. G 图标「常用语」分页：点一条直接上屏，可固定面板连续输入；主 App 设置里维护
+//   6. G 图标「常用语」分页：点一条直接上屏，可固定面板连续输入；主 App 设置主菜单里维护
 // 其余一切界面与输入逻辑均完全保持 Gboard 官方原生！
 
 #import <UIKit/UIKit.h>
@@ -1131,7 +1130,6 @@ static void GXKUpdateActionKey(UIViewController *vc) {
 
 static void GXKApplyTelemetryBlockIfNeeded(void);
 static void GXKApplyMiniAppAndSuggestionHooks(void);
-static void GXKInstallLocationStampHooks(void);
 static void GXKInstallPhrasesHooks(void);
 static void GXKInstallMainAppHooks(void);
 static void GXKDetachPhrasesPanel(void);
@@ -1171,7 +1169,6 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     GXKRefreshComposingState((UIViewController *)self); // 新会话先取一次真实组字状态。
     GXKApplyTelemetryBlockIfNeeded(); // 兜底：构造函数时framework若未就绪，这里补一次。
     GXKApplyMiniAppAndSuggestionHooks(); // 分页裁剪与历史删除：类未就绪时下次出现再试。
-    GXKInstallLocationStampHooks(); // 定位意图标记：只记时间戳，不改界面。
     GXKInstallPhrasesHooks(); // 常用语分页：同上。
     GXKInstallMainAppHooks(); // 主 App 侧入口（键盘进程里类不存在，自然跳过）。
 
@@ -1516,44 +1513,6 @@ static void GXKApplyMiniAppAndSuggestionHooks(void) {
     GXKInstallSuggestionHooks();
 }
 
-#pragma mark - 定位意图标记（键盘侧只写时间戳，不改界面）
-
-// 地图分页点「开启位置信息服务」时原生会拉起 Gboard 主 App。这里只记一个时间戳到
-// App Group，主 App 激活时据此弹「去系统设置」选项；键盘侧外观与行为完全保持原生。
-static NSString *const GXKLocationStampKey = @"GXKLocationIntentAt";
-
-static BOOL gxk_locationstamp_hooked = NO;
-static void (*gOrigLocationGoToSettingsStamp)(id, SEL, id, id);
-static void (*gOrigLocationPermissionTapStamp)(id, SEL, id, id);
-
-static void GXKMarkLocationIntent(void) {
-    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
-    if (!defaults) defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setDouble:[[NSDate date] timeIntervalSince1970] forKey:GXKLocationStampKey];
-    GXK_LOG(@"[*] 已记录定位意图时间戳");
-}
-
-static void gxk_locationStampGoToSettings(id self, SEL _cmd, id first, id second) {
-    GXKMarkLocationIntent();
-    if (gOrigLocationGoToSettingsStamp) gOrigLocationGoToSettingsStamp(self, _cmd, first, second);
-}
-
-static void gxk_locationStampPermissionTap(id self, SEL _cmd, id first, id second) {
-    GXKMarkLocationIntent();
-    if (gOrigLocationPermissionTapStamp) gOrigLocationPermissionTapStamp(self, _cmd, first, second);
-}
-
-static void GXKInstallLocationStampHooks(void) {
-    if (gxk_locationstamp_hooked) return;
-    if (!NSClassFromString(@"GKBLocationPermissionCardView")) return;
-    GXKSwizzleOrSkip(@"GKBLocationPermissionCardView", @"handleGoToSettings:handler:",
-                     (IMP)gxk_locationStampGoToSettings, (void **)&gOrigLocationGoToSettingsStamp);
-    GXKSwizzleOrSkip(@"GKBLocationPermissionCardView", @"handleLocationPermissionTap:handler:",
-                     (IMP)gxk_locationStampPermissionTap, (void **)&gOrigLocationPermissionTapStamp);
-    gxk_locationstamp_hooked = YES;
-    GXK_LOG(@"[*] 定位意图标记已接入（不改界面，只记时间戳）");
-}
-
 #pragma mark - G 图标「常用语」分页 + 主 App 维护入口
 
 // 常用语存在 App Group 的 NSUserDefaults 里，键盘与主 App 共用同一份数据。
@@ -1564,18 +1523,12 @@ static NSString *const GXKPhrasesPinnedKey = @"GXKPhrasesPinned";
 // 编辑器改完通知键盘面板刷新，避免两处入口看到不同步的列表。
 static NSString *const GXKPhrasesChangedNotification = @"GXKPhrasesChangedNotification";
 
-static char GXKPhrasesSettingsKey;  // 关联对象键：必须是静态地址。
-
 static BOOL gxk_phrases_hooked = NO;
-static BOOL gxk_appdelegate_hooked = NO;
 static BOOL gxk_settings_hooked = NO;
-static BOOL gxk_settingspage_hooked = NO;
 static void (*gOrigMiniAppPickerDidSelect)(id, SEL, id, id, unsigned long long);
 static void (*gOrigArtMiniAppPickerDidSelect)(id, SEL, id, id, unsigned long long);
-static BOOL (*gOrigApplicationOpenURL)(id, SEL, id, id, id);
-static void (*gOrigApplicationDidBecomeActive)(id, SEL, id);
-static void (*gOrigSettingsViewDidLoad)(id, SEL);
-static void (*gOrigSettingsPageViewDidAppear)(id, SEL, BOOL);
+static void (*gOrigSettingsMainMenu)(id, SEL);
+static void (*gOrigSettingsPageDidSelect)(id, SEL, id, id);
 static __weak UIView *gPhrasesPanelView;
 static __weak id gPhrasesMiniAppHost;
 
@@ -1672,10 +1625,8 @@ static void GXKInsertPhraseText(NSString *text) {
     ((void (*)(id, SEL, id))objc_msgSend)(proxy, @selector(insertText:), text);
 }
 
-// 编辑入口：主 App 设置页挂不上时，键盘面板里的「编辑」是始终可用的兜底维护入口。
+// 编辑入口：键盘面板右上角「编辑」与主 App 设置主菜单里的「常用语」共用这一个函数。
 static void GXKPresentPhrasesEditor(UIViewController *from);
-// 导航项挂载：容器 VC 与真正上屏的 page VC 共用同一份实现。
-static void GXKAttachPhrasesEntry(UIViewController *vc);
 
 @interface GXKPhrasesPanel : UIView <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *table;
@@ -1942,114 +1893,141 @@ static void GXKInstallPhrasesHooks(void) {
     GXK_LOG(@"[*] 常用语分页已接入 G 图标");
 }
 
-#pragma mark - 主 App：定位中转 + 常用语维护入口
+#pragma mark - 主 App：常用语维护入口（设置主菜单里的一行）
 
-// 键盘扩展只被放行宿主 App 的 scheme，所以「跳定位设置」必须由主 App 代跑。
-static BOOL GXKIsLocationRelayURL(NSURL *url) {
-    if (![url isKindOfClass:[NSURL class]]) return NO;
-    if (![[url.scheme lowercaseString] isEqualToString:@"gboard"]) return NO;
-    NSString *host = [[url.host lowercaseString] stringByRemovingPercentEncoding];
-    NSString *path = [[url.path lowercaseString] stringByRemovingPercentEncoding];
-    if ([host isEqualToString:@"x-gxk-location"]) return YES;
-    if (path.length && [path rangeOfString:@"x-gxk-location"].location != NSNotFound) return YES;
-    return NO;
-}
+// 主 App「设置」主页的内容由 GKBSettingsViewController 的 mainMenuPageDescriptor 描述，
+// 真正上屏的是 GKBSettingsPageViewController。要加一行只能改这份 descriptor：
+// 复制一行原生条目（沿用它的 type / settingID，渲染与原生完全一致），只换标题与 key。
+static NSString *const GXKPhrasesRowKey = @"GXKPhrasesRow";
 
-// 主 App 里唯一合法的一步：UIApplicationOpenSettingsURLString 打开「设置 → Gboard」。
-// prefs:/App-Prefs: 这类深链第三方 App 一律被系统静默拒绝，所以不做无效尝试。
-static BOOL GXKMainAppOpenSettingsPage(void) {
-    NSString *text = UIApplicationOpenSettingsURLString;
-    NSURL *url = text.length ? [NSURL URLWithString:text] : nil;
-    if (!url) {
-        GXK_LOG(@"[!] 系统设置页地址不可用");
-        return NO;
-    }
-    UIApplication *app = [UIApplication sharedApplication];
-    if (!app) return NO;
-    __block BOOL handed = NO;
-    [app openURL:url options:@{} completionHandler:^(BOOL success) {
-        GXK_LOG(@"[*] 打开系统设置页 %@ => %@", text, success ? @"成功" : @"被拒绝");
-    }];
-    handed = YES;
-    return handed;
-}
-
-// 从根视图控制器往上找当前真正在屏幕上的那一个，避免把 alert 挂在被覆盖的控制器上。
-static UIViewController *GXKTopViewController(void) {
-    UIApplication *app = [UIApplication sharedApplication];
-    UIWindow *window = app.keyWindow;
-    if (!window) {
-        for (UIWindow *candidate in app.windows) {
-            if (candidate.isKeyWindow) { window = candidate; break; }
+// 从现有条目里挑一个样板：优先「搜索设置」，退而键盘/主题/语言，都没有就取第一条带 key 的行。
+static id GXKPhrasesRowTemplate(NSArray *sections, id *outSection) {
+    NSArray *preferred = @[@"SearchSettings", @"KeyboardSettings", @"Themes", @"Languages"];
+    id fallback = nil;
+    id fallbackSection = nil;
+    for (id section in sections) {
+        if (![section respondsToSelector:@selector(rows)]) continue;
+        id rows = [section rows];
+        if (![rows isKindOfClass:[NSArray class]]) continue;
+        for (id row in (NSArray *)rows) {
+            if (![row respondsToSelector:@selector(key)]) continue;
+            id key = [row key];
+            if (![key isKindOfClass:[NSString class]]) continue;
+            if (!fallback) {
+                fallback = row;
+                fallbackSection = section;
+            }
+            for (NSString *needle in preferred) {
+                if ([(NSString *)key rangeOfString:needle].location != NSNotFound) {
+                    if (outSection) *outSection = section;
+                    return row;
+                }
+            }
         }
     }
-    if (!window) window = app.windows.firstObject;
-    UIViewController *vc = window.rootViewController;
-    while (vc) {
-        UIViewController *next = nil;
-        if (vc.presentedViewController) next = vc.presentedViewController;
-        else if ([vc isKindOfClass:[UINavigationController class]])
-            next = ((UINavigationController *)vc).topViewController;
-        else if ([vc isKindOfClass:[UITabBarController class]])
-            next = ((UITabBarController *)vc).selectedViewController;
-        if (!next || next == vc) break;
-        vc = next;
-    }
-    return vc;
+    if (outSection) *outSection = fallbackSection;
+    return fallback;
 }
 
-// 冷启动时窗口可能还没就绪，重试几轮再弹；只弹一次，不打扰后续使用。
-static void GXKPresentLocationSettingsAlert(void) {
-    static BOOL shown = NO;
-    static NSInteger tries = 0;
-    if (shown) return;
-    UIViewController *host = GXKTopViewController();
-    if (!host || !host.view.window) {
-        if (tries >= 20) { GXK_LOG(@"[!] 找不到可弹窗的控制器，放弃提示"); return; }
-        tries++;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ GXKPresentLocationSettingsAlert(); });
+static BOOL GXKSettingsRowIsOurs(id row) {
+    if (![row respondsToSelector:@selector(key)]) return NO;
+    id key = [row key];
+    if (![key isKindOfClass:[NSString class]]) return NO;
+    return [(NSString *)key isEqualToString:GXKPhrasesRowKey];
+}
+
+static id GXKPhrasesSettingsRow(id template) {
+    Class itemClass = NSClassFromString(@"GKBSettingsItem");
+    if (!itemClass || !template) return nil;
+    long long type = 0;
+    long long settingID = 0;
+    if ([template respondsToSelector:@selector(type)]) {
+        type = ((long long (*)(id, SEL))objc_msgSend)(template, @selector(type));
+    }
+    if ([template respondsToSelector:@selector(settingID)]) {
+        settingID = ((long long (*)(id, SEL))objc_msgSend)(template, @selector(settingID));
+    }
+    id row = ((id (*)(id, SEL, long long, long long, id, id, id))objc_msgSend)(
+        [itemClass alloc], @selector(initWithType:settingID:title:accessibilityIdentifier:key:),
+        type, settingID, @"常用语", @"gxk_phrases_row", GXKPhrasesRowKey);
+    return row;
+}
+
+// 幂等：descriptor 每次打开设置都会重新生成，所以每次调用都检查一遍。
+static void GXKInjectPhrasesRow(id descriptor) {
+    if (![descriptor respondsToSelector:@selector(sections)]) return;
+    NSArray *sections = [descriptor sections];
+    if (![sections isKindOfClass:[NSArray class]] || sections.count == 0) return;
+    id targetSection = nil;
+    id template = GXKPhrasesRowTemplate(sections, &targetSection);
+    if (!template || !targetSection) {
+        GXK_LOG(@"[!] 设置主菜单里找不到可复制的行，跳过常用语入口");
         return;
     }
-    shown = YES;
-    UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"开启定位"
-                                             message:@"Gboard 的定位权限在系统设置里。点「去系统设置」打开 Gboard 设置页，再进「位置」把定位打开。"
-                                      preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"去系统设置"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *action) {
-        GXKMainAppOpenSettingsPage();
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [host presentViewController:alert animated:YES completion:nil];
-    GXK_LOG(@"[*] 已弹出「去系统设置」提示");
-}
-
-static BOOL gxk_applicationOpenURL(id self, SEL _cmd, id app, id url, id options) {
-    if (GXKIsLocationRelayURL((NSURL *)url)) {
-        GXK_LOG(@"[*] 主 App 收到定位中转: %@", url);
-        GXKPresentLocationSettingsAlert();
-        return YES;
+    NSArray *rows = [targetSection rows];
+    if (![rows isKindOfClass:[NSArray class]]) return;
+    NSMutableArray *newRows = [NSMutableArray arrayWithCapacity:rows.count + 1];
+    NSUInteger insertAt = rows.count;
+    for (NSUInteger i = 0; i < rows.count; i++) {
+        id row = rows[i];
+        if (GXKSettingsRowIsOurs(row)) return; // 已经加过了。
+        [newRows addObject:row];
+        if (row == template) insertAt = i + 1;
     }
-    return gOrigApplicationOpenURL ? gOrigApplicationOpenURL(self, _cmd, app, url, options) : NO;
+    id ours = GXKPhrasesSettingsRow(template);
+    if (!ours) return;
+    if (insertAt > newRows.count) insertAt = newRows.count;
+    [newRows insertObject:ours atIndex:insertAt];
+    [targetSection setRows:newRows];
+    GXK_LOG(@"[*] 设置主菜单已插入「常用语」一行");
 }
 
-// 键盘侧记的时间戳只有 2 分钟内算数，用过即清零，避免之后每次打开 Gboard 都弹。
-static BOOL GXKConsumeLocationIntent(void) {
-    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
-    if (!defaults) defaults = [NSUserDefaults standardUserDefaults];
-    double stamp = [defaults doubleForKey:GXKLocationStampKey];
-    if (stamp <= 0.0) return NO;
-    [defaults setDouble:0.0 forKey:GXKLocationStampKey];
-    NSTimeInterval age = [[NSDate date] timeIntervalSince1970] - stamp;
-    GXK_LOG(@"[*] 读到定位意图时间戳，距今 %.1fs", age);
-    return age >= 0.0 && age <= 120.0;
+static id gxk_settingsMainMenu(id self, SEL _cmd) {
+    id descriptor = gOrigSettingsMainMenu ? gOrigSettingsMainMenu(self, _cmd) : nil;
+    GXKInjectPhrasesRow(descriptor);
+    return descriptor;
 }
 
-static void gxk_applicationDidBecomeActive(id self, SEL _cmd, id app) {
-    if (gOrigApplicationDidBecomeActive) gOrigApplicationDidBecomeActive(self, _cmd, app);
-    if (GXKConsumeLocationIntent()) GXKPresentLocationSettingsAlert();
+// 设置页的点击先经过 page VC：在这里认出自己那一行，直接弹编辑器，绝不进原生分支。
+static void gxk_settingsPageDidSelect(id self, SEL _cmd, id collectionView, id indexPath) {
+    if ([indexPath isKindOfClass:[NSIndexPath class]] && [self respondsToSelector:@selector(pageDescriptor)]) {
+        id descriptor = ((id (*)(id, SEL))objc_msgSend)(self, @selector(pageDescriptor));
+        if ([descriptor respondsToSelector:@selector(sections)]) {
+            NSArray *sections = [descriptor sections];
+            NSInteger section = ((NSInteger (*)(id, SEL))objc_msgSend)(indexPath, @selector(section));
+            NSInteger row = ((NSInteger (*)(id, SEL))objc_msgSend)(indexPath, @selector(row));
+            if ([sections isKindOfClass:[NSArray class]] && section >= 0 && (NSUInteger)section < sections.count) {
+                id sec = sections[(NSUInteger)section];
+                if ([sec respondsToSelector:@selector(rows)]) {
+                    NSArray *rows = [sec rows];
+                    if ([rows isKindOfClass:[NSArray class]] && row >= 0 && (NSUInteger)row < rows.count) {
+                        if (GXKSettingsRowIsOurs(rows[(NSUInteger)row])) {
+                            if ([collectionView respondsToSelector:@selector(deselectItemAtIndexPath:animated:)]) {
+                                ((void (*)(id, SEL, id, BOOL))objc_msgSend)(
+                                    collectionView, @selector(deselectItemAtIndexPath:animated:), indexPath, NO);
+                            }
+                            if ([self isKindOfClass:[UIViewController class]]) {
+                                GXKPresentPhrasesEditor((UIViewController *)self);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (gOrigSettingsPageDidSelect) gOrigSettingsPageDidSelect(self, _cmd, collectionView, indexPath);
+}
+
+static void GXKInstallMainAppHooks(void) {
+    if (gxk_settings_hooked) return;
+    if (!NSClassFromString(@"GKBSettingsViewController")) return;
+    GXKSwizzleOrSkip(@"GKBSettingsViewController", @"mainMenuPageDescriptor",
+                     (IMP)gxk_settingsMainMenu, (void **)&gOrigSettingsMainMenu);
+    GXKSwizzleOrSkip(@"GKBSettingsPageViewController", @"collectionView:didSelectItemAtIndexPath:",
+                     (IMP)gxk_settingsPageDidSelect, (void **)&gOrigSettingsPageDidSelect);
+    gxk_settings_hooked = YES;
+    GXK_LOG(@"[*] 主 App 设置入口已接入（常用语）");
 }
 
 @interface GXKPhrasesEditorController : UIViewController <UITableViewDataSource, UITableViewDelegate>
@@ -2164,92 +2142,20 @@ static void gxk_applicationDidBecomeActive(id self, SEL _cmd, id app) {
 
 @end
 
-// 统一入口：设置页 push，键盘里 present。两处都走这里，行为一致。
+// 统一入口：一律全屏 modal。GOO 自绘导航容器不保证能正常展示 push 进来的控制器，
+// 之前挂在「搜索设置」导航栏的那版点开就是白屏，所以这里不再走 push。
 static void GXKPresentPhrasesEditor(UIViewController *from) {
     if (!from) return;
-    GXKPhrasesEditorController *editor = [[GXKPhrasesEditorController alloc] init];
-    UINavigationController *nav = from.navigationController;
-    if (nav && nav.view.window) {
-        [nav pushViewController:editor animated:YES];
-        return;
+    UIViewController *host = from;
+    while (host.presentedViewController && host.presentedViewController != host) {
+        host = host.presentedViewController;
     }
+    GXKPhrasesEditorController *editor = [[GXKPhrasesEditorController alloc] init];
     editor.dismissable = YES;
     UINavigationController *wrapper = [[UINavigationController alloc] initWithRootViewController:editor];
     wrapper.modalPresentationStyle = UIModalPresentationFullScreen;
-    [from presentViewController:wrapper animated:YES completion:nil];
-    GXK_LOG(@"[*] 常用语编辑器已弹出（键盘内入口）");
-}
-
-@interface GXKPhrasesSettingsTarget : NSObject
-@property (nonatomic, weak) UIViewController *controller;
-- (void)onOpenPhrasesEditor:(id)sender;
-@end
-
-@implementation GXKPhrasesSettingsTarget
-
-- (void)onOpenPhrasesEditor:(id)sender {
-    GXKPresentPhrasesEditor(self.controller);
-}
-
-@end
-
-static void gxk_settingsViewDidLoad(id self, SEL _cmd) {
-    if (gOrigSettingsViewDidLoad) gOrigSettingsViewDidLoad(self, _cmd);
-    if (![self isKindOfClass:[UIViewController class]]) return;
-    GXKAttachPhrasesEntry((UIViewController *)self);
-}
-
-// 真正显示在屏幕上的是 GKBSettingsPageViewController（每个设置页一个），
-// GKBSettingsViewController 只是容器，往它身上挂 rightBarButtonItem 真机看不到。
-// 所以主入口挂在 page VC 的 viewDidAppear:，每页出现时补一次，避免被 GOO 自绘导航栏覆盖。
-static void GXKAttachPhrasesEntry(UIViewController *vc) {
-    if (!vc || ![vc isKindOfClass:[UIViewController class]]) return;
-    if (objc_getAssociatedObject(vc, &GXKPhrasesSettingsKey)) {
-        // 已挂过，但导航项可能被 GOO 重置，确保还在。
-        if (vc.navigationItem.rightBarButtonItem) return;
-    }
-    GXKPhrasesSettingsTarget *target = [[GXKPhrasesSettingsTarget alloc] init];
-    target.controller = vc;
-    objc_setAssociatedObject(vc, &GXKPhrasesSettingsKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithTitle:@"常用语"
-                                                            style:UIBarButtonItemStylePlain
-                                                           target:target
-                                                           action:@selector(onOpenPhrasesEditor:)];
-    item.accessibilityLabel = @"常用语管理";
-    vc.navigationItem.rightBarButtonItem = item;
-    // GOO 自绘导航栏是 KVO 驱动的，显式催一次布局，避免首帧不刷新。
-    @try {
-        UINavigationBar *bar = vc.navigationController.navigationBar;
-        if (bar) [bar setNeedsLayout];
-    } @catch (__unused NSException *e) {}
-    GXK_LOG(@"[*] 设置页 %@ 已挂「常用语」入口 (nav=%@)", NSStringFromClass([vc class]),
-            vc.navigationController ? NSStringFromClass([vc.navigationController class]) : @"nil");
-}
-
-static void gxk_settingsPageViewDidAppear(id self, SEL _cmd, BOOL animated) {
-    if (gOrigSettingsPageViewDidAppear) gOrigSettingsPageViewDidAppear(self, _cmd, animated);
-    if (![self isKindOfClass:[UIViewController class]]) return;
-    GXKAttachPhrasesEntry((UIViewController *)self);
-}
-
-static void GXKInstallMainAppHooks(void) {
-    if (!gxk_appdelegate_hooked && NSClassFromString(@"AppDelegate")) {
-        GXKSwizzleOrSkip(@"AppDelegate", @"application:openURL:options:",
-                         (IMP)gxk_applicationOpenURL, (void **)&gOrigApplicationOpenURL);
-        GXKSwizzleOrSkip(@"AppDelegate", @"applicationDidBecomeActive:",
-                         (IMP)gxk_applicationDidBecomeActive, (void **)&gOrigApplicationDidBecomeActive);
-        gxk_appdelegate_hooked = YES;
-    }
-    if (!gxk_settings_hooked && NSClassFromString(@"GKBSettingsViewController")) {
-        GXKSwizzleOrSkip(@"GKBSettingsViewController", @"viewDidLoad",
-                         (IMP)gxk_settingsViewDidLoad, (void **)&gOrigSettingsViewDidLoad);
-        gxk_settings_hooked = YES;
-    }
-    if (!gxk_settingspage_hooked && NSClassFromString(@"GKBSettingsPageViewController")) {
-        GXKSwizzleOrSkip(@"GKBSettingsPageViewController", @"viewDidAppear:",
-                         (IMP)gxk_settingsPageViewDidAppear, (void **)&gOrigSettingsPageViewDidAppear);
-        gxk_settingspage_hooked = YES;
-    }
+    [host presentViewController:wrapper animated:YES completion:nil];
+    GXK_LOG(@"[*] 常用语编辑器已弹出");
 }
 
 #pragma mark - 隐私上报拦截 (只掐 clearcut 与 Breakpad 上报)
@@ -2374,7 +2280,7 @@ static void gkx_init(void) {
     GXKApplyTelemetryBlockIfNeeded();
 
     // 主 App 进程里根本没有键盘控制器，viewWillAppear 那套接线永远不触发，
-    // 所以定位中转与「常用语」维护入口必须在这里挂一次；键盘进程里这些类不存在，自然跳过。
+    // 所以设置主菜单的「常用语」入口必须在这里挂一次；键盘进程里这些类不存在，自然跳过。
     GXKInstallMainAppHooks();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
