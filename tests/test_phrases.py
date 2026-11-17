@@ -100,10 +100,17 @@ class PhrasesTest(unittest.TestCase):
 
     def test_row_tap_opens_editor(self) -> None:
         body = function_body(self.source, "static void gxk_settingsPageDidSelect(")
-        self.assertIn("GXKSettingsRowIsOurs", body)
+        self.assertIn("GXKIsPhrasesRowSelected", body)
         self.assertIn("GXKPresentPhrasesEditor(", body)
         # 非本行必须回落原生，绝不吞掉其他设置项。
         self.assertIn("gOrigSettingsPageDidSelect", body)
+        # 认行的两条路：key 匹配 + 屏幕上那格显示「常用语」。
+        picker = function_body(self.source, "static BOOL GXKIsPhrasesRowSelected(")
+        self.assertIn("GXKSettingsRowIsOurs", picker)
+        self.assertIn("GXKCellShowsPhrasesTitle", picker)
+        cell = function_body(self.source, "static BOOL GXKViewShowsPhrasesTitle(")
+        self.assertIn('@"常用语"', cell)
+        self.assertIn("UILabel", cell)
 
     def test_editor_is_presented_not_pushed(self) -> None:
         # GOO 自绘导航容器里 push 出来的控制器会白屏，统一走全屏 modal。

@@ -2004,8 +2004,32 @@ static id gxk_settingsMainMenu(id self, SEL _cmd) {
 }
 
 // 设置页的点击先经过 page VC：在这里认出自己那一行，直接弹编辑器，绝不进原生分支。
-static void gxk_settingsPageDidSelect(id self, SEL _cmd, id collectionView, id indexPath) {
-    if ([indexPath isKindOfClass:[NSIndexPath class]] && [self respondsToSelector:@selector(pageDescriptor)]) {
+// 兜底：pageDescriptor 若是 mainMenuPageDescriptor 的副本，按行对象认不出自己那一行，
+// 但屏幕上显示的文字一定是「常用语」。这里直接读被点 cell 的文本。
+static BOOL GXKViewShowsPhrasesTitle(UIView *view, NSUInteger depth) {
+    if (!view || depth > 8) return NO;
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *text = ((UILabel *)view).text;
+        if ([text isEqualToString:@"常用语"]) return YES;
+    }
+    for (UIView *child in view.subviews) {
+        if (GXKViewShowsPhrasesTitle(child, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+static BOOL GXKCellShowsPhrasesTitle(id collectionView, id indexPath) {
+    if (![collectionView respondsToSelector:@selector(cellForItemAtIndexPath:)]) return NO;
+    id cell = ((id (*)(id, SEL, id))objc_msgSend)(collectionView, @selector(cellForItemAtIndexPath:), indexPath);
+    if (![cell isKindOfClass:[UIView class]]) return NO;
+    return GXKViewShowsPhrasesTitle((UIView *)cell, 0);
+}
+
+// 先认行对象（key 对上），认不出再认屏幕上那格显示的文字——两条路都不依赖 descriptor 的
+// 内部结构，因为上屏的 descriptor 可能是 mainMenuPageDescriptor 的副本。
+static BOOL GXKIsPhrasesRowSelected(id self, id collectionView, id indexPath) {
+    if (![indexPath isKindOfClass:[NSIndexPath class]]) return NO;
+    if ([self respondsToSelector:@selector(pageDescriptor)]) {
         id descriptor = ((id (*)(id, SEL))objc_msgSend)(self, @selector(pageDescriptor));
         NSArray *sections = GXKSectionsOf(descriptor);
         NSInteger section = ((NSInteger (*)(id, SEL))objc_msgSend)(indexPath, @selector(section));
@@ -2013,18 +2037,23 @@ static void gxk_settingsPageDidSelect(id self, SEL _cmd, id collectionView, id i
         if (sections && section >= 0 && (NSUInteger)section < sections.count) {
             NSArray *rows = GXKRowsOf(sections[(NSUInteger)section]);
             if (rows && row >= 0 && (NSUInteger)row < rows.count) {
-                if (GXKSettingsRowIsOurs(rows[(NSUInteger)row])) {
-                    if ([collectionView respondsToSelector:@selector(deselectItemAtIndexPath:animated:)]) {
-                        ((void (*)(id, SEL, id, BOOL))objc_msgSend)(
-                            collectionView, @selector(deselectItemAtIndexPath:animated:), indexPath, NO);
-                    }
-                    if ([self isKindOfClass:[UIViewController class]]) {
-                        GXKPresentPhrasesEditor((UIViewController *)self);
-                    }
-                    return;
-                }
+                if (GXKSettingsRowIsOurs(rows[(NSUInteger)row])) return YES;
             }
         }
+    }
+    return GXKCellShowsPhrasesTitle(collectionView, indexPath);
+}
+
+static void gxk_settingsPageDidSelect(id self, SEL _cmd, id collectionView, id indexPath) {
+    if (GXKIsPhrasesRowSelected(self, collectionView, indexPath)) {
+        if ([collectionView respondsToSelector:@selector(deselectItemAtIndexPath:animated:)]) {
+            ((void (*)(id, SEL, id, BOOL))objc_msgSend)(
+                collectionView, @selector(deselectItemAtIndexPath:animated:), indexPath, NO);
+        }
+        if ([self isKindOfClass:[UIViewController class]]) {
+            GXKPresentPhrasesEditor((UIViewController *)self);
+        }
+        return;
     }
     if (gOrigSettingsPageDidSelect) gOrigSettingsPageDidSelect(self, _cmd, collectionView, indexPath);
 }
