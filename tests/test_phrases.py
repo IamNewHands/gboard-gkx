@@ -70,6 +70,17 @@ class PhrasesTest(unittest.TestCase):
         self.assertIn("GXKShowPhrasesPanel", body)
         self.assertIn("gOrigMiniAppPickerDidSelect", body)
 
+    def test_art_extension_super_call_does_not_recurse(self) -> None:
+        # GKBArtExtension 的原实现里 objc_msgSendSuper2 回基类，而基类方法已被换成这个钩子。
+        # 没有护栏时 原实现 → super → 钩子 → 原实现 无限递归，真机表现为点 GIF/贴纸/颜文字
+        # 直接栈溢出 SIGSEGV（崩溃栈里 gxk_miniAppPickerDidSelect 与 Gboard 交替七层）。
+        # 标记变量声明在函数外，只在源文件里查；函数体内查读写点。
+        self.assertIn("static BOOL gxk_artSelectInFlight = NO;", self.source)
+        body = function_body(self.source, "static void gxk_miniAppPickerDidSelect(")
+        self.assertIn("if (gxk_artSelectInFlight)", body)
+        self.assertIn("gxk_artSelectInFlight = YES;", body)
+        self.assertIn("gxk_artSelectInFlight = NO;", body)
+
     def test_panel_is_overlay_without_layout_constraints(self) -> None:
         body = function_body(self.source, "static void GXKShowPhrasesPanel(")
         self.assertNotIn("NSLayoutConstraint", body)

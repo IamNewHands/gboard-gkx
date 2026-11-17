@@ -2167,6 +2167,11 @@ static id GXKPhrasesPickerItem(void) {
     return item;
 }
 
+// 艺术字扩展的原实现内部会 objc_msgSendSuper2 回基类，而基类那份已经被换成这个函数。
+// 不设护栏就是：原实现 → super → 这里 → 原实现 … 无限递归，最后踩到栈保护页 SIGSEGV
+// （真机 2026-11-17 21:57 的崩溃栈就是 gxk_miniAppPickerDidSelect 与 Gboard +0x2e8be8 交替七层）。
+static BOOL gxk_artSelectInFlight = NO;
+
 static void gxk_miniAppPickerDidSelect(id self, SEL _cmd, id picker, id item, unsigned long long index) {
     NSString *ident = GXKPickerItemIdentifier(item);
     if (ident && [ident isEqualToString:GXK_PHRASES_IDENTIFIER]) {
@@ -2174,8 +2179,20 @@ static void gxk_miniAppPickerDidSelect(id self, SEL _cmd, id picker, id item, un
         return;
     }
     // 回落到「本次被替换的那一个」原实现：基类与艺术字扩展各有一份。
-    if (gOrigArtMiniAppPickerDidSelect && [self isKindOfClass:NSClassFromString(@"GKBArtExtension")]) {
-        gOrigArtMiniAppPickerDidSelect(self, _cmd, picker, item, index);
+    Class artClass = NSClassFromString(@"GKBArtExtension");
+    if (gOrigArtMiniAppPickerDidSelect && artClass && [self isKindOfClass:artClass]) {
+        if (gxk_artSelectInFlight) {
+            // 第二次进来 = 艺术字原实现的 super 调用，这里必须交给基类的原实现，不能再回艺术字。
+            if (gOrigMiniAppPickerDidSelect) gOrigMiniAppPickerDidSelect(self, _cmd, picker, item, index);
+            return;
+        }
+        gxk_artSelectInFlight = YES;
+        @try {
+            gOrigArtMiniAppPickerDidSelect(self, _cmd, picker, item, index);
+        } @finally {
+            // 异常也要清标记，否则这条分页此后永远走不到艺术字原实现。
+            gxk_artSelectInFlight = NO;
+        }
         return;
     }
     if (gOrigMiniAppPickerDidSelect) gOrigMiniAppPickerDidSelect(self, _cmd, picker, item, index);
