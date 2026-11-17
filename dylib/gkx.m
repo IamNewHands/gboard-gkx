@@ -1615,6 +1615,19 @@ static id GXKKeyboardProxy(void) {
     return ((id (*)(id, SEL))objc_msgSend)(vc, @selector(textDocumentProxy));
 }
 
+// 键盘扩展进程里绝不允许出现任何需要系统键盘的输入控件（UIAlertController 带输入框、
+// 内联 UITextField）。输入框要键盘，键盘就是这个扩展自己，系统会递归激活同一扩展并杀进程。
+// 真机实测：G 图标 → 常用语 → 编辑 → 新增，必闪退；删除与上屏不受影响。
+static BOOL GXKIsKeyboardExtension(void) {
+    static BOOL keyboard = NO;
+    static BOOL tried = NO;
+    if (!tried) {
+        tried = YES;
+        keyboard = [[[NSBundle mainBundle] bundlePath] hasSuffix:@".appex"];
+    }
+    return keyboard;
+}
+
 static void GXKInsertPhraseText(NSString *text) {
     if (text.length == 0) return;
     id proxy = GXKKeyboardProxy();
@@ -1692,7 +1705,7 @@ static void GXKPresentPhrasesEditor(UIViewController *from);
 
     UILabel *hint = [[UILabel alloc] initWithFrame:CGRectZero];
     hint.tag = GXK_PHRASES_HINT_TAG;
-    hint.text = @"还没有常用语。点右上角「编辑」添加，或打开 Gboard App → 设置 → 右上角「常用语」。";
+    hint.text = @"还没有常用语。先复制文字再点右上角「编辑」→「+」，或打开 Gboard App → 设置 → 常用语。";
     hint.font = [UIFont systemFontOfSize:13.0];
     hint.textColor = [UIColor grayColor];
     hint.numberOfLines = 0;
@@ -2111,7 +2124,42 @@ static void GXKInstallMainAppHooks(void) {
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
+// 键盘进程里没有任何"能打字"的入口：UIAlertController 带输入框、内联 UITextField 都会去要
+// 系统键盘，而系统键盘就是这个扩展自己，真机上必被系统杀掉（实测：点「新增」直接闪退）。
+// 所以键盘内新增/修改一律走剪贴板：先把文字复制好，再回来点按钮。这样全程不需要键盘。
+- (NSString *)gxkPasteboardCandidate {
+    UIPasteboard *board = [UIPasteboard generalPasteboard];
+    NSString *text = board.string;
+    if (![text isKindOfClass:[NSString class]]) return nil;
+    text = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return text.length ? text : nil;
+}
+
+- (void)gxkAddFromPasteboard {
+    NSString *text = [self gxkPasteboardCandidate];
+    if (!text) {
+        UIAlertController *tip = [UIAlertController
+            alertControllerWithTitle:@"新增常用语"
+                             message:@"先把要用的文字复制到剪贴板，再回到这里点「新增」。键盘里不能弹输入框，只能这样加。"
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [tip addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:tip animated:YES completion:nil];
+        return;
+    }
+    if (![self.items containsObject:text]) {
+        [self.items addObject:text];
+        GXKPhraseSave(self.items);
+        [self.table reloadData];
+        [[NSNotificationCenter defaultCenter] postNotificationName:GXKPhrasesChangedNotification object:nil];
+    }
+    GXK_LOG(@"[*] 常用语已从剪贴板加入，共 %lu 条", (unsigned long)self.items.count);
+}
+
 - (void)onAdd:(id)sender {
+    if (GXKIsKeyboardExtension()) {
+        [self gxkAddFromPasteboard];
+        return;
+    }
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"新增常用语"
                                                                   message:nil
                                                            preferredStyle:UIAlertControllerStyleAlert];
@@ -2159,6 +2207,25 @@ static void GXKInstallMainAppHooks(void) {
     [tableView deselectRowAtIndexPath:indexPath animated:NO];
     if (indexPath.row >= (NSInteger)self.items.count) return;
     NSString *current = self.items[indexPath.row];
+    if (GXKIsKeyboardExtension()) {
+        // 键盘进程：用剪贴板内容替换这条，全程不弹输入框。
+        NSString *text = [self gxkPasteboardCandidate];
+        if (!text) {
+            UIAlertController *tip = [UIAlertController
+                alertControllerWithTitle:@"修改常用语"
+                                 message:@"先把新文字复制到剪贴板，再点这一条。键盘里不能弹输入框，只能这样改。"
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [tip addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:tip animated:YES completion:nil];
+            return;
+        }
+        [self.items replaceObjectAtIndex:indexPath.row withObject:text];
+        GXKPhraseSave(self.items);
+        [self.table reloadData];
+        [[NSNotificationCenter defaultCenter] postNotificationName:GXKPhrasesChangedNotification object:nil];
+        GXK_LOG(@"[*] 常用语已用剪贴板内容替换第 %ld 条", (long)indexPath.row);
+        return;
+    }
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"编辑常用语"
                                                                   message:nil
                                                            preferredStyle:UIAlertControllerStyleAlert];

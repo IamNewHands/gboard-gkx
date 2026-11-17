@@ -146,6 +146,31 @@ class PhrasesTest(unittest.TestCase):
         self.assertIn("onAdd:", self.source)
         self.assertIn("GXKPhraseSave(", self.source)
 
+    def test_keyboard_extension_never_opens_text_input(self) -> None:
+        # 键盘扩展里弹带输入框的 alert 会让系统递归激活同一扩展，真机必闪退
+        # （实测：G 图标 → 常用语 → 编辑 → 新增）。所以键盘分支必须走剪贴板。
+        guard = function_body(self.source, "static BOOL GXKIsKeyboardExtension(")
+        self.assertIn("appex", guard)
+        add = function_body(self.source, "- (void)onAdd:")
+        self.assertIn("GXKIsKeyboardExtension()", add)
+        self.assertIn("gxkAddFromPasteboard", add)
+        # 键盘面板自己也有 didSelectRow，必须限定在编辑器实现里找。
+        editor_source = self.source[self.source.index("@implementation GXKPhrasesEditorController"):]
+        edit = function_body(editor_source,
+                             "- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:")
+        self.assertIn("GXKIsKeyboardExtension()", edit)
+        self.assertIn("gxkPasteboardCandidate", edit)
+        # 剪贴板分支必须排在 alert 之前，且真的把内容写进存储。
+        self.assertLess(edit.index("GXKIsKeyboardExtension()"),
+                        edit.index("addTextFieldWithConfigurationHandler"))
+        self.assertLess(add.index("GXKIsKeyboardExtension()"),
+                        add.index("addTextFieldWithConfigurationHandler"))
+        paste = function_body(self.source, "- (void)gxkAddFromPasteboard")
+        self.assertIn("UIPasteboard", function_body(self.source,
+                                                    "- (NSString *)gxkPasteboardCandidate"))
+        self.assertIn("GXKPhraseSave(", paste)
+        self.assertIn("GXKPhrasesChangedNotification", paste)
+
 
 if __name__ == "__main__":
     unittest.main()
