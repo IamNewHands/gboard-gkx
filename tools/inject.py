@@ -459,12 +459,12 @@ def main():
         print("        rpath=%s -> 落点 %s" % (used_rpath, os.path.relpath(dst, workdir)))
 
         if args.dict and os.path.isfile(args.dict):
+            # 词库只放一份，落在主 App 的 Frameworks 下。
+            # 键盘扩展的 LC_RPATH 是 @executable_path/../../Frameworks，指的就是这里，
+            # 再往 appex 里塞一份只是白白多占 1.7MB 安装体积，运行时不会读到它。
             dict_dst_fw = os.path.join(fw, "user_dictionary.db")
-            dict_dst_appex = os.path.join(appex, "user_dictionary.db")
             shutil.copy2(args.dict, dict_dst_fw)
-            shutil.copy2(args.dict, dict_dst_appex)
-            for dict_dst in (dict_dst_fw, dict_dst_appex):
-                archive_metadata[os.path.relpath(dict_dst, workdir).replace(os.sep, "/")] = (stat.S_IFREG | 0o644, (1980, 1, 1, 0, 0, 0))
+            archive_metadata[os.path.relpath(dict_dst_fw, workdir).replace(os.sep, "/")] = (stat.S_IFREG | 0o644, (1980, 1, 1, 0, 0, 0))
             print("        词库注入: %s -> %s" % (args.dict, os.path.relpath(dict_dst_fw, workdir)))
 
     print("[3/5] 清理旧签名")

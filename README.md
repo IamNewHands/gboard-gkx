@@ -15,6 +15,7 @@
   * 在 Protobuf 序列化中剔除了冗余的 `comment` 字段，单文件二进制体积从 2.18 MB 骤降至 **1.61 MB**。
   * 在 Mozc C++ 反序列化时**避免了 60,000 次堆内存分配**，扩展运行时内存增量控制在 **4~6 MB** 安全区间，彻底解决 iOS 键盘扩展因 Jetsam 物理内存超限导致的闪退问题。
 * **无感部署**：初次安装或更新后，扩展启动时自动将词库无感写入 App Group 共享容器（`group.zunbengege.top/user_dictionary.db`），即装即用。
+* **只随包带一份**：词库只落在主 App 的 `Frameworks/user_dictionary.db`。键盘扩展的 `LC_RPATH` 是 `@executable_path/../../Frameworks`，指的就是这一份；再往 `.appex` 里复制一份只是白占 1.7 MB 安装体积，运行时永远读不到。部署代码按「bundle 内 → 主 App Frameworks → 相对上跳两级」逐条 `fileExistsAtPath` 探测，两个进程都能找到。
 
 ### 2. 九键表情键智能切换（重输 / 换行）
 * **替换范围**：九键拼音及其 **123／符号页**，只替换原生 `key_pos_9keys_emoji` 表情键；原生回车键和 **26 键及其数字／符号页保持不变**。不根据坐标猜测按键身份。
@@ -62,7 +63,9 @@
 * **类名判定按类指针缓存**：全树扫描原本对每个节点调一次 `NSStringFromClass` 再做两次 `containsString`；现在第一次见到某个 `Class` 就把结果记进 `gViewKindCache`，之后直接查表。
 * **全树扫描节流 + 尾随**：`GXKComposingFullScan` 最快 0.25s 跑一次（`GXK_COMPOSING_SCAN_MIN_INTERVAL`）；被节流跳过的那次用一次 `dispatch_after` 尾随补扫，且只有状态真的翻转才触发界面刷新。代理已经明确给出组字标记时走 O(1) 路径，完全不扫。
 * **工具条不再每拍重建**：同一宿主行（G 图标行）复用已有 `UIStackView` 与 5 个按钮，只同步配色；约束先 `deactivateConstraints:` 再 `activateConstraints:`，不层层叠加。装饰扫描按 band 记忆，同一个 band 只走一次 800 节点。
-* **回归护栏**：`tests/test_perf.py` 锁住上述四条（缓存必须早于 `NSStringFromClass` 返回、扫描必须节流且带尾随、普通打字只补两拍、约束必须先撤后加）。
+* **触觉引擎闲置即释放**：`prepare` 会让 Taptic 一直预热，停手 2 秒（`GXK_HAPTIC_IDLE_SECONDS`）就把两个 `UIImpactFeedbackGenerator` 置空，下次点击再懒建。连续点击期间不重建，手感不变。
+* **钉子状态不强制落盘**：`GXKPhrasesPinned` 只有键盘进程自己读写，去掉 `synchronize`；常用语正文 `GXKPhraseSave` 的 `synchronize` 必须保留——主 App 编辑、键盘读取，跨进程要立刻可见。
+* **回归护栏**：`tests/test_perf.py` 锁住上述各条（缓存必须早于 `NSStringFromClass` 返回、扫描必须节流且带尾随、普通打字只补两拍、约束必须先撤后加、触觉闲置释放、钉子不同步、词库只打一份）。
 
 ---
 

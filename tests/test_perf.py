@@ -193,6 +193,42 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("deactivateConstraints:gToolbarConstraints", detach)
         self.assertIn("gToolbarConstraints = nil;", detach)
 
+    def test_haptics_released_after_idle(self):
+        """Taptic 引擎不能一直预热：停手 2 秒就释放 generator。"""
+        self.assertIn("#define GXK_HAPTIC_IDLE_SECONDS 2.0", self.source)
+        self.assertIn("static NSTimer *gHapticIdleTimer;", self.source)
+        impact = function_body(self.source, "static void GXKImpact(UIImpactFeedbackStyle style) {")
+        self.assertIn("GXKScheduleHapticRelease();", impact)
+        schedule = function_body(self.source, "static void GXKScheduleHapticRelease(void) {")
+        self.assertIn("[gHapticIdleTimer invalidate]", schedule)
+        self.assertIn("GXK_HAPTIC_IDLE_SECONDS", schedule)
+        self.assertIn("repeats:NO", schedule)
+        # 释放必须真的把两个 generator 置空。
+        self.assertIn("gFbMedium = nil;", schedule)
+        self.assertIn("gFbLight = nil;", schedule)
+        release = function_body(self.source, "static void GXKReleaseHaptics(void) {")
+        self.assertIn("[gHapticIdleTimer invalidate]", release)
+
+    def test_pin_toggle_skips_forced_sync(self):
+        """钉子状态只有键盘自己读，不跨进程，不必强制落盘；常用语正文必须保留。"""
+        pinned = function_body(self.source, "static void GXKPhrasesSetPinned(BOOL pinned) {")
+        # 只看真实调用，注释里提到 synchronize 不算。
+        self.assertNotIn("[defaults synchronize];", pinned)
+        self.assertIn("setBool:pinned forKey:GXKPhrasesPinnedKey", pinned)
+        save = function_body(self.source, "static void GXKPhraseSave(NSArray<NSString *> *list) {")
+        self.assertIn("[defaults synchronize];", save)
+
+    def test_dictionary_ships_once_and_is_found_from_both_processes(self):
+        """词库只随包放一份；扩展进程要能沿 bundle 往上找到主 App 的 Frameworks。"""
+        inject = (ROOT / "tools/inject.py").read_text(encoding="utf-8")
+        self.assertNotIn("dict_dst_appex", inject)
+        self.assertIn('dict_dst_fw = os.path.join(fw, "user_dictionary.db")', inject)
+        deploy = function_body(self.source, "static void GXKEnsureUserDictionaryDeployed(void) {")
+        # 候选路径必须逐个 fileExistsAtPath 验证，不能拿到第一个非 nil 就用。
+        self.assertIn("for (NSString *candidate in candidates)", deploy)
+        self.assertIn("[fm fileExistsAtPath:candidate]", deploy)
+        self.assertIn("../../Frameworks/user_dictionary.db", deploy)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

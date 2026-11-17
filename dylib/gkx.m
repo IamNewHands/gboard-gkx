@@ -61,6 +61,9 @@ static BOOL gDictDeploySettled;
 // 触觉复用：避免每次点击分配generator并丢失prepare预热。
 static UIImpactFeedbackGenerator *gFbMedium;
 static UIImpactFeedbackGenerator *gFbLight;
+// prepare 会让 Taptic 引擎保持预热，闲置不释放就是白耗电；2 秒没再点就撒手。
+static NSTimer *gHapticIdleTimer;
+#define GXK_HAPTIC_IDLE_SECONDS 2.0
 
 // 原实现函数指针
 static void (*gOrigViewDidAppear)(id, SEL, BOOL);
@@ -82,15 +85,20 @@ static void GXKEnsureUserDictionaryDeployed(void) {
 
     NSURL *targetDBURL = [containerURL URLByAppendingPathComponent:@"user_dictionary.db"];
 
+    // 词库只随包放一份（主 App 的 Frameworks 下），这里按「谁在跑」逐条找：
+    // 主 App 进程直接命中 Frameworks；键盘扩展要先试自己 bundle，再退回主 App 的 Frameworks。
     NSBundle *mainBundle = [NSBundle mainBundle];
-    NSString *bundlePath = [mainBundle pathForResource:@"user_dictionary" ofType:@"db"];
-    if (!bundlePath) {
-        bundlePath = [[mainBundle bundlePath] stringByAppendingPathComponent:@"Frameworks/user_dictionary.db"];
+    NSString *bundleDir = [mainBundle bundlePath];
+    NSArray<NSString *> *candidates = @[
+        [mainBundle pathForResource:@"user_dictionary" ofType:@"db"] ?: @"",
+        [bundleDir stringByAppendingPathComponent:@"Frameworks/user_dictionary.db"],
+        [[bundleDir stringByAppendingPathComponent:@"../../Frameworks/user_dictionary.db"] stringByStandardizingPath],
+    ];
+    NSString *bundlePath = nil;
+    for (NSString *candidate in candidates) {
+        if (candidate.length > 0 && [fm fileExistsAtPath:candidate]) { bundlePath = candidate; break; }
     }
     if (!bundlePath) {
-        bundlePath = [[mainBundle.bundleURL URLByAppendingPathComponent:@"../../Frameworks/user_dictionary.db"] URLByStandardizingPath].path;
-    }
-    if (!bundlePath || ![fm fileExistsAtPath:bundlePath]) {
         GXK_LOG(@"[*] 安装包内未找到预置 user_dictionary.db");
         return;
     }
@@ -472,6 +480,25 @@ static void GXKDetachActionKey(void) {
 
 #pragma mark - 触觉反馈 (复用 + prepare 预热)
 
+static void GXKReleaseHaptics(void) {
+    [gHapticIdleTimer invalidate];
+    gHapticIdleTimer = nil;
+    gFbMedium = nil;
+    gFbLight = nil;
+}
+
+// 每次点击重置一次「闲置释放」倒计时：连续点击时不重建 generator，停手 2 秒后归零。
+static void GXKScheduleHapticRelease(void) {
+    [gHapticIdleTimer invalidate];
+    gHapticIdleTimer = [NSTimer scheduledTimerWithTimeInterval:GXK_HAPTIC_IDLE_SECONDS
+                                                      repeats:NO
+                                                        block:^(NSTimer *timer) {
+        gHapticIdleTimer = nil;
+        gFbMedium = nil;
+        gFbLight = nil;
+    }];
+}
+
 static void GXKImpact(UIImpactFeedbackStyle style) {
     if (@available(iOS 10.0, *)) {
         if (style == UIImpactFeedbackStyleMedium) {
@@ -483,12 +510,8 @@ static void GXKImpact(UIImpactFeedbackStyle style) {
             [gFbLight impactOccurred];
             [gFbLight prepare];
         }
+        GXKScheduleHapticRelease();
     }
-}
-
-static void GXKReleaseHaptics(void) {
-    gFbMedium = nil;
-    gFbLight = nil;
 }
 
 #pragma mark - 顶部工具条 (只借 G 图标行，绝不改键盘高度)
@@ -1678,7 +1701,8 @@ static void GXKPhrasesSetPinned(BOOL pinned) {
     NSUserDefaults *defaults = GXKPhraseDefaults();
     if (!defaults) return;
     [defaults setBool:pinned forKey:GXKPhrasesPinnedKey];
-    [defaults synchronize];
+    // 钉子状态只有键盘进程自己读，不跨进程，不必强制同步落盘。
+    // 常用语正文（GXKPhraseSave）必须保留 synchronize：主 App 编辑、键盘读取，跨进程要立刻可见。
 }
 
 // 部署目标 12.0：systemBlue / systemBackground 都是 iOS 13 才有的，统一在这里兜底。
