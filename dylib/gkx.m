@@ -145,6 +145,28 @@ static BOOL GXKComposingFromProxy(UIViewController *vc) {
     return NO;
 }
 
+// 类名判定缓存：九键键盘树里同类视图成百上千，每个节点都做一次 NSStringFromClass +
+// 两次 containsString，是整趟扫描里最贵的固定开销。按类指针只算一次。
+enum { GXKViewKindPlain = 0, GXKViewKindComposing = 1, GXKViewKindSoftKey = 2 };
+static NSMutableDictionary *gViewKindCache;
+
+static NSInteger GXKViewKind(UIView *view) {
+    if (!gViewKindCache) gViewKindCache = [NSMutableDictionary dictionary];
+    Class cls = [view class];
+    NSValue *key = [NSValue valueWithPointer:(__bridge const void *)cls];
+    NSNumber *cached = gViewKindCache[key];
+    if (cached) return cached.integerValue;
+    NSString *name = NSStringFromClass(cls);
+    NSInteger kind = GXKViewKindPlain;
+    if ([name isEqualToString:@"GKBSoftKeyView"]) {
+        kind = GXKViewKindSoftKey;
+    } else if ([name containsString:@"Composing"] || [name containsString:@"Preedit"]) {
+        kind = GXKViewKindComposing;
+    }
+    gViewKindCache[key] = @(kind);
+    return kind;
+}
+
 static BOOL GXKComposingFullScan(UIViewController *vc) {
     if (!vc || !vc.view) return NO;
     UIView *root = vc.view;
@@ -157,10 +179,10 @@ static BOOL GXKComposingFullScan(UIViewController *vc) {
 
         if (v.isHidden || v.alpha < 0.05) continue;
 
-        NSString *cls = NSStringFromClass([v class]);
+        NSInteger kind = GXKViewKind(v);
 
         // 判定 1: 扫描 Composing 与 Preedit 视图中是否有拼音文字
-        if ([cls containsString:@"Composing"] || [cls containsString:@"Preedit"]) {
+        if (kind == GXKViewKindComposing) {
             if ([v respondsToSelector:@selector(text)]) {
                 NSString *t = [v valueForKey:@"text"];
                 if (t.length > 0) return YES;
@@ -178,7 +200,7 @@ static BOOL GXKComposingFullScan(UIViewController *vc) {
         }
 
         // 判定 2: 九键右下角回车键在拼音输入中会变为「确认」
-        if ([cls isEqualToString:@"GKBSoftKeyView"]) {
+        if (kind == GXKViewKindSoftKey) {
             CGPoint p = [v convertPoint:CGPointZero toView:root];
             if (p.x > root.bounds.size.width * 0.70 && p.y > 150.0) {
                 for (UIView *sub in v.subviews) {
@@ -197,11 +219,47 @@ static BOOL GXKComposingFullScan(UIViewController *vc) {
     return NO;
 }
 
-// 事件驱动的状态刷新：代理有mark就是YES（O(1)）；否则跑一次全树。
+// 全树扫描节流：布局事件一秒可能来几十次，最多 0.25 秒扫一次；
+// 被跳过的这一次排一个尾随扫描，状态不会卡在旧值上。
+#define GXK_COMPOSING_SCAN_MIN_INTERVAL 0.25
+static CFTimeInterval gComposingScanAt;
+static BOOL gComposingScanScheduled;
+
+static void GXKUpdateActionKey(UIViewController *vc);
+static void GXKUpdateToolbar(UIViewController *vc);
+static void GXKScheduleComposingScan(void);
+
+// 事件驱动的状态刷新：代理有mark就是YES（O(1)）；否则跑一次全树（受节流约束）。
 static void GXKRefreshComposingState(UIViewController *vc) {
     if (!vc) { gComposingActive = NO; return; }
     if (GXKComposingFromProxy(vc)) { gComposingActive = YES; return; }
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (gComposingScanAt > 0.0 && now - gComposingScanAt < GXK_COMPOSING_SCAN_MIN_INTERVAL) {
+        GXKScheduleComposingScan();
+        return;
+    }
+    gComposingScanAt = now;
     gComposingActive = GXKComposingFullScan(vc);
+}
+
+// 尾随扫描：只在状态真的翻转时才触发一次界面刷新，没翻转就什么都不做。
+static void GXKScheduleComposingScan(void) {
+    if (gComposingScanScheduled) return;
+    gComposingScanScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(GXK_COMPOSING_SCAN_MIN_INTERVAL * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        gComposingScanScheduled = NO;
+        UIViewController *vc = gCurrentVC;
+        if (!vc || !vc.isViewLoaded) return;
+        if (GXKComposingFromProxy(vc)) { gComposingActive = YES; return; }
+        gComposingScanAt = CFAbsoluteTimeGetCurrent();
+        BOOL composing = GXKComposingFullScan(vc);
+        if (composing == gComposingActive) return;
+        gComposingActive = composing;
+        GXKUpdateActionKey(vc);
+        GXKUpdateToolbar(vc);
+    });
 }
 
 // 轮询与刷新用：优先读缓存，代理层已明确有mark时立即纠正缓存。
@@ -464,6 +522,11 @@ static GXKToolbarTarget *gToolbarTarget;
 // band 内被工具条盖住的原生图标（九键顶部右侧语音按钮等）：挂载时 alpha=0，撤走时原样归还。
 static NSMutableArray<UIView *> *gToolbarHiddenViews;
 static NSMutableArray<NSNumber *> *gToolbarHiddenAlphas;
+// 同一次挂载、同一 band 内只扫一次装饰：没东西可藏时不该每拍重走 800 个节点。
+static BOOL gToolbarDecorationsScanned;
+static CGRect gToolbarDecorationsBand;
+// 工具条四条几何约束：复用 stack 时先撤旧约束，避免常量层层叠加。
+static NSArray<NSLayoutConstraint *> *gToolbarConstraints;
 // 「全选」记下的文本与时间：紧接着的「剪切」直接作用于同一段内容，不再要求系统选区。
 static NSString *gToolbarSelectAllText;
 static NSTimeInterval gToolbarSelectAllAt;
@@ -588,6 +651,8 @@ static void GXKRestoreToolbarDecorations(void) {
     }
     [gToolbarHiddenViews removeAllObjects];
     [gToolbarHiddenAlphas removeAllObjects];
+    gToolbarDecorationsScanned = NO;
+    gToolbarDecorationsBand = CGRectZero;
 }
 
 static BOOL GXKViewHasImage(UIView *view) {
@@ -650,7 +715,13 @@ static void GXKSyncToolbarDecorations(BOOL composing) {
     UIViewController *vc = gCurrentVC;
     UIView *root = (vc && vc.isViewLoaded) ? vc.view : nil;
     if (!row || !logo || !root) return;
-    if (gToolbarHiddenViews.count == 0) GXKHideToolbarDecorations(row, logo, root, gToolbarBand);
+    if (gToolbarHiddenViews.count == 0) {
+        // 已按同一 band 扫过且没有可藏对象：不再每拍重走一遍 800 个节点。
+        if (gToolbarDecorationsScanned && CGRectEqualToRect(gToolbarDecorationsBand, gToolbarBand)) return;
+        gToolbarDecorationsScanned = YES;
+        gToolbarDecorationsBand = gToolbarBand;
+        GXKHideToolbarDecorations(row, logo, root, gToolbarBand);
+    }
 }
 
 // 工具条底色取键盘自身的表面色，而不是透明：万一 band 里还有没被让位的原生素材，
@@ -688,6 +759,10 @@ static void GXKDetachToolbar(void) {
     gToolbarNineBody = nil;
     gToolbarBand = CGRectZero;
     [stack removeFromSuperview];
+    if (gToolbarConstraints) {
+        [NSLayoutConstraint deactivateConstraints:gToolbarConstraints];
+        gToolbarConstraints = nil;
+    }
     GXKRestoreToolbarDecorations();
     if (logo) {
         logo.hidden = logoWasHidden; // G 图标按原状态归还，不替用户决定隐藏。
@@ -766,10 +841,20 @@ static void GXKUpdateToolbar(UIViewController *vc) {
         return;
     }
 
-    GXKDetachToolbar();
-    // 先让 band 内的原生图标（语音按钮等）让位，再按新的可见性重算空位：
-    // 被藏掉的邻居不再挡路，五个按钮能分到更多宽度，也不会再被压在下面。
-    if (!composing && GXKHideToolbarDecorations(row, logo, root, band) > 0) {
+    // 同一个宿主行（G 图标行）没变时复用现有 stack 与 5 个按钮：
+    // 只是空位宽度变了（旋转、主题、候选栏出现），没必要把整条视图重建一遍。
+    BOOL reuse = (gToolbarStack && gToolbarRow == row && gToolbarLogoView == logo &&
+                  gToolbarStack.superview == row);
+    if (!reuse) {
+        GXKDetachToolbar();
+        // 先让 band 内的原生图标（语音按钮等）让位，再按新的可见性重算空位：
+        // 被藏掉的邻居不再挡路，五个按钮能分到更多宽度，也不会再被压在下面。
+        if (!composing && GXKHideToolbarDecorations(row, logo, root, band) > 0) {
+            CGRect widened = CGRectZero;
+            if (GXKToolbarBand(row, logo, root, &widened) && widened.size.width > band.size.width) band = widened;
+        }
+    } else if (!composing && gToolbarHiddenViews.count == 0 &&
+               GXKHideToolbarDecorations(row, logo, root, band) > 0) {
         CGRect widened = CGRectZero;
         if (GXKToolbarBand(row, logo, root, &widened) && widened.size.width > band.size.width) band = widened;
     }
@@ -778,25 +863,43 @@ static void GXKUpdateToolbar(UIViewController *vc) {
 
     UIColor *tint = GXKToolbarTint(body);
     UIColor *surface = GXKToolbarSurface(row, body) ?: [UIColor clearColor];
-    UIStackView *stack = GXKMakeToolbar(row, tint, surface);
+    UIStackView *stack = reuse ? gToolbarStack : GXKMakeToolbar(row, tint, surface);
+    if (reuse) {
+        // 复用只同步配色：文字、字体、target 都没变，无需重设。
+        if ([surface isKindOfClass:[UIColor class]]) stack.backgroundColor = surface;
+        for (UIView *arranged in stack.arrangedSubviews) {
+            if (![arranged isKindOfClass:[UIButton class]]) continue;
+            UIButton *button = (UIButton *)arranged;
+            [button setTitleColor:tint forState:UIControlStateNormal];
+            [button setTitleColor:[tint colorWithAlphaComponent:0.45] forState:UIControlStateHighlighted];
+        }
+    }
     gToolbarStack = stack;
-    gToolbarRow = row;
-    gToolbarLogoView = logo;
+    if (!reuse) {
+        gToolbarRow = row;
+        gToolbarLogoView = logo;
+        gToolbarLogoWasHidden = logo.isHidden;
+        gToolbarLogoWasAlpha = logo.alpha;
+    }
     gToolbarNineBody = body;
     gToolbarBand = band;
-    gToolbarLogoWasHidden = logo.isHidden;
-    gToolbarLogoWasAlpha = logo.alpha;
     // 用 alpha 而不是 hidden：hidden 在 UIStackView 里会把兄弟视图重排，band 一变就反复重挂。
     logo.alpha = 0.0; // 只藏 G 图标本身，同行预编辑/候选视图一律不碰。
     stack.hidden = composing;
-    [row addSubview:stack];
+    if (stack.superview != row) [row addSubview:stack];
     // 只占 band 那一段：左右各贴住相邻可见兄弟的边界，绝不覆盖同行其它内容。
-    [NSLayoutConstraint activateConstraints:@[
+    // 复用路径下先撤掉上一轮约束，否则常量会层层叠加。
+    if (gToolbarConstraints) {
+        [NSLayoutConstraint deactivateConstraints:gToolbarConstraints];
+        gToolbarConstraints = nil;
+    }
+    gToolbarConstraints = @[
         [stack.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:band.origin.x],
         [stack.widthAnchor constraintEqualToConstant:band.size.width],
         [stack.topAnchor constraintEqualToAnchor:row.topAnchor],
         [stack.heightAnchor constraintEqualToConstant:band.size.height],
-    ]];
+    ];
+    [NSLayoutConstraint activateConstraints:gToolbarConstraints];
     [row bringSubviewToFront:stack];
     GXK_LOG(@"工具条: 宿主 %@ %.0fx%.0f 空位 %.0f@%.0f", NSStringFromClass(row.class),
             row.bounds.size.width, row.bounds.size.height, band.size.width, band.origin.x);
@@ -915,8 +1018,10 @@ static void GXKUpdateToolbar(UIViewController *vc) {
 
 static void GXKUpdateActionKey(UIViewController *vc);
 
-// 一次事件后只保留约 3 秒的补帧窗口；窗口内没有新事件就停表，不再每秒空唤醒 5 次。
-#define GXK_POLL_BURST 15
+// 一次事件后只保留约 1 秒的补帧窗口；窗口内没有新事件就停表，不再每秒空唤醒 5 次。
+#define GXK_POLL_BURST 5
+// 组字状态没翻转时的极小窗口：普通打字只补两帧，不再每键拉起整轮刷新。
+#define GXK_POLL_SETTLE 2
 
 static void GXKStopPolling(void) {
     if (gStatePollTimer) {
@@ -1142,10 +1247,13 @@ static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *vc = weakVC;
         if (vc && vc == gCurrentVC) {
+            BOOL wasComposing = gComposingActive;
             GXKRefreshComposingState(vc); // 组字状态只在此处与布局事件里全树扫描一次。
             GXKUpdateActionKey(vc);
             GXKUpdateToolbar(vc);
-            GXKBumpPolling(GXK_POLL_BURST); // 输入后给一小段补帧窗口。
+            // 只有组字状态翻转才需要完整补帧窗口；普通打字补两帧就够，
+            // 否则连续输入会让定时器永远跑不完，等于持续每秒 5 次全量刷新。
+            GXKBumpPolling((wasComposing != gComposingActive) ? GXK_POLL_BURST : GXK_POLL_SETTLE);
         }
     });
 }

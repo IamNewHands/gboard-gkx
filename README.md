@@ -57,6 +57,13 @@
 * **键盘扩展里绝不能弹输入框**：`UIAlertController` + `addTextFieldWithConfigurationHandler`（或任何内联 `UITextField`）会去要系统键盘，而系统键盘就是这个扩展自己，系统会递归激活同一扩展并杀掉进程。真机实测：G 图标 → 常用语 → 编辑 → 新增，必闪退；删除与上屏不受影响。所以 `GXKIsKeyboardExtension()` 为真时一律走剪贴板，主 App 侧（普通 App 进程）仍保留 alert 输入。
 * **为什么复制原生行而不是硬造**：二进制里查不到任何 `GKBSettingType*` 字符串，`GKBSettingsItem` 的 type 枚举值无法静态确定，硬塞会有崩风险；复制一条真实存在的行才能保证渲染、点击、埋点行为与原生完全一致。
 
+### 7. 打字流畅度：把每键的刷新成本压到常数级
+* **轮询窗口按需**：状态同步仍靠 `NSTimer`（0.2s），但补帧次数从每键 15 拍降到普通打字 2 拍（`GXK_POLL_SETTLE`），只有「组字 ↔ 空闲」真的翻转时才用 5 拍（`GXK_POLL_BURST`）。空闲自动停表，不留常驻定时器。
+* **类名判定按类指针缓存**：全树扫描原本对每个节点调一次 `NSStringFromClass` 再做两次 `containsString`；现在第一次见到某个 `Class` 就把结果记进 `gViewKindCache`，之后直接查表。
+* **全树扫描节流 + 尾随**：`GXKComposingFullScan` 最快 0.25s 跑一次（`GXK_COMPOSING_SCAN_MIN_INTERVAL`）；被节流跳过的那次用一次 `dispatch_after` 尾随补扫，且只有状态真的翻转才触发界面刷新。代理已经明确给出组字标记时走 O(1) 路径，完全不扫。
+* **工具条不再每拍重建**：同一宿主行（G 图标行）复用已有 `UIStackView` 与 5 个按钮，只同步配色；约束先 `deactivateConstraints:` 再 `activateConstraints:`，不层层叠加。装饰扫描按 band 记忆，同一个 band 只走一次 800 节点。
+* **回归护栏**：`tests/test_perf.py` 锁住上述四条（缓存必须早于 `NSStringFromClass` 返回、扫描必须节流且带尾随、普通打字只补两拍、约束必须先撤后加）。
+
 ---
 
 ## 📐 开发规范与架构红线 (Development Standards)

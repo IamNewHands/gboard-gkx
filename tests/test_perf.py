@@ -126,6 +126,73 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("GXKReleaseHaptics()", gone)
         self.assertIn("gComposingActive = NO", gone)
 
+    def test_view_kind_cache_avoids_per_node_class_strings(self):
+        """类名判定必须按类指针缓存，不能在每个节点上重新拼字符串。"""
+        cache = function_body(self.source, "static NSInteger GXKViewKind(UIView *view) {")
+        self.assertIn("gViewKindCache", cache)
+        self.assertIn("NSValue valueWithPointer", cache)
+        self.assertIn("NSStringFromClass", cache)
+        # 缓存命中必须提前返回，否则缓存没有意义。
+        self.assertLess(cache.index("if (cached) return cached.integerValue;"),
+                        cache.index("NSStringFromClass"))
+        scan = function_body(self.source, "static BOOL GXKComposingFullScan(UIViewController *vc) {")
+        self.assertIn("GXKViewKind(v)", scan)
+        self.assertNotIn("NSStringFromClass", scan, "scan must not format class names per node")
+        self.assertNotIn("containsString:@\"Composing\"", scan)
+
+    def test_composing_scan_is_throttled_with_trailing_pass(self):
+        """全树扫描必须节流，且被跳过的那次要有尾随扫描兜住状态。"""
+        self.assertIn("#define GXK_COMPOSING_SCAN_MIN_INTERVAL 0.25", self.source)
+        refresh = function_body(self.source, "static void GXKRefreshComposingState(UIViewController *vc)")
+        self.assertIn("CFAbsoluteTimeGetCurrent()", refresh)
+        self.assertIn("GXK_COMPOSING_SCAN_MIN_INTERVAL", refresh)
+        self.assertIn("GXKScheduleComposingScan()", refresh)
+        # 代理已明确有 mark 时仍然走 O(1) 路径，不受节流影响。
+        self.assertLess(refresh.index("GXKComposingFromProxy(vc)"),
+                        refresh.index("CFAbsoluteTimeGetCurrent()"))
+        trailing = function_body(self.source, "static void GXKScheduleComposingScan(void) {")
+        self.assertIn("dispatch_after", trailing)
+        self.assertIn("gComposingScanScheduled", trailing)
+        self.assertIn("GXKComposingFullScan(vc)", trailing)
+        # 状态没翻转时不得触发界面刷新。
+        self.assertIn("if (composing == gComposingActive) return;", trailing)
+
+    def test_plain_typing_uses_short_settle_window(self):
+        """普通打字只补两帧；只有组字状态翻转才拉起完整补帧窗口。"""
+        self.assertIn("#define GXK_POLL_BURST 5", self.source)
+        self.assertIn("#define GXK_POLL_SETTLE 2", self.source)
+        typed = function_body(self.source, "static void gkx_textDidChange(id self, SEL _cmd, id textInput)")
+        self.assertIn("BOOL wasComposing = gComposingActive;", typed)
+        self.assertIn("GXKBumpPolling((wasComposing != gComposingActive) ? GXK_POLL_BURST : GXK_POLL_SETTLE);", typed)
+
+    def test_toolbar_decorations_scanned_once_per_band(self):
+        """同一 band 只扫一次装饰，没东西可藏时不再每拍重走 800 节点。"""
+        self.assertIn("static BOOL gToolbarDecorationsScanned;", self.source)
+        self.assertIn("static CGRect gToolbarDecorationsBand;", self.source)
+        sync = function_body(self.source, "static void GXKSyncToolbarDecorations(BOOL composing) {")
+        self.assertIn("gToolbarDecorationsScanned", sync)
+        self.assertIn("CGRectEqualToRect(gToolbarDecorationsBand, gToolbarBand)", sync)
+        self.assertIn("gToolbarDecorationsBand = gToolbarBand;", sync)
+        # 归还装饰时必须清掉扫描备忘，否则下次挂载会漏扫。
+        restore = function_body(self.source, "static void GXKRestoreToolbarDecorations(void) {")
+        self.assertIn("gToolbarDecorationsScanned = NO;", restore)
+
+    def test_toolbar_reuses_stack_and_constraints(self):
+        """同一宿主行复用 stack 与按钮，约束先撤后加，不层层叠加。"""
+        self.assertIn("static NSArray<NSLayoutConstraint *> *gToolbarConstraints;", self.source)
+        update = function_body(self.source, "static void GXKUpdateToolbar(UIViewController *vc) {")
+        self.assertIn("BOOL reuse = (gToolbarStack && gToolbarRow == row", update)
+        self.assertIn("UIStackView *stack = reuse ? gToolbarStack : GXKMakeToolbar(row, tint, surface);", update)
+        self.assertIn("deactivateConstraints:gToolbarConstraints", update)
+        self.assertIn("activateConstraints:gToolbarConstraints", update)
+        # 重建路径必须先撤掉旧约束；两条路径都不得漏掉旧约束。
+        # 扫描失败分支更早就会 GXKDetachToolbar()，这里只看复用判定之后那一次。
+        self.assertLess(update.index("BOOL reuse ="),
+                        update.index("GXKDetachToolbar();", update.index("BOOL reuse =")))
+        detach = function_body(self.source, "static void GXKDetachToolbar(void) {")
+        self.assertIn("deactivateConstraints:gToolbarConstraints", detach)
+        self.assertIn("gToolbarConstraints = nil;", detach)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
