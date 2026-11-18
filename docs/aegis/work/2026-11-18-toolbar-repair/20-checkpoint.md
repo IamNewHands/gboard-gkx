@@ -1,6 +1,6 @@
 # 最新续跑状态
 
-- 状态：构建与打包交付已完成；界面验收 needs-device-verification，不宣称真机问题已解决。
+- 状态：20b57f6 构建与打包已完成，但真机验收失败：用户报告整行工具栏消失，只剩 G。当前正在制作诊断 v2，尚未证实具体根因、不宣称显示已修复。
 - 修复源提交：main / 20b57f6863c1fe953d1deacef15bc5d76514e1b7，已推送 origin=https://github.com/IamNewHands/gboard-gkx.git；本地与远端该 SHA 一致。
 - 已完成：稳定回车字体 owner、真实 foreground GKBImageLayer 与祖先 masksToBounds 测量、根坐标约束、弱引用原生障碍及九键/独立26键实时门控；独立复核通过，最终118项回归 OK。
 - CI：https://github.com/IamNewHands/gboard-gkx/actions/runs/44266198725，headSha 与修复提交相同，macOS 15 arm64/iOS12+ clang、QuartzCore 链接、ldid 与 artifact 上传均成功，编译日志无 warning/error。
@@ -9,3 +9,12 @@
 - 更正：Chrome/CDP 不应作为 GitHub CLI 的前置条件；用户指定 CLI 后已直接推送和编译。此前失败来自受限 schannel 凭据/网络上下文，不是 CI；当前 danger-full-access 成功。校验器一度错误要求每个 Gboard 可执行文件含完整 group 字符串；原包真实 owner 为共享框架，已纠正并加强允许变更之外的字节对比，产物无重打包。
 - 真机下一步：LCSign 自签安装此包，检查初始/输入中/清空后三态字体与G对齐、工具栏点击及9↔26切换；测量不完整或可见G不足8pt时仍会安全不显示。诊断默认关闭，长按复制0.8秒开始/停止内存采样；验收通过后移除诊断接线。
 - 工作区保护：预存 CON 与 probe-zwb2izzd/ 无关，不 stage、不删除；新提取目录 dist/pack-20b57f6 保留。没有 PR/Release、强推或新增分支。
+
+## 整行消失回归：诊断 v2（2026-11-18）
+
+- 任务起点：main / eee9a324ac23bcf273e8941072f8384c4bbb274c，源代码与 20b57f6 修复包一致。用户真机现象为整行消失，不能拿旧 log2.txt 或源码反例当作当前根因证明。
+- 已证实诊断缺口：原入口仅在工具栏「复制」按钮，工具栏隐藏/解绑后无法采样。临时新增自有「换行／重输」按钮长按 0.8 秒开始/停止，验证当前按钮/宿主/原生模型/九键体，原 tap 保持不变、不在 G/原生键/根视图挂手势。
+- 证据：记录最后生产 scan/band/space gate、实际阻挡对象/祖先、带宽和根内候选矩形；独立扫描所有 G 角色（包含隐藏或不可测，最多 6 个，1500 节点）；逐 UIImage 列出图层身份、CGImage/像素、动画/transform、绘制/裁切后矩形。覆盖不足均须看 truncated/listed；历史 gate 不是新测量。
+- 保留边界：未放宽任何生产显示谓词；无新高度/原生 alpha-hidden/输入捕获/网络或磁盘日志。诊断默认关闭，60 秒/80 样本/196608 字符上限，显式停止才写剪贴板；真机根因修复并验收后再撤诊断接线。
+- 验证：125 项本地 Python 契约全部通过，非 UIKit 执行。曾有 4 项测试失配：tap 提取器命中声明后拿到新增诊断方法，已精确选择实现；两处门控一行 return 变为附诊断标签的块，测试仍检查原谓词与 return NO，不放宽原安全边界。独立复核发现并修正三处诊断问题：每次生产尝试独立重置 gate/band/blocker，未走分支标 not-evaluated 且绑定 owner/root；反馈代次守卫并按当前组字状态恢复两态标题，避免回写旧标题；16 层图层链未到 root 明确标 layerChainTruncated 并汇总 truncated，8 层 view 链标 chainTruncated。反馈清理允许仍绑定但隐藏的工具栏复制按钮恢复固定标题，可见性仅在 action key 分支验证。诊断遍历 visited 上限时计数可能多 1（P3），truncated 判定仍正确，不影响显示生产谓词。续跑独立复核再确认两处反馈串扰：跨按钮开始/停止会废弃旧回调，普通复制错误会把「诊断」当恢复基线。现共用当前 owner/root/绑定校验恢复函数，在切换反馈按钮前恢复上一按钮；普通 Copy 错误用固定「复制」基线，旧错误回调只在该按钮不由诊断占用时恢复，Highlighted 也由诊断恢复为当前标题。新鲜 127 项契约与 git diff --check 全部通过；最终独立复核无 Critical/Important，确认两处串扰已修正、生产显示与输入动作保持原谓词，仅建议诊断包待 CI 编译后交付。仍有 P3 遍历计数多 1，不影响覆盖不足标记；UIKit/真机长按与显示根因未验证。CI/IPA 交付结果待补。
+- 真机待收：安装 v2 包，长按「换行」开始，输入拼音、清空、再长按「换行」停止并复制报告；提供报告后按实际 gate 修复显示，验收初始/输入中/清空及9↔26。

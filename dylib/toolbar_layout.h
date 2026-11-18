@@ -1,5 +1,12 @@
 #ifndef GXK_TOOLBAR_LAYOUT_H
 #define GXK_TOOLBAR_LAYOUT_H
+// [DEBUG-toolbar] Constant rejection labels only; no capture or extra tree walk here.
+static NSString *gToolbarImageGate;
+static NSString *gToolbarScanGate;
+static NSString *gToolbarBandGate;
+static CGRect gToolbarImageDrawnRoot, gToolbarImageVisibleRoot;
+static CGRect gToolbarBandCandidateRoot;
+static CGRect gToolbarBandCacheCandidateRoot;
 // Read native image-layer geometry; never infer drawing from UIView.contentMode or a full-row logo frame.
 static BOOL GXKToolbarIconSized(CGRect rect) {
     CGSize size = rect.size;
@@ -16,6 +23,9 @@ static BOOL GXKToolbarFiniteRect(CGRect rect) {
 // and template/tinted images use a mask. Only the proven, unmasked original-image path is measured.
 static BOOL GXKToolbarImageRect(UIView *view, UIView *base, CGRect *outRect) {
     if (outRect) *outRect = CGRectZero;
+    gToolbarImageGate = @"binding";
+    gToolbarImageDrawnRoot = CGRectZero;
+    gToolbarImageVisibleRoot = CGRectZero;
     UIView *root = gCurrentVC.view;
     if (!view || !base || !root.window || view.window != root.window ||
         (base != root && ![base isDescendantOfView:root]) || ![view isDescendantOfView:root] ||
@@ -23,6 +33,7 @@ static BOOL GXKToolbarImageRect(UIView *view, UIView *base, CGRect *outRect) {
     UIImage *image = [(id<GXKNativeIconContent>)view image];
     CALayer *layer = view.layer;
     Class imageLayerClass = NSClassFromString(@"GKBImageLayer");
+    gToolbarImageGate = @"image-layer-contract";
     if (![image isKindOfClass:[UIImage class]] || !imageLayerClass || ![layer isKindOfClass:imageLayerClass] ||
         ![layer respondsToSelector:@selector(image)] || [(id<GXKNativeIconContent>)layer image] != image ||
         !image.CGImage || image.imageOrientation != UIImageOrientationUp || image.images.count ||
@@ -30,10 +41,12 @@ static BOOL GXKToolbarImageRect(UIView *view, UIView *base, CGRect *outRect) {
         layer.contents != (__bridge id)image.CGImage || !isfinite(layer.contentsScale) || layer.contentsScale <= 0.0 ||
         !CGRectEqualToRect(layer.contentsRect, CGRectMake(0, 0, 1, 1)) ||
         !CGRectEqualToRect(layer.contentsCenter, CGRectMake(0, 0, 1, 1))) return NO;
+    gToolbarImageGate = @"layer-bounds";
     CGRect bounds = layer.bounds;
     if (!GXKToolbarFiniteRect(bounds)) return NO;
     CGSize size = CGSizeMake(CGImageGetWidth(image.CGImage) / layer.contentsScale,
                              CGImageGetHeight(image.CGImage) / layer.contentsScale);
+    gToolbarImageGate = @"contents-gravity";
     if (![layer.contentsGravity isEqualToString:kCAGravityCenter]) {
         if (![layer.contentsGravity isEqualToString:kCAGravityResizeAspect]) return NO;
         CGFloat scale = MIN(bounds.size.width / size.width, bounds.size.height / size.height);
@@ -42,26 +55,35 @@ static BOOL GXKToolbarImageRect(UIView *view, UIView *base, CGRect *outRect) {
     CGRect drawn = CGRectMake(CGRectGetMidX(bounds) - size.width * 0.5,
                               CGRectGetMidY(bounds) - size.height * 0.5, size.width, size.height);
     CGRect visible = [layer convertRect:drawn toLayer:root.layer];
+    gToolbarImageDrawnRoot = visible;
+    gToolbarImageVisibleRoot = visible;
     NSUInteger depth = 0;
     for (CALayer *ancestor = layer; ancestor && depth++ < 64; ancestor = ancestor.superlayer) {
+        gToolbarImageGate = @"ancestor-hidden-mask-animation-transform";
         // Animated/complex geometry is not a stable axis-aligned anchor; retry after native layout settles.
         if (ancestor.hidden || ancestor.opacity < 0.05 || ancestor.mask || ancestor.animationKeys.count ||
             !CATransform3DIsIdentity(ancestor.transform) || !CATransform3DIsIdentity(ancestor.sublayerTransform)) return NO;
+        gToolbarImageGate = @"ancestor-clip-empty";
         if (ancestor.masksToBounds) {
             CGRect clip = [ancestor convertRect:ancestor.bounds toLayer:root.layer];
             if (!GXKToolbarFiniteRect(clip)) return NO;
             visible = CGRectIntersection(visible, clip);
+            gToolbarImageVisibleRoot = visible;
         }
         if (!GXKToolbarFiniteRect(visible)) return NO;
         if (ancestor == root.layer) {
             visible = CGRectIntersection(visible, root.layer.bounds);
+            gToolbarImageVisibleRoot = visible;
             if (!GXKToolbarFiniteRect(visible)) return NO;
+            gToolbarImageGate = @"visible-icon-size";
             CGRect measured = [root.layer convertRect:visible toLayer:base.layer];
             if (!GXKToolbarFiniteRect(measured) || !GXKToolbarIconSized(measured)) return NO;
+            gToolbarImageGate = @"measured";
             if (outRect) *outRect = measured;
             return YES;
         }
     }
+    gToolbarImageGate = @"layer-ancestry-incomplete";
     return NO; // Detached or incomplete layer ancestry cannot authorize an anchor.
 }
 
@@ -106,12 +128,14 @@ static BOOL GXKToolbarGlyphRect(UIView *view, UIView *base, CGRect *outRect) {
 // 只借 G 图标那一段空白：左右边界各自停在最近一个可见兄弟视图之前。
 // 宁可窄到不显示，也绝不盖住候选栏或右侧功能图标。
 static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outBand) {
+    gToolbarBandGate = @"band-binding";
+    gToolbarBandCandidateRoot = CGRectZero;
     if (outBand) *outBand = CGRectZero;
     if (!row || !logo || logo.superview != row) return NO;
     CGFloat width = row.bounds.size.width;
     CGRect logoRect = logo.frame;
     CGRect glyph = CGRectZero;
-    if (!GXKToolbarGlyphRect(logo, row, &glyph)) { gToolbarBandCacheValid = NO; return NO; }
+    if (!GXKToolbarGlyphRect(logo, row, &glyph)) { gToolbarBandGate = @"band-glyph-missing"; gToolbarBandCacheValid = NO; return NO; }
     CGRect rowInRoot = [row convertRect:row.bounds toView:root];
     // 邻居签名：只读 frame/hidden/alpha，不做可见性上溯，代价是一次很短的循环。
     NSUInteger signature = row.subviews.count * 2654435761u;
@@ -136,6 +160,8 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
         CGRectEqualToRect(gToolbarBandCacheRootBounds, root.bounds) &&
         gToolbarBandCacheSignature == signature &&
         gToolbarBandCacheEpoch == gToolbarBandEpoch) {
+        gToolbarBandGate = gToolbarBandCacheHit ? @"band-cache-hit" : @"band-cache-rejected";
+        gToolbarBandCandidateRoot = gToolbarBandCacheCandidateRoot;
         if (outBand) *outBand = gToolbarBandCacheBand;
         return gToolbarBandCacheHit;
     }
@@ -170,6 +196,9 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
     CGRect candidate = CGRectMake(left, top, right - left, barHeight);
     CGRect candidateInRoot = [row convertRect:candidate toView:root];
     BOOL hit = right - left >= 200.0 && CGRectContainsRect(root.bounds, candidateInRoot);
+    gToolbarBandCandidateRoot = candidateInRoot;
+    gToolbarBandCacheCandidateRoot = candidateInRoot;
+    gToolbarBandGate = hit ? @"band-clear" : right - left < 200.0 ? @"band-width" : @"band-outside-root";
     gToolbarBandCacheRow = row;
     gToolbarBandCacheLogo = logo;
     gToolbarBandCacheRowSize = row.bounds.size;
@@ -189,6 +218,7 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
 // 一次遍历同时判定：可见九键体、是否还有独立可见的 26 键体、G 图标行。
 // 三样缺一就返回 NO，调用方保持原生——宁可不显示工具条，也不猜布局。
 static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIView **outBody, CGRect *outBand) {
+    gToolbarScanGate = @"root-or-class-unavailable";
     if (outRow) *outRow = nil;
     if (outLogo) *outLogo = nil;
     if (outBody) *outBody = nil;
@@ -227,7 +257,11 @@ static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIVi
         }
         [stack addObjectsFromArray:view.subviews];
     }
-    if (stack.count || !body || qwertyVisible || !logoCandidates.count) return NO;
+    if (stack.count || !body || qwertyVisible || !logoCandidates.count) {
+        gToolbarScanGate = stack.count ? @"tree-incomplete" : !body ? @"nine-body-missing" :
+                           qwertyVisible ? @"independent-qwerty" : @"no-measurable-logo";
+        return NO;
+    }
 
     // 挑"落在九键体正上方、离它最近"的那个 G：工具栏必须和键位同一条竖线，不能高一行。
     CGRect bodyRect = [body convertRect:body.bounds toView:root];
@@ -247,15 +281,20 @@ static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIVi
             bestBottom = CGRectGetMaxY(glyph);
         }
     }
+    gToolbarScanGate = @"logo-choice-missing";
     if (!logo) return NO;
 
+    gToolbarScanGate = @"row-invisible";
     UIView *row = logo.superview;
     if (!row || row == root || !GXKKeyIsVisible(row, root)) return NO;
+    gToolbarScanGate = @"row-size";
     CGSize size = row.bounds.size;
     if (size.width < 100 || size.height < 18 || size.height > 110) return NO;
 
     CGRect band = CGRectZero;
+    gToolbarScanGate = @"band-unavailable";
     if (!GXKToolbarBand(row, logo, root, &band)) return NO;
+    gToolbarScanGate = @"scan-success";
 
     if (outRow) *outRow = row;
     if (outLogo) *outLogo = logo;

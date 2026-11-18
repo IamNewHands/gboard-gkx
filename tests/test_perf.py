@@ -207,7 +207,12 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("if (!GXKKeyIsVisible(body, root)) continue;", owners)
         code = re.sub(r"//[^\n]*", "", owners)
         self.assertRegex(code, r"if \(\[body isKindOfClass:nineClass\]\) nineVisible = YES;\s*"
-                              r"else if \(\[body isKindOfClass:qwertyClass\]\) return NO;")
+                              r"else if \(\[body isKindOfClass:qwertyClass\]\) \{")
+        qwerty = function_body(code, "else if ([body isKindOfClass:qwertyClass])")
+        self.assertIn("return NO;", qwerty)
+        self.assertNotIn("return YES;", qwerty)
+        self.assertIn('gToolbarSpaceGate = @"independent-qwerty";', qwerty)
+        self.assertIn("gToolbarSpaceBlocker = body;", qwerty)
         self.assertIn("if (!nineVisible) return NO;", owners)
         for band_condition in ("band", "CGRect", "GXKToolbarContentBlocks", "convertRect:"):
             self.assertNotIn(band_condition, owners)
@@ -442,12 +447,15 @@ class PerfContracts(unittest.TestCase):
 
     def test_logo_selection_requires_complete_nine_key_scan_not_tree_order(self):
         scan = function_body(self.layout, "static BOOL GXKToolbarScan(")
-        for required in ("NSMutableArray<NSArray *> *logoCandidates", "if (stack.count || !body || qwertyVisible || !logoCandidates.count) return NO;",
+        for required in ("NSMutableArray<NSArray *> *logoCandidates", "if (stack.count || !body || qwertyVisible || !logoCandidates.count) {",
                          "if (!GXKToolbarGlyphRect(view, root, &glyph) || CGRectIsEmpty(glyph))",
                          "CGRect bodyRect = [body convertRect:body.bounds toView:root];",
                          "CGFloat gap = CGRectGetMinY(bodyRect) - CGRectGetMaxY(glyph);",
                          "BOOL better = (!logo || gap < bestGap - 0.5)"):
             self.assertIn(required, scan)
+        rejected = function_body(scan, "if (stack.count || !body || qwertyVisible || !logoCandidates.count)")
+        self.assertIn("return NO;", rejected)
+        self.assertNotIn("return YES;", rejected)
         self.assertLess(scan.index("isKindOfClass:nineClass"), scan.index("isKindOfClass:qwertyClass"))
         self.assertNotIn("if (!logo && [view isKindOfClass:logoClass]", scan)
 

@@ -57,7 +57,7 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("GXKUpdateActionKey", layout)
 
     def test_tap_revalidates_sender_identity_and_binding(self):
-        tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender")
+        tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender {")
         self.assertIn("sender != gActionKeyButton", tap)
         self.assertIn("GXKFindNineKeyEmojiKey", tap)
         self.assertIn("softKeyDef", tap)
@@ -169,7 +169,7 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("isKindOfClass:[NSArray class]", predicate)
         self.assertIn("actions.count > 0", predicate)
         self.assertNotIn("setActions", predicate)
-        tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender")
+        tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender {")
         update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
         self.assertIn("!GXKModelHasNativeActions(gActionSoftKeyDef)", tap)
         self.assertGreaterEqual(update.count("!GXKModelHasNativeActions(model)"), 2)
@@ -249,7 +249,7 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("setTitleColor:tint forState:UIControlStateNormal", sync)
 
     def test_queued_updates_are_bound_to_original_controller(self):
-        tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender")
+        tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender {")
         changed = function_body(self.source, "static void gkx_textDidChange(id self, SEL _cmd, id textInput)")
         self.assertIn("__weak UIViewController *weakVC = vc", tap)
         self.assertIn("currentVC == gCurrentVC", tap)

@@ -8,6 +8,10 @@ static NSHashTable<UIView *> *gToolbarKeyboardBodies;
 static NSUInteger gToolbarContentEpoch;
 static NSUInteger gToolbarObstacleEpoch;
 static BOOL gToolbarObstacleComplete;
+// [DEBUG-toolbar] Last production decision survives stack detachment.
+static NSString *gToolbarSpaceGate;
+static __weak UIView *gToolbarSpaceBlocker;
+static CGRect gToolbarSpaceBand;
 
 static BOOL GXKToolbarContentBlocks(UIView *view, UIView *root, CGRect band) {
     if (!GXKKeyIsVisible(view, root)) return NO;
@@ -37,6 +41,9 @@ static BOOL GXKToolbarContentBlocks(UIView *view, UIView *root, CGRect band) {
 }
 
 static BOOL GXKToolbarNativeSpaceClear(UIView *root, UIView *logo, CGRect band) {
+    gToolbarSpaceGate = @"invalid-band-binding";
+    gToolbarSpaceBlocker = nil;
+    gToolbarSpaceBand = band;
     if (!root || !logo || !CGRectContainsRect(root.bounds, band)) return NO;
     BOOL rebuild = gToolbarObstacleRoot != root || gToolbarObstacleLogo != logo ||
                    gToolbarObstacleEpoch != gToolbarContentEpoch ||
@@ -56,6 +63,7 @@ static BOOL GXKToolbarNativeSpaceClear(UIView *root, UIView *logo, CGRect band) 
         Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
         Class nineClass = GXKClassCached(@"GKB9KeysSoftKeyboardView", &gCachedNineKeyClass);
         Class qwertyClass = GXKClassCached(@"GKBZhQwertySoftKeyboardView", &gCachedQwertyClass);
+        gToolbarSpaceGate = @"keyboard-class-unavailable";
         if (!keyClass || !nineClass || !qwertyClass) return NO;
         NSMutableArray<UIView *> *pending = [NSMutableArray arrayWithObject:root];
         NSUInteger visited = 0;
@@ -75,6 +83,7 @@ static BOOL GXKToolbarNativeSpaceClear(UIView *root, UIView *logo, CGRect band) 
             if (leaf || icon || [view isKindOfClass:[UILabel class]]) [gToolbarObstacles addObject:view];
             if (!leaf) [pending addObjectsFromArray:view.subviews];
         }
+        gToolbarSpaceGate = @"obstacle-tree-incomplete";
         if (pending.count) return NO;
         gToolbarObstacleComplete = YES;
     }
@@ -85,12 +94,22 @@ static BOOL GXKToolbarNativeSpaceClear(UIView *root, UIView *logo, CGRect band) 
     for (UIView *body in gToolbarKeyboardBodies) {
         if (!GXKKeyIsVisible(body, root)) continue;
         if ([body isKindOfClass:nineClass]) nineVisible = YES; // Nine-key inherits the QWERTY class.
-        else if ([body isKindOfClass:qwertyClass]) return NO;
+        else if ([body isKindOfClass:qwertyClass]) {
+            gToolbarSpaceGate = @"independent-qwerty";
+            gToolbarSpaceBlocker = body;
+            return NO;
+        }
     }
+    gToolbarSpaceGate = @"nine-body-not-visible";
     if (!nineVisible) return NO;
     for (UIView *view in gToolbarObstacles) {
-        if (GXKToolbarContentBlocks(view, root, band)) return NO;
+        if (GXKToolbarContentBlocks(view, root, band)) {
+            gToolbarSpaceGate = @"native-obstacle";
+            gToolbarSpaceBlocker = view;
+            return NO;
+        }
     }
+    gToolbarSpaceGate = @"space-clear";
     return YES;
 }
 #endif

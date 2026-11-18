@@ -27,6 +27,7 @@ class ToolbarDiagnosticContracts(unittest.TestCase):
         cls.main = (ROOT / "dylib/gkx.m").read_text(encoding="utf-8")
         cls.diag = (ROOT / "dylib/toolbar_diagnostics.h").read_text(encoding="utf-8")
         cls.layout = (ROOT / "dylib/toolbar_layout.h").read_text(encoding="utf-8")
+        cls.visibility = (ROOT / "dylib/toolbar_visibility.h").read_text(encoding="utf-8")
         cls.code = re.sub(r"//[^\n]*", "", cls.diag)
 
     def body(self, name):
@@ -80,7 +81,7 @@ class ToolbarDiagnosticContracts(unittest.TestCase):
         self.assertIn("[image isKindOfClass:[UIImage class]]", glyph)
         self.assertIn("CALayer *layer = view.layer;", glyph)
         self.assertRegex(glyph, r"for \(CALayer \*ancestor = layer; ancestor && depth\+\+ < 16; ancestor = ancestor\.superlayer\)")
-        self.assertIn("if (ancestor == gCurrentVC.view.layer) break;", glyph)
+        self.assertIn("if (ancestor == gCurrentVC.view.layer) { layerChainReachedRoot = YES; break; }", glyph)
         for evidence in ("layer.contentsGravity", "layer.contentsScale", "layer.contents == (__bridge id)image.CGImage",
                          "layer.contentsRect", "layer.contentsCenter", "image.capInsets", "image.imageOrientation",
                          "ancestor.bounds", "ancestor.position", "ancestor.masksToBounds", "ancestor.mask != nil",
@@ -109,7 +110,7 @@ class ToolbarDiagnosticContracts(unittest.TestCase):
         self.assertIn("NOT geometry freshness", self.diag)
         self.assertIn("Start/stop snapshots are immediate", self.diag)
 
-    def test_only_copy_has_opt_in_gesture_and_began_is_single_action(self):
+    def test_toolbar_copy_has_opt_in_gesture_and_began_is_single_action(self):
         make = function_body(self.main, "static UIStackView *GXKMakeToolbar")
         self.assertIn("if (i == 1)", make)
         self.assertIn("diagnostic.minimumPressDuration = 0.8;", make)
@@ -119,6 +120,137 @@ class ToolbarDiagnosticContracts(unittest.TestCase):
         self.assertIn("vc != gCurrentVC", handler)
         self.assertIn("containsObject:button", handler)
         self.assertIn("GXKToolbarDiagnosticToggle", handler)
+
+    def test_independent_entry_does_not_depend_on_toolbar_binding(self):
+        handler = function_body(self.main, "- (void)onActionKeyDiagnostic:(UILongPressGestureRecognizer *)gesture {")
+        for guard in ("gesture.state != UIGestureRecognizerStateBegan", "vc.isViewLoaded",
+                      "button != gActionKeyButton", "button.superview != gActionHost",
+                      "GXKKeyIsVisible(button, vc.view)", "GXKNineKeyBodyForKey(gEmojiSoftKeyView, vc.view)",
+                      "GXKActionHostForKey(gEmojiSoftKeyView) != gActionHost",
+                      "GXKNativeIconForKey(gEmojiSoftKeyView) != gActionNativeIcon",
+                      "softKeyDef != gActionSoftKeyDef", "GXKModelHasNativeActions(gActionSoftKeyDef)"):
+            self.assertIn(guard, handler)
+        self.assertIn("GXKToolbarDiagnosticToggle(vc, button)", handler)
+        for forbidden in ("gToolbarTarget", "gToolbarStack", "gToolbarRow", "insertText:", "deleteBackward", "onActionKeyTapped"):
+            self.assertNotIn(forbidden, handler)
+        update = function_body(self.main, "static void GXKUpdateActionKey(UIViewController *vc) {")
+        self.assertIn("initWithTarget:gActionTarget action:@selector(onActionKeyDiagnostic:)", update)
+        self.assertIn("diagnostic.minimumPressDuration = 0.8;", update)
+        self.assertIn("diagnostic.cancelsTouchesInView = YES;", update)
+        self.assertIn("[btn addGestureRecognizer:diagnostic];", update)
+        self.assertIn("action:@selector(onActionKeyTapped:) forControlEvents:UIControlEventTouchUpInside", update)
+        self.assertNotRegex(update, r"\[(?:root|host|currentKey|icon) addGestureRecognizer:")
+
+    def test_feedback_is_protected_in_both_action_key_paths(self):
+        update = function_body(self.main, "static void GXKUpdateActionKey(UIViewController *vc) {")
+        for button in ("cheapBtn", "btn"):
+            self.assertIn(button + " == gToolbarDiagnosticFeedbackButton && GXKToolbarDiagnosticNow() < gToolbarDiagnosticFeedbackUntil", update)
+        toggle = self.body("static void GXKToolbarDiagnosticToggle")
+        self.assertEqual(2, toggle.count("GXKToolbarDiagnosticFeedback(vc, button,"))
+        feedback = self.body("static void GXKToolbarDiagnosticFeedback")
+        self.assertIn("generation = ++gToolbarDiagnosticFeedbackGeneration", feedback)
+        self.assertIn("generation != gToolbarDiagnosticFeedbackGeneration", feedback)
+        restore = self.body("static BOOL GXKToolbarDiagnosticRestoreFeedbackTitle")
+        self.assertIn("liveVC.view != root", restore)
+        self.assertIn("live != gActionKeyButton", restore)
+        self.assertIn('GXKComposingStateCached(liveVC) ? @"重输" : @"换行"', restore)
+        self.assertIn("forState:UIControlStateHighlighted", restore)
+        self.assertNotIn("original", re.sub(r"//[^\n]*", "", feedback + restore))
+        self.assertNotIn("GXKFlashTitle", toggle)
+        shared, action = restore.split("if (actionKey) {", 1)
+        self.assertNotIn("GXKKeyIsVisible", shared)
+        self.assertIn("![live isDescendantOfView:liveVC.view]", shared)
+        self.assertIn("GXKKeyIsVisible(live, liveVC.view)", action)
+        self.assertIn("else if (![gToolbarStack.arrangedSubviews containsObject:live]) return NO;", action)
+        self.assertIn("GXKToolbarDiagnosticRestoreFeedbackTitle(weakVC, live, weakRoot, actionKey)", feedback)
+
+    def test_cross_button_feedback_restores_previous_before_superseding_generation(self):
+        feedback = self.body("static void GXKToolbarDiagnosticFeedback(")
+        self.assertIn("previous && previous != button", feedback)
+        restore = feedback.index("GXKToolbarDiagnosticRestoreFeedbackTitle(gToolbarDiagnosticFeedbackOwner, previous,")
+        self.assertLess(restore, feedback.index("gToolbarDiagnosticFeedbackButton = button;"))
+        self.assertLess(restore, feedback.index("++gToolbarDiagnosticFeedbackGeneration"))
+        self.assertIn("gToolbarDiagnosticFeedbackRoot, gToolbarDiagnosticFeedbackActionKey", feedback)
+        self.assertIn("gToolbarDiagnosticFeedbackRoot = vc.view;", feedback)
+        self.assertIn("static __weak UIViewController *gToolbarDiagnosticFeedbackOwner;", self.diag)
+        self.assertIn("static __weak UIView *gToolbarDiagnosticFeedbackRoot;", self.diag)
+
+    def test_copy_error_flash_cannot_restore_diagnostic_title_or_overwrite_new_feedback(self):
+        flash = function_body(self.main, "static void GXKFlashTitle(")
+        self.assertIn("NSString *original = GXKToolbarDiagnosticFlashBaseline(button);", flash)
+        self.assertIn("live && !GXKToolbarDiagnosticFeedbackOwns(live)", flash)
+        baseline = self.body("static NSString *GXKToolbarDiagnosticFlashBaseline")
+        self.assertIn("button == gToolbarDiagnosticFeedbackButton && !gToolbarDiagnosticFeedbackActionKey", baseline)
+        self.assertIn('[gToolbarStack.arrangedSubviews containsObject:button]) return @"复制";', baseline)
+        self.assertIn("return [button titleForState:UIControlStateNormal];", baseline)
+        owns = self.body("static BOOL GXKToolbarDiagnosticFeedbackOwns")
+        self.assertIn("button == gToolbarDiagnosticFeedbackButton && GXKToolbarDiagnosticNow() < gToolbarDiagnosticFeedbackUntil", owns)
+
+    def test_failed_scan_survey_reads_all_logo_roles_without_promoting_them(self):
+        survey = self.body("static NSString *GXKToolbarDiagnosticLogoSurvey")
+        self.assertIn('NSClassFromString(@"GKBHeaderLogoView")', survey)
+        self.assertIn("arrayWithObject:root", survey)
+        self.assertIn("visited++ < 1500", survey)
+        self.assertIn("pending.count >= 1500) { truncated = YES; break; }", survey)
+        self.assertIn("logos.count < 6", survey)
+        self.assertIn("count > logos.count", survey)
+        self.assertNotIn("if (view.hidden", survey)
+        self.assertNotIn("if (view.isHidden", survey)
+        self.assertIn("GXKToolbarDiagnosticGlyph(view, view.superview, &glyph)", survey)
+        for forbidden in ("GXKToolbarScan(", "GXKToolbarBand(", "GXKUpdateToolbar(", "GXKToolbarNativeSpaceClear(", "outLogo", "gToolbarLogoView ="):
+            self.assertNotIn(forbidden, survey)
+        self.assertIn("GXKToolbarDiagnosticLogoSurvey(root)", self.body("static NSString *GXKToolbarDiagnosticSnapshot"))
+
+    def test_last_production_decision_survives_detach_without_feedback_overwrite(self):
+        request = self.body("static void GXKToolbarDiagnosticRequest")
+        self.assertLess(request.index("gToolbarDiagnosticLastDecision = reason"), request.index("!gToolbarDiagnosticActive"))
+        self.assertIn('![reason isEqualToString:@"feedback-settle"]', request)
+        for field in ("lastDecision=", "decisionOwnerCurrent=", "scanGate=", "bandGate=", "bandCandidateRoot=",
+                      "spaceGate=", "spaceBandRoot=", "blocker=", "blockerChain=", "obstacleComplete=", "logoCandidate["):
+            self.assertIn(field, self.diag)
+        space = function_body(self.visibility, "static BOOL GXKToolbarNativeSpaceClear")
+        self.assertIn('gToolbarSpaceGate = @"independent-qwerty";', space)
+        self.assertIn("gToolbarSpaceBlocker = body;", space)
+        self.assertIn('gToolbarSpaceGate = @"native-obstacle";', space)
+        self.assertIn("gToolbarSpaceBlocker = view;", space)
+        for gate in ("no-measurable-logo", "nine-body-missing", "tree-incomplete", "row-size", "band-unavailable"):
+            self.assertIn('@"' + gate + '"', self.layout)
+
+    def test_each_image_attempt_exposes_contract_and_clipping_evidence(self):
+        glyph = self.body("static NSString *GXKToolbarDiagnosticGlyph")
+        self.assertIn("NSString *imageGate = gToolbarImageGate", glyph)
+        for expression in ("layerImage == image", "image.CGImage != NULL", "image.images.count",
+                           "CATransform3DIsIdentity(ancestor.sublayerTransform)", "gToolbarImageDrawnRoot", "gToolbarImageVisibleRoot"):
+            self.assertIn(expression, glyph)
+        for field in ("imageGate=", "layerImageMatch=", "CGImage=", "imageFrames=", "drawnRoot=", "visibleRoot=", "clipRoot=", "visibleIconSized="):
+            self.assertIn(field, glyph)
+        self.assertIn("imageCount > images.count", glyph)
+        self.assertIn("Last gate labels/spaceBand describe the last production call", self.diag)
+
+    def test_production_gates_are_attempt_scoped_and_root_bound(self):
+        reset = self.body("static void GXKToolbarDiagnosticResetGates")
+        for line in ('gToolbarScanGate = @"not-evaluated";', 'gToolbarBandGate = @"not-evaluated";',
+                     'gToolbarSpaceGate = @"not-evaluated";', "gToolbarSpaceBlocker = nil;",
+                     "gToolbarSpaceBand = CGRectZero;", "gToolbarBandCandidateRoot = CGRectZero;"):
+            self.assertIn(line, reset)
+        begin = self.body("static void GXKToolbarDiagnosticBegin")
+        self.assertIn("gToolbarDiagnosticLastRoot = vc.view;", begin)
+        self.assertIn("GXKToolbarDiagnosticResetGates();", begin)
+        update = function_body(self.main, "static void GXKUpdateToolbar(UIViewController *vc) {")
+        self.assertLess(update.index("GXKToolbarDiagnosticBegin(vc)"), update.index("if (bound)"))
+        self.assertLess(update.index("GXKToolbarDiagnosticResetGates()"), update.index("GXKToolbarScan(root,"))
+        snapshot = self.body("static NSString *GXKToolbarDiagnosticSnapshot")
+        self.assertIn("root == gToolbarDiagnosticLastRoot", snapshot)
+        self.assertNotIn("gToolbarDiagnosticLastOwner =", self.body("static void GXKToolbarDiagnosticRequest"))
+
+    def test_ancestor_coverage_cannot_claim_complete_before_root(self):
+        glyph = self.body("static NSString *GXKToolbarDiagnosticGlyph")
+        self.assertIn("BOOL layerChainReachedRoot = NO;", glyph)
+        self.assertIn("BOOL layerChainTruncated = !layerChainReachedRoot;", glyph)
+        self.assertIn("truncated = truncated || layerChainTruncated;", glyph)
+        self.assertIn("layerChainReachedRoot=%d layerChainTruncated=%d", glyph)
+        chain = self.body("static NSString *GXKToolbarDiagnosticChain")
+        self.assertIn('chainTruncated=%d", view != nil', chain)
 
     def test_all_refresh_results_request_diagnostics(self):
         update = function_body(self.main, "static void GXKUpdateToolbar(UIViewController *vc) {")
@@ -185,7 +317,7 @@ class ToolbarDiagnosticContracts(unittest.TestCase):
         toggle = self.body("static void GXKToolbarDiagnosticToggle")
         start = toggle[toggle.index("gToolbarDiagnosticSamples = [NSMutableArray array];"):]
         self.assertLess(start.index('GXKToolbarDiagnosticCapture(vc, @"start-before-feedback"'),
-                        start.index('GXKFlashTitle(button, @"诊断")'))
+                        start.index('GXKToolbarDiagnosticFeedback(vc, button, @"诊断")'))
         self.assertIn("gToolbarDiagnosticFeedbackUntil", start)
         timeout = start[start.index("GXK_DIAGNOSTIC_SECONDS * NSEC_PER_SEC"):]
         self.assertIn('@"timeout-60s"', timeout)
