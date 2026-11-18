@@ -1,6 +1,8 @@
 # 最新续跑状态
 
-- 当前状态：用户已提供 log3.txt 并明确继续修复。19 个真机样本中 6 个空闲态被 band-width 拦截（x43..56，仅13pt<200），13个组字/过渡态无可测G；此前所有space分支均未执行。正在修复实际可见内容空位判断，尚未编译/交付本轮IPA，不宣称真机恢复。以下旧修复/诊断交付均为历史证据。
+- 当前状态：log3实际内容空位修复已推送main3574c24368a9a48df1ac6994bd463d6c6df258b5，Actions44291336372 success；130项源码契约与23项验包反例通过，当前unsigned IPA已单次生成且独立final PASS（交付证据见log3章节）。源码/构建/包交付闭合，iPhone17Pro/iOS27真机显示、字体、触摸与9↔26仍待用户验收，不宣称真机恢复。log3的19个样本中6个空闲态被旧band-width拦截（x43..56，仅13pt<200），13个组字/过渡态无可测G；修复按实际可见内容测量，不硬编码x56。
+
+## 旧修复交付（以下至log3章节均为历史，不是当前源提交）
 - 修复源提交：main / 20b57f6863c1fe953d1deacef15bc5d76514e1b7，已推送 origin=https://github.com/IamNewHands/gboard-gkx.git；本地与远端该 SHA 一致。
 - 已完成：稳定回车字体 owner、真实 foreground GKBImageLayer 与祖先 masksToBounds 测量、根坐标约束、弱引用原生障碍及九键/独立26键实时门控；独立复核通过，最终118项回归 OK。
 - CI：https://github.com/IamNewHands/gboard-gkx/actions/runs/44266198725，headSha 与修复提交相同，macOS 15 arm64/iOS12+ clang、QuartzCore 链接、ldid 与 artifact 上传均成功，编译日志无 warning/error。
@@ -10,7 +12,7 @@
 - 真机下一步：LCSign 自签安装此包，检查初始/输入中/清空后三态字体与G对齐、工具栏点击及9↔26切换；测量不完整或可见G不足8pt时仍会安全不显示。诊断默认关闭，长按复制0.8秒开始/停止内存采样；验收通过后移除诊断接线。
 - 工作区保护：预存 CON 与 probe-zwb2izzd/ 无关，不 stage、不删除；新提取目录 dist/pack-20b57f6 保留。没有 PR/Release、强推或新增分支。
 
-## log3 空位修复（2026-11-18 18:35，进行中）
+## log3 空位修复（2026-11-18 19:14交付；源码/CI/验包完成，真机待验收）
 
 - TaskStartSnapshot：main / 57e385e25020e549c1e672399a4feede065386ef；仅预存CON未跟踪。用户授权代码修复、测试/独立审阅、直接push main、Actions编译及unsigned IPA，无PR/Release。
 - Change Necessity / Decision: code-change：不能靠改字号或放宽200pt门槛修复“容器外框被当成内容”的责任错误。最小边界为布局/实际内容owner共用可见障碍矩形、临时边界取证与对应契约测试；原生几何/输入/手势不改。
@@ -20,6 +22,12 @@
 - 验证计划：日志几何回放与非空候选/右图标/跨左边界/祖先裁切/大图片/既有载体无事件内容翻转/9↔26反例；Python源码契约非UIKit，云端clang与原包字节/ZIP/加载/权限独立校验后交付待真机验收。默认关闭的v2诊断保留，增补真实rightBound对象，根因修复并真机验收后再撤。
 - 续跑实测（18:57）：129项静态契约已通过，前轮“1失败”为旧工作树记录而非当前结果；前轮space-repair-review因上游模型报错中断，没有审阅结论，本轮重启space-review/package-review。独立审阅定位model opacity/bounds判空可先于祖先animation检查；现同一ClippedViewRect完整检查图层链，到root唯一成功出口，ContentRect即使nil image/text/items也先验证载体链。注册UICollectionReusableView并继续检查子视图，保留自绘supplementary完整区域。新鲜130项/0.038s/OK、git diff --check exit0。
 - 覆盖边界：弱注册表对已登记载体每次重读内容；新增/移除子树仍依赖controller文字/布局/生命周期epoch，无事件结构突变未经UIKit验证。保守拒绝动画/复杂图层，可能过渡中暂时隐藏；不承诺自动放行。本轮源码独立复核Important动画项已关闭、无剩余Critical/Important；fresh130项/0.036s/OK。用户本轮明确回复“直接推送，后续不要再询问了，记到记忆里”，已授权直接push main/Actions/unsignedIPA，不包含强推、PR/Release/原包上传。打包校验器来源与固定原包断言缺口由package-review补强中；生产源码先提交编译，验包闭合后交付。
+
+- 终态验证（19:14）：Actions44291336372 success，https://github.com/IamNewHands/gboard-gkx/actions/runs/44291336372；head_sha为3574c24368a9a48df1ac6994bd463d6c6df258b5，workflow .github/workflows/build-dylib.yml，macos-15-arm64/iOS12+ clang/QuartzCore/ldid成功，无编译warning/error；上传器Node弃用警告非编译失败。父审后fresh23项验包反例/6.210s/OK及130项源码契约/0.036s/OK，git diff --check exit0，源码与CI提交无diff。Windows zipfile先归一化反斜杠/截NUL导致旧filename入口漏检，已在同一safe_zip owner读取orig_filename并拒绝归一化/截断；原始双header反例通过，未放宽规则。
+- 单次打包：dist/package-toolbar-space-repair.sh的preflight/注入/final全部exit0；两阶段实时GET绑定精确commit/run/artifact/name/workflow/success，archive哈希/ZIP CRC/原名无重名与穿越/唯一dylib字节通过。artifact14420899163（libgkx，75758bytes），archive SHA25665c9331719d5d4ade30e306f74079a7d1ac193f90cbda445e95ef83635ebd45a；dylib SHA2563a58118c5a7511bdce1df2b9babe33c62a42a2e8c18bccf7fb628bf9a5ba1b43。
+- 产物：dist/gboard-gkx-3574c24-toolbar-space-repair-unsigned.ipa，35972531bytes（34.31MiB），SHA2561dbcc15b992dc7655ddb749fb47e68b2bc141eb202d5510d132cb9747db4afd1；dist/gboard-gkx-3574c24-toolbar-space-repair-verification.json为PASS回执，父读取回执与ops_stat重新核对哈希/大小一致。2050条ZIP，仅新增确切dylib/词库并移除3旧签名文件；两个exe各唯一@rpath/libgkx.dylib且RPATH/原段/文件offset保持，8个固定group槽替换为group.zunbengege.top；允许3文件差异176/28/27bytes之外2045原生文件字节/权限不变，arm64段/section/linkedit边界验证通过。
+- Complexity Closure：exceeded-and-governed；既有大gkx.m仅接线/现有局部行为修正，实际内容和裁切责任共用既有visibility/layout owner，退役任意兄弟外框与旧缓存签名判空路径，无新fallback/重试owner；验包单一provenance/ZIP owner与同目录反例维护，checkpoint/evidence替换临时状态而不新增治理文件。广泛拆分大源文件不属本任务；当前修复无未治理新增责任。
+- 交付边界：本轮源码/CI/结构验包与unsigned IPA完成；真机初始/组字/清空三态、字体/G对齐/工具栏触摸/9↔26需LCSign自签后验收。诊断默认关闭且临时保留，真机根因验收后再撤；无事件新增子树/复杂动画没有运行时放行证据。原IPA、词库、dist/pack-3574c24-space-repair、旧产物和预存CON/probe均保留；没有PR/Release/强推/原包上传，不重跑已完成打包。
 
 ## 整行消失回归：诊断 v2（2026-11-18）
 

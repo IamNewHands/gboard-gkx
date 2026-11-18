@@ -1,5 +1,13 @@
 # 已实测证据与未覆盖边界
 
+## 2026-11-18 log3 空位修复交付（源码/编译/独立验包通过，真机待验收）
+
+- 修复源3574c24368a9a48df1ac6994bd463d6c6df258b5已推送main；fresh130项Python源码契约Ran130tests in0.039s/OK、git diff --check exit0，生产源码相对该CI提交无diff。独立源码复核无剩余Critical/Important；Python契约与几何回放不替代UIKit。
+- Actions44291336372 success，https://github.com/IamNewHands/gboard-gkx/actions/runs/44291336372；精确head_sha与修复源相同，workflow .github/workflows/build-dylib.yml，macos-15-arm64/iOS12+ clang、QuartzCore、ldid与上传成功。编译无warning/error，上传器Node20→24/punycode/url.parse弃用警告不影响此次产物；未扩大CI变更范围。
+- 父审后23项独立验包反例Ran23tests in6.210s/OK，130项源码契约Ran130tests in0.036s/OK；Windows原始ZIP双header的反斜杠与NUL反例验证orig_filename入口拒绝归一化/截断，没有放宽路径规则。preflight/注入/final单次执行全部exit0；两阶段同一ci_identity实时GET绑定精确SHA/run/artifact/name/workflow/success。artifact14420899163为libgkx，75758bytes，archive SHA25665c9331719d5d4ade30e306f74079a7d1ac193f90cbda445e95ef83635ebd45a，唯一dylib SHA2563a58118c5a7511bdce1df2b9babe33c62a42a2e8c18bccf7fb628bf9a5ba1b43，下载ZIP哈希/CRC/字节比对通过。
+- 新IPA：dist/gboard-gkx-3574c24-toolbar-space-repair-unsigned.ipa，35972531bytes（34.31MiB），SHA2561dbcc15b992dc7655ddb749fb47e68b2bc141eb202d5510d132cb9747db4afd1；dist/gboard-gkx-3574c24-toolbar-space-repair-verification.json为PASS，父读回执与ops_stat核对一致。固定原包/词库哈希、2050条ZIP/3旧签名文件删除/8固定group槽/两个exe唯一load/RPATH/offset与755/644通过；只有3文件允许差异176/28/27bytes，其余2045原生文件逐字节与权限不变，arm64段/section/linkedit边界有效。
+- 未覆盖：LCSign自签后的iPhone17Pro/iOS27 UIKit显示/字体/G对齐/触摸/初始-组字-清空三态/9↔26。日志不证明x56对象当前为空，修复用实时ContentRect而非硬编码x56；完整动画链保守拒绝，无事件新增子树尚无运行时证据。源码/CI/包交付已闭合而非真机恢复已证实；诊断默认关闭，待真机验收后退役，旧输入与产物保留，无PR/Release/原包上传。
+
 ## 2026-11-18 17:53 诊断 v2 交付实测
 
 - 用户在旧包20b57f6上报告整行工具栏消失、只剩G；旧包编译/结构成功不证明显示已修复。当前v2只补可达诊断与反馈可靠性，不改变生产显示门禁。
