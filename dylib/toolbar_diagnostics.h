@@ -66,61 +66,55 @@ static NSString *GXKToolbarDiagnosticView(UIView *view, UIView *root) {
             inRoot, view.hidden, (double)view.alpha, view.clipsToBounds, NSStringFromCGAffineTransform(view.transform)];
 }
 
-// Bounded, read-only counterpart of the existing bottommost-image heuristic.
-// These are VIEW/image rectangles, not opaque pixel bounds or proof of which image is G.
+// Share the layout owner's anchor. Diagnostic detail reads only image/layer geometry, never native text.
 static NSString *GXKToolbarDiagnosticGlyph(UIView *logo, UIView *row, CGRect *outGlyph) {
     *outGlyph = CGRectZero;
     if (!logo || !row || logo.superview != row) return @"unbound";
+    BOOL measured = GXKToolbarGlyphRect(logo, row, outGlyph);
     NSMutableArray<UIView *> *pending = [NSMutableArray arrayWithObject:logo];
     NSMutableArray<NSString *> *images = [NSMutableArray array];
-    CGRect own = [logo convertRect:logo.bounds toView:row];
-    CGFloat bestBottom = -CGFLOAT_MAX, bestArea = 0.0;
     NSUInteger visited = 0, imageCount = 0;
     BOOL truncated = NO;
-    while (pending.count && visited < GXK_DIAGNOSTIC_MAX_NODES) {
+    while (pending.count && visited++ < GXK_DIAGNOSTIC_MAX_NODES) {
         UIView *view = pending.lastObject;
         [pending removeLastObject];
-        visited++;
-        if (view != logo && (view.hidden || view.alpha < 0.05)) continue;
         UIImage *image = nil;
-        BOOL draws = [view isKindOfClass:[UIImageView class]];
-        if (draws) image = ((UIImageView *)view).image;
-        else if ([view respondsToSelector:@selector(image)]) {
-            id candidate = [(id<GXKNativeIconContent>)view image];
-            if ([candidate isKindOfClass:[UIImage class]]) { draws = YES; image = candidate; }
-        }
-        CGRect rect = [view convertRect:view.bounds toView:row];
-        if (view != logo && draws && !CGRectIsEmpty(rect) && GXKToolbarIconSized(rect)) {
+        if ([view respondsToSelector:@selector(image)]) image = [(id<GXKNativeIconContent>)view image];
+        if ([image isKindOfClass:[UIImage class]]) {
             imageCount++;
-            if (images.count < 8) [images addObject:[NSString stringWithFormat:
-                @"%@ row=%@ imageSize=%@ scale=%.2f mode=%ld alignInsets=%@", GXKToolbarDiagnosticIdentity(view),
-                NSStringFromCGRect(rect), image ? NSStringFromCGSize(image.size) : @"none",
-                image ? (double)image.scale : 0.0, (long)view.contentMode,
-                image ? NSStringFromUIEdgeInsets(image.alignmentRectInsets) : @"none"]];
-            if (!CGRectIsEmpty(own) && !CGRectIntersectsRect(rect, own)) continue;
-            CGFloat bottom = CGRectGetMaxY(rect), area = rect.size.width * rect.size.height;
-            if (bestArea == 0.0 || bottom > bestBottom + 0.5 ||
-                (fabs(bottom - bestBottom) <= 0.5 && area > bestArea)) {
-                bestBottom = bottom; bestArea = area; *outGlyph = rect;
+            if (images.count < 8) {
+                CALayer *layer = view.layer;
+                CGRect rect = CGRectZero;
+                BOOL valid = GXKToolbarImageRect(view, row, &rect);
+                NSMutableArray<NSString *> *chain = [NSMutableArray array];
+                NSUInteger depth = 0;
+                for (CALayer *ancestor = layer; ancestor && depth++ < 16; ancestor = ancestor.superlayer) {
+                    [chain addObject:[NSString stringWithFormat:@"%@ bounds=%@ position=%@ masks=%d mask=%d hidden=%d opacity=%.2f animated=%d transform=%d",
+                        NSStringFromClass(ancestor.class), NSStringFromCGRect(ancestor.bounds), NSStringFromCGPoint(ancestor.position),
+                        ancestor.masksToBounds, ancestor.mask != nil, ancestor.hidden, (double)ancestor.opacity,
+                        ancestor.animationKeys.count > 0, !CATransform3DIsIdentity(ancestor.transform)]];
+                    if (ancestor == gCurrentVC.view.layer) break;
+                }
+                [images addObject:[NSString stringWithFormat:
+                    @"%@ measured=%d visible=%@ viewRow=%@ imageSize=%@ imageScale=%.2f layer=%@ layerImageAPI=%d gravity=%@ contentsScale=%.2f contentsMatch=%d contentsRect=%@ contentsCenter=%@ capInsets=%@ orientation=%ld\n    %@",
+                    GXKToolbarDiagnosticIdentity(view), valid, NSStringFromCGRect(rect),
+                    NSStringFromCGRect([view convertRect:view.bounds toView:row]), NSStringFromCGSize(image.size), (double)image.scale,
+                    NSStringFromClass(layer.class), [layer respondsToSelector:@selector(image)], layer.contentsGravity,
+                    (double)layer.contentsScale, layer.contents == (__bridge id)image.CGImage,
+                    NSStringFromCGRect(layer.contentsRect), NSStringFromCGRect(layer.contentsCenter),
+                    NSStringFromUIEdgeInsets(image.capInsets), (long)image.imageOrientation, [chain componentsJoinedByString:@"\n    "]]];
             }
-            continue;
         }
-        for (UIView *child in view.subviews.reverseObjectEnumerator) {
+        for (UIView *child in view.subviews) {
             if (pending.count >= GXK_DIAGNOSTIC_MAX_NODES) { truncated = YES; break; }
             [pending addObject:child];
         }
     }
-    truncated = truncated || pending.count > 0;
-    NSString *mode = @"images";
-    if (bestArea == 0.0 && !CGRectIsEmpty(own)) {
-        CGFloat side = MAX(8.0, MIN(own.size.height, 44.0));
-        *outGlyph = CGRectMake(CGRectGetMinX(own), CGRectGetMaxY(own) - side, side, side);
-        mode = @"fallback-square";
-    }
-    return [NSString stringWithFormat:@"mode=%@ visited=%lu truncated=%d images=%lu listed=%lu picked=%@\n  %@",
-            mode, (unsigned long)visited, truncated, (unsigned long)imageCount, (unsigned long)images.count,
+    return [NSString stringWithFormat:@"mode=visible-native-layer measured=%d visited=%lu truncated=%d images=%lu listed=%lu picked=%@\n  %@",
+            measured, (unsigned long)visited, truncated || pending.count > 0, (unsigned long)imageCount, (unsigned long)images.count,
             NSStringFromCGRect(*outGlyph), [images componentsJoinedByString:@"\n  "]];
 }
+
 
 static NSString *GXKToolbarDiagnosticButtons(UIStackView *stack, UIView *root) {
     NSMutableArray<NSString *> *lines = [NSMutableArray array];
@@ -248,7 +242,7 @@ static void GXKToolbarDiagnosticToggle(UIViewController *vc, UIButton *button) {
     if (gToolbarDiagnosticSamples) {
         GXKToolbarDiagnosticStop(vc, @"manual-stop");
         NSString *header = [NSString stringWithFormat:
-            @"GXK toolbar diagnostic v1\niOS=%@ samples=%lu dropped=%lu stop=%@\nCoordinates: UIKit points; root=keyboard root, band/glyph=row space.\nFont pointSize is configured, NOT actual auto-shrunk drawing size.\nFresh glyph uses bounded image-view heuristic, NOT opaque image pixels; truncated=1 is incomplete.\nusedValid checks current identity/tree binding only, NOT geometry freshness.\nusedValid=0 means used geometry is unbound/mismatched; ignore its deltas.\nStart/stop snapshots are immediate; the 0.1 s interval applies to regular refresh reads only.\nrefresh-mask: 1 composing, 2 fast, 4 scan-failed, 8 reuse-resampled, 16 new-resampled, 32 feedback-settle.\nNo input text, key label text, accessibility IDs, disk writes or network uploads.\n",
+            @"GXK toolbar diagnostic v1\niOS=%@ samples=%lu dropped=%lu stop=%@\nCoordinates: UIKit points; root=keyboard root, band/glyph=row space.\nFont pointSize is configured, NOT actual auto-shrunk drawing size.\nFresh glyph uses the shared visible-native-layer measurement, NOT opaque image pixels; truncated=1 is incomplete.\nusedValid checks current identity/tree binding only, NOT geometry freshness.\nusedValid=0 means used geometry is unbound/mismatched; ignore its deltas.\nStart/stop snapshots are immediate; the 0.1 s interval applies to regular refresh reads only.\nrefresh-mask: 1 composing, 2 fast, 4 scan-failed, 8 reuse-resampled, 16 new-resampled, 32 native-content-hidden (also feedback-settle).\nNo input text, key label text, accessibility IDs, disk writes or network uploads.\n",
             [UIDevice currentDevice].systemVersion, (unsigned long)gToolbarDiagnosticSamples.count,
             (unsigned long)gToolbarDiagnosticDropped, gToolbarDiagnosticStopReason ?: @"unknown"];
         [UIPasteboard generalPasteboard].string = [header stringByAppendingString:

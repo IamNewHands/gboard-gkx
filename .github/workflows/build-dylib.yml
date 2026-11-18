@@ -35,6 +35,7 @@ jobs:
             -framework UIKit \
             -framework Foundation \
             -framework CoreGraphics \
+            -framework QuartzCore \
             -o out/libgkx.dylib \
             dylib/gkx.m
           file out/libgkx.dylib

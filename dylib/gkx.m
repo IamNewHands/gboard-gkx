@@ -10,6 +10,7 @@
 // 其余一切界面与输入逻辑均完全保持 Gboard 官方原生！
 
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -440,25 +441,11 @@ static BOOL GXKModelHasNativeActions(id model) {
     return [actions isKindOfClass:[NSArray class]] && actions.count > 0;
 }
 
+#import "native_key_style.h"
+
 static UIFont *GXKNativeActionFont(UIView *key, UIView *root) {
     UIView *body = GXKNineKeyBodyForKey(key, root);
-    if (!body) return [UIFont systemFontOfSize:16.0];
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:body];
-    NSUInteger visited = 0;
-    while (stack.count && visited++ < 300) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        // 只读同布局原生回车文字的字体，不改其标题、外观或行为。
-        if ([v.restorationIdentifier isEqualToString:@"key_pos_9keys_return"] &&
-            [v respondsToSelector:@selector(idToViewDict)]) {
-            NSDictionary *contents = ((id<GXKNativeSoftKeyContent>)v).idToViewDict;
-            UILabel *label = [contents isKindOfClass:[NSDictionary class]] ? contents[@"label"] : nil;
-            if ([label isKindOfClass:[UILabel class]] && label.font) return label.font;
-        }
-        [stack addObjectsFromArray:v.subviews];
-    }
-    // 原包 softkey_9keys_label_blue.nib：Roboto-Regular 16pt；无该字体时用UIKit常规字体。
-    return [UIFont fontWithName:@"Roboto-Regular" size:16.0] ?: [UIFont systemFontOfSize:16.0];
+    return GXKNativeKeyFont(body, root);
 }
 
 static void GXKDetachActionKey(void) {
@@ -552,6 +539,7 @@ static void GXKUpdateToolbar(UIViewController *vc);
 
 static __weak UIStackView *gToolbarStack;
 static __weak UIView *gToolbarRow;
+static __weak UIView *gToolbarHost;
 static __weak UIView *gToolbarLogoView;
 static __weak UIView *gToolbarNineBody;
 static CGRect gToolbarBand;
@@ -561,7 +549,9 @@ static __weak UIView *gToolbarBandCacheRow;
 static __weak UIView *gToolbarBandCacheLogo;
 static CGSize gToolbarBandCacheRowSize;
 static CGRect gToolbarBandCacheLogoFrame;
-static NSUInteger gToolbarBandCacheHiddenCount;
+static CGRect gToolbarBandCacheGlyph;
+static CGRect gToolbarBandCacheRowInRoot;
+static CGRect gToolbarBandCacheRootBounds;
 static NSUInteger gToolbarBandCacheSignature;
 static NSUInteger gToolbarBandCacheEpoch;
 static BOOL gToolbarBandCacheValid;
@@ -569,8 +559,6 @@ static BOOL gToolbarBandCacheHit;
 static CGRect gToolbarBandCacheBand;
 // 挂载、撤走、归还装饰都会改变「谁挡在 band 里」，这些时机自增代次让缓存失效。
 static NSUInteger gToolbarBandEpoch;
-static BOOL gToolbarLogoWasHidden;
-static CGFloat gToolbarLogoWasAlpha = 1.0;
 static BOOL gUpdatingToolbar;
 static GXKToolbarTarget *gToolbarTarget;
 // 本拍工具条要用的字体：取自同键盘原生 UILabel，主题/字号变了跟着变。
@@ -579,12 +567,6 @@ static UIFont *gToolbarFont;
 static __weak UILabel *gToolbarStyleSource;
 static void GXKToolbarDiagnosticBandObserved(UIView *row, UIView *logo, CGRect glyph, CGFloat unclampedTop);
 
-// band 内被工具条盖住的原生图标（九键顶部右侧语音按钮等）：挂载时 alpha=0，撤走时原样归还。
-static NSMutableArray<UIView *> *gToolbarHiddenViews;
-static NSMutableArray<NSNumber *> *gToolbarHiddenAlphas;
-// 同一次挂载、同一 band 内只扫一次装饰：没东西可藏时不该每拍重走 800 个节点。
-static BOOL gToolbarDecorationsScanned;
-static CGRect gToolbarDecorationsBand;
 // 工具条四条几何约束：复用 stack 时先撤旧约束，避免常量层层叠加。
 static NSArray<NSLayoutConstraint *> *gToolbarConstraints;
 // 「全选」记下的文本与时间：紧接着的「剪切」直接作用于同一段内容，不再要求系统选区。
@@ -608,363 +590,39 @@ static void GXKFlashTitle(UIButton *button, NSString *text) {
     });
 }
 
-// G 图标那一格里真正画出来的图形往往只占视图的一小块：GKBHeaderLogoView 经常是整行宽，
-// 彩色 G 只是它内部的一个 UIImageView。band 必须从「图形右缘」起算，用视图右缘会把 left
-// 推到整行之外，宽度不足 200pt，整条工具条就直接不显示了。
-static BOOL GXKToolbarIconSized(CGRect rect) {
-    CGSize size = rect.size;
-    return size.width >= 8.0 && size.height >= 8.0 && size.width <= 64.0 && size.height <= 64.0;
-}
+#import "toolbar_layout.h"
+#import "toolbar_visibility.h"
 
-// 收集 logo 子树里"像图标"的图片矩形。整行宽的底图不算：它会把竖向中心拉到行中间，
-// 文字就跑到 G 图标上一行去了（真机实测：文字比图标高 24pt）。
-static void GXKToolbarGlyphCollect(UIView *view, UIView *base, NSMutableArray<NSValue *> *out) {
-    if (!view || !base || !out) return;
-    for (UIView *sub in view.subviews) {
-        if (sub.isHidden || sub.alpha < 0.05) continue;
-        BOOL draws = [sub isKindOfClass:[UIImageView class]];
-        if (!draws && [sub respondsToSelector:@selector(image)]) {
-            id image = [(id)sub image];
-            draws = [image isKindOfClass:[UIImage class]];
-        }
-        CGRect rect = [sub convertRect:sub.bounds toView:base];
-        if (draws && !CGRectIsEmpty(rect) && GXKToolbarIconSized(rect)) {
-            [out addObject:[NSValue valueWithCGRect:rect]];
-            continue; // 图标子树已经计入，不再往下找。
-        }
-        GXKToolbarGlyphCollect(sub, base, out);
-    }
-}
-
-// 取"用户真正看见的那个 G"：在 logo 子树里挑面积最大的图标级图片矩形。
-// 不能信 logo.frame——它可能是整行容器，也可能比里面的圆形图标偏上一截，
-// 竖向跟着它走，文字就会浮在 G 图标上一行（真机实测差 24pt）。
-// 只取最靠下的那个：徽标、角标、阴影都压在容器上半部，主图形贴底。
-static BOOL GXKToolbarGlyphRect(UIView *view, UIView *base, CGRect *outRect) {
-    if (!view || !base) return NO;
-    CGRect own = [view convertRect:view.bounds toView:base];
-    NSMutableArray<NSValue *> *found = [NSMutableArray array];
-    GXKToolbarGlyphCollect(view, base, found);
-    CGRect best = CGRectZero;
-    CGFloat bestBottom = -CGFLOAT_MAX;
-    CGFloat bestArea = 0.0;
-    for (NSValue *value in found) {
-        CGRect rect = value.CGRectValue;
-        // 只看落在 logo 自己范围内的图形，避免捡到同一行别处的图标。
-        if (!CGRectIsEmpty(own) && !CGRectIntersectsRect(rect, own)) continue;
-        CGFloat bottom = CGRectGetMaxY(rect);
-        CGFloat area = rect.size.width * rect.size.height;
-        // 取「最靠下」的图形，不是面积最大的：logo 容器常是整行高，上面还压着字标、
-        // 阴影、整行底图等更大的图片。按面积挑会把竖向中心拉到容器中部，文字就浮到
-        // G 图标上一行（真机实测差 24~33px）。用户看见的 G 永远贴在容器底部。
-        BOOL better = (bestBottom == -CGFLOAT_MAX) || (bottom > bestBottom + 0.5) ||
-                      (fabs(bottom - bestBottom) <= 0.5 && area > bestArea);
-        if (better) {
-            bestBottom = bottom;
-            bestArea = area;
-            best = rect;
-        }
-    }
-    if (bestArea <= 0.0) {
-        if (CGRectIsEmpty(own)) return NO;
-        // 子树里没有图片（纯绘制图标）：在左下角取一个图标大小的方框贴住容器底边。
-        // 不能退回整行宽的 own：那样 left 会被推到行末，band 宽度不足 200pt，工具条整条消失。
-        CGFloat side = MIN(own.size.height, 44.0);
-        if (side < 8.0) side = 8.0;
-        best = CGRectMake(CGRectGetMinX(own), CGRectGetMaxY(own) - side, side, side);
-    }
-    if (outRect) *outRect = best;
-    return YES;
-}
-
-// 只借 G 图标那一段空白：左右边界各自停在最近一个可见兄弟视图之前。
-// 宁可窄到不显示，也绝不盖住候选栏或右侧功能图标。
-static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outBand) {
-    if (outBand) *outBand = CGRectZero;
-    if (!row || !logo || logo.superview != row) return NO;
-    CGFloat width = row.bounds.size.width;
-    CGFloat height = row.bounds.size.height;
-    CGRect logoRect = logo.frame;
-    // 邻居签名：只读 frame/hidden/alpha，不做可见性上溯，代价是一次很短的循环。
-    NSUInteger signature = row.subviews.count * 2654435761u;
-    for (UIView *sibling in row.subviews) {
-        if (sibling == logo) continue;
-        CGRect sr = sibling.frame;
-        // 先落成有符号再转无符号：负坐标直接转 unsigned 是未定义行为。
-        signature = signature * 31u
-                  + (NSUInteger)(NSInteger)(CGRectGetMinX(sr) * 4.0)
-                  + (NSUInteger)(NSInteger)(CGRectGetMaxX(sr) * 4.0) * 7u
-                  + (NSUInteger)(NSInteger)(CGRectGetMinY(sr) * 4.0) * 13u
-                  + (NSUInteger)(NSInteger)(CGRectGetMaxY(sr) * 4.0) * 17u
-                  + (sibling.isHidden ? 1u : 0u) * 19u
-                  + (NSUInteger)(NSInteger)(sibling.alpha * 100.0) * 23u
-                  + (sibling == gToolbarStack ? 1u : 0u) * 29u;
-    }
-    NSUInteger hiddenCount = gToolbarHiddenViews.count;
-    if (gToolbarBandCacheValid && gToolbarBandCacheRow == row && gToolbarBandCacheLogo == logo &&
-        CGSizeEqualToSize(gToolbarBandCacheRowSize, row.bounds.size) &&
-        CGRectEqualToRect(gToolbarBandCacheLogoFrame, logoRect) &&
-        gToolbarBandCacheHiddenCount == hiddenCount &&
-        gToolbarBandCacheSignature == signature &&
-        gToolbarBandCacheEpoch == gToolbarBandEpoch) {
-        if (outBand) *outBand = gToolbarBandCacheBand;
-        return gToolbarBandCacheHit;
-    }
-    // 用图形矩形而不是 logo 视图矩形：视图常是整行宽，图形只占左边一小块。
-    // 用视图右缘算 left 会把它推到整行之外，band 宽度不足 200pt，工具条整条消失。
-    // 邻居也按图形矩形判左右：视图整行宽时，右侧功能图标会被误判成"在视图里面"，
-    // 右边界就落到行末，工具条会盖住它们。
-    CGRect glyph = logoRect;
-    CGRect glyphInRow = CGRectZero;
-    if (GXKToolbarGlyphRect(logo, row, &glyphInRow)) glyph = glyphInRow;
-    CGFloat left = 0.0;
-    CGFloat right = width;
-    for (UIView *sibling in row.subviews) {
-        if (sibling == logo || sibling == gToolbarStack) continue; // 自己的条不算邻居。
-        if (sibling.isHidden || sibling.alpha < 0.05) continue;
-        if (!GXKKeyIsVisible(sibling, root)) continue;
-        CGRect r = sibling.frame;
-        if (CGRectGetMaxX(r) <= CGRectGetMinX(glyph) + 0.5) {
-            if (CGRectGetMaxX(r) > left) left = CGRectGetMaxX(r);
-        } else if (CGRectGetMinX(r) >= CGRectGetMaxX(glyph) - 0.5) {
-            if (CGRectGetMinX(r) < right) right = CGRectGetMinX(r);
-        }
-    }
-    CGFloat iconRight = CGRectGetMaxX(glyph);
-    if (iconRight > left) left = iconRight + 4.0;
-    // 竖向贴住图形本身：高度取图形高度（拿不到才退整行），垂直居中。
-    // 这样五个字读起来是 G 图标同一行的原生文字，而不是另起一条横带。
-    CGFloat barHeight = glyph.size.height;
-    // 高度至少 28pt：图形本身可能只有 20pt（图标留白），按它做条会挤到字。
-    // 仍以图形中心为准做垂直居中，所以视觉上还是"和 G 同一行"。
-    if (barHeight < 28.0) barHeight = 28.0;
-    if (barHeight > height) barHeight = height;
-    CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;
-    GXKToolbarDiagnosticBandObserved(row, logo, glyph, top); // [DEBUG-toolbar] 只记夹回前的位置。
-    if (top < 0.0) top = 0.0;
-    if (top + barHeight > height) top = MAX(0.0, height - barHeight);
-    // 五个中文按钮最少要 200pt；不够就整条不显示，保持原生。
-    BOOL hit = (right - left >= 200.0);
-    gToolbarBandCacheRow = row;
-    gToolbarBandCacheLogo = logo;
-    gToolbarBandCacheRowSize = row.bounds.size;
-    gToolbarBandCacheLogoFrame = logoRect;
-    gToolbarBandCacheHiddenCount = hiddenCount;
-    gToolbarBandCacheSignature = signature;
-    gToolbarBandCacheEpoch = gToolbarBandEpoch;
-    gToolbarBandCacheValid = YES;
-    gToolbarBandCacheHit = hit;
-    gToolbarBandCacheBand = hit ? CGRectMake(left, top, right - left, barHeight) : CGRectZero;
-    if (outBand) *outBand = gToolbarBandCacheBand;
-    return hit;
-}
-
-// 一次遍历同时判定：可见九键体、是否还有独立可见的 26 键体、G 图标行。
-// 三样缺一就返回 NO，调用方保持原生——宁可不显示工具条，也不猜布局。
-static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIView **outBody, CGRect *outBand) {
-    if (outRow) *outRow = nil;
-    if (outLogo) *outLogo = nil;
-    if (outBody) *outBody = nil;
-    if (outBand) *outBand = CGRectZero;
-    Class nineClass = GXKClassCached(@"GKB9KeysSoftKeyboardView", &gCachedNineKeyClass);
-    Class qwertyClass = GXKClassCached(@"GKBZhQwertySoftKeyboardView", &gCachedQwertyClass);
-    Class logoClass = GXKClassCached(@"GKBHeaderLogoView", &gCachedLogoClass);
-    if (!root || !root.window || !nineClass || !qwertyClass || !logoClass) return NO;
-
-    UIView *body = nil;
-    // G 图标在树里会出现多次（真机实测至少两处：头行一个、候选行一个）。先命中的往往
-    // 不是用户看见的那个，挂错了整条工具条就高出一行。先把候选全收下来，等找到九键体
-    // 再按"离键位最近的那个 G"挑，不靠遍历顺序。
-    NSMutableArray<NSArray *> *logoCandidates = [NSMutableArray array];
-    BOOL qwertyVisible = NO;
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
-    NSUInteger visited = 0;
-    while (stack.count && visited++ < 1500) {
-        UIView *view = stack.lastObject;
-        [stack removeLastObject];
-        // 已绑定的 G 图标在我们挂载期间 alpha 为 0，必须放行，否则每拍都判"找不到 G 行"来回闪。
-        BOOL ownLogo = (view == gToolbarLogoView);
-        if (!ownLogo && (view.isHidden || view.alpha < 0.05)) continue;
-        if (view.window != root.window) continue;
-        if ([view isKindOfClass:nineClass]) {
-            if (!body && GXKKeyIsVisible(view, root)) body = view;
-        } else if ([view isKindOfClass:qwertyClass] && GXKKeyIsVisible(view, root)) {
-            qwertyVisible = YES; // 九键继承 26 键类，所以九键必须走上面那条分支。
-        }
-        if ([view isKindOfClass:logoClass] && (ownLogo || GXKKeyIsVisible(view, root))) {
-            CGRect glyph = CGRectZero;
-            if (!GXKToolbarGlyphRect(view, root, &glyph) || CGRectIsEmpty(glyph)) {
-                glyph = [view convertRect:view.bounds toView:root]; // 拿不到图片就退回视图自身。
-            }
-            if (!CGRectIsEmpty(glyph)) {
-                [logoCandidates addObject:@[view, [NSValue valueWithCGRect:glyph]]];
-            }
-        }
-        [stack addObjectsFromArray:view.subviews];
-    }
-    if (!body || qwertyVisible || !logoCandidates.count) return NO;
-
-    // 挑"落在九键体正上方、离它最近"的那个 G：工具栏必须和键位同一条竖线，不能高一行。
-    CGRect bodyRect = [body convertRect:body.bounds toView:root];
-    UIView *logo = nil;
-    CGFloat bestGap = CGFLOAT_MAX;
-    CGFloat bestBottom = -CGFLOAT_MAX;
-    for (NSArray *entry in logoCandidates) {
-        UIView *candidate = entry[0];
-        CGRect glyph = [entry[1] CGRectValue];
-        CGFloat gap = CGRectGetMinY(bodyRect) - CGRectGetMaxY(glyph);
-        if (gap < -8.0) gap = -8.0; // 压进键位体里的不算更近，但也不排除。
-        BOOL better = (!logo || gap < bestGap - 0.5) ||
-                      (fabs(gap - bestGap) <= 0.5 && CGRectGetMaxY(glyph) > bestBottom);
-        if (better) {
-            logo = candidate;
-            bestGap = gap;
-            bestBottom = CGRectGetMaxY(glyph);
-        }
-    }
-    if (!logo) return NO;
-
-    UIView *row = logo.superview;
-    if (!row || row == root || !GXKKeyIsVisible(row, root)) return NO;
-    CGSize size = row.bounds.size;
-    if (size.width < 100 || size.height < 18 || size.height > 110) return NO;
-
-    CGRect band = CGRectZero;
-    if (!GXKToolbarBand(row, logo, root, &band)) return NO;
-
-    if (outRow) *outRow = row;
-    if (outLogo) *outLogo = logo;
-    if (outBody) *outBody = body;
-    if (outBand) *outBand = band;
-    return YES;
-}
-
-// 文字色与字体都取同键盘原生键帽的 UILabel：Gboard 主题可能与系统外观不一致，
-// 字号也会随主题变（原生键帽是 Roboto 16pt）。只固定 13pt 会被一眼看出是外挂，
-// 所以一次遍历同时拿颜色与字体，不额外多走一遍 800 节点。
+// Identified native key owns font; a verified current icon owns neutral theme tint.
 static UIColor *GXKToolbarTextStyle(UIView *body, UIFont **outFont) {
-    if (outFont) { *outFont = nil; gToolbarStyleSource = nil; } // [DEBUG-toolbar]
-    if (body) {
-        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:body];
-        NSUInteger visited = 0;
-        while (stack.count && visited++ < 800) {
-            UIView *view = stack.lastObject;
-            [stack removeLastObject];
-            if (view.isHidden || view.alpha < 0.05) continue;
-            if ([view isKindOfClass:[UILabel class]]) {
-                UILabel *label = (UILabel *)view;
-                UIColor *color = label.textColor;
-                if ([color isKindOfClass:[UIColor class]]) {
-                    if (outFont && [label.font isKindOfClass:[UIFont class]]) {
-                        *outFont = label.font;
-                        gToolbarStyleSource = label; // [DEBUG-toolbar] 与真实取样同点，不另扫树。
-                    }
-                    return color;
-                }
-            }
-            [stack addObjectsFromArray:view.subviews];
-        }
+    UIView *root = gCurrentVC.isViewLoaded ? gCurrentVC.view : nil;
+    UILabel *label = GXKNativeKeyStyleLabel(body, root);
+    if (outFont) {
+        *outFont = label.font ?: GXKNativeKeyFont(body, root);
+        gToolbarStyleSource = label;
     }
+    if (body && GXKNineKeyBodyForKey(gEmojiSoftKeyView, root) == body &&
+        GXKKeyIsVisible(gEmojiSoftKeyView, root) && GXKNativeIconForKey(gEmojiSoftKeyView) == gActionNativeIcon) {
+        UIColor *color = gActionNativeIcon.foregroundColor;
+        if ([color isKindOfClass:[UIColor class]]) return color;
+    }
+    if ([label.textColor isKindOfClass:[UIColor class]]) return label.textColor;
     if (@available(iOS 13.0, *)) return [UIColor labelColor];
-    return [UIColor darkGrayColor]; // 部署目标 12.0：labelColor 不可用。
+    return [UIColor darkGrayColor];
 }
 
 static UIColor *GXKToolbarTint(UIView *body) {
     return GXKToolbarTextStyle(body, NULL);
 }
 
-// [DEBUG-toolbar] 临时诊断单独归属；确认字号/对齐原因后随本组接线一起移除。
+// [DEBUG-toolbar] 默认关闭；保留到修复包完成真机字体/对齐/点击验证，随后撤掉诊断接线。
 #import "toolbar_diagnostics.h"
-
-static void GXKRestoreToolbarDecorations(void) {
-    for (NSUInteger i = 0; i < gToolbarHiddenViews.count; i++) {
-        UIView *view = gToolbarHiddenViews[i];
-        if (i < gToolbarHiddenAlphas.count) view.alpha = gToolbarHiddenAlphas[i].doubleValue;
-    }
-    [gToolbarHiddenViews removeAllObjects];
-    [gToolbarHiddenAlphas removeAllObjects];
-    gToolbarDecorationsScanned = NO;
-    gToolbarDecorationsBand = CGRectZero;
-    gToolbarBandEpoch++; // 装饰归还后 band 的可见邻居变了，缓存必须失效。
-    gToolbarBandCacheValid = NO;
-}
-
-static BOOL GXKViewHasImage(UIView *view) {
-    if ([view isKindOfClass:[UIImageView class]]) return YES;
-    for (UIView *sub in view.subviews) {
-        if (GXKViewHasImage(sub)) return YES;
-    }
-    return NO;
-}
-
-// 工具条只借 band，但 band 里仍可能浮着原生装饰图标（九键顶部右侧那个语音按钮就是：
-// 它的祖先空尺寸、不裁剪，几何上逃过 band 计算，视觉上却压在按钮文字上）。
-// 这里只挑「图标尺寸 + 含图片 + 与 band 相交」的视图隐藏，命中即整块子树让位；
-// 文本、候选词、键帽都不满足这些条件，不会被误伤。撤走工具条时原样归还。
-static NSUInteger GXKHideToolbarDecorations(UIView *row, UIView *logo, UIView *root, CGRect band) {
-    if (!row || !logo || CGRectIsEmpty(band)) return 0;
-    if (!gToolbarHiddenViews) gToolbarHiddenViews = [NSMutableArray array];
-    if (!gToolbarHiddenAlphas) gToolbarHiddenAlphas = [NSMutableArray array];
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:row];
-    NSUInteger visited = 0;
-    while (stack.count && visited++ < 800) {
-        UIView *view = stack.lastObject;
-        [stack removeLastObject];
-        if (view == row) {
-            [stack addObjectsFromArray:view.subviews];
-            continue;
-        }
-        if (view == logo || [view isDescendantOfView:logo] || [logo isDescendantOfView:view]) continue;
-        if (view == gToolbarStack || [view isDescendantOfView:gToolbarStack]) continue;
-        if (view.isHidden || view.alpha < 0.05) continue;
-        CGRect rect = [view convertRect:view.bounds toView:row];
-        CGSize size = rect.size;
-        BOOL iconSized = size.width >= 8.0 && size.height >= 8.0 && size.width <= 64.0 && size.height <= 64.0;
-        if (!iconSized || CGRectIsEmpty(CGRectIntersection(rect, band))) {
-            [stack addObjectsFromArray:view.subviews];
-            continue;
-        }
-        if (!GXKViewHasImage(view)) {
-            [stack addObjectsFromArray:view.subviews];
-            continue;
-        }
-        [gToolbarHiddenViews addObject:view];
-        [gToolbarHiddenAlphas addObject:@(view.alpha)];
-        view.alpha = 0.0; // 整块子树已让位，不再向下找。
-    }
-    if (gToolbarHiddenViews.count) {
-        GXK_LOG(@"工具条: 让位原生图标 %lu 个", (unsigned long)gToolbarHiddenViews.count);
-    }
-    return gToolbarHiddenViews.count;
-}
-
-// 组字中工具条整条让位，这时必须把让位的原生图标还回去：否则拼音栏会缺一个按钮。
-static void GXKSyncToolbarDecorations(BOOL composing) {
-    if (composing) {
-        GXKRestoreToolbarDecorations();
-        return;
-    }
-    UIView *row = gToolbarRow;
-    UIView *logo = gToolbarLogoView;
-    UIViewController *vc = gCurrentVC;
-    UIView *root = (vc && vc.isViewLoaded) ? vc.view : nil;
-    if (!row || !logo || !root) return;
-    if (gToolbarHiddenViews.count == 0) {
-        // 已按同一 band 扫过且没有可藏对象：不再每拍重走一遍 800 个节点。
-        if (gToolbarDecorationsScanned && CGRectEqualToRect(gToolbarDecorationsBand, gToolbarBand)) return;
-        gToolbarDecorationsScanned = YES;
-        gToolbarDecorationsBand = gToolbarBand;
-        GXKHideToolbarDecorations(row, logo, root, gToolbarBand);
-    }
-}
 
 static void GXKDetachToolbar(void) {
     UIStackView *stack = gToolbarStack;
-    UIView *logo = gToolbarLogoView;
-    BOOL logoWasHidden = gToolbarLogoWasHidden;
-    CGFloat logoWasAlpha = gToolbarLogoWasAlpha;
     gToolbarStack = nil;
     gToolbarRow = nil;
+    gToolbarHost = nil;
     gToolbarLogoView = nil;
     gToolbarNineBody = nil;
     gToolbarBand = CGRectZero;
@@ -975,11 +633,7 @@ static void GXKDetachToolbar(void) {
         [NSLayoutConstraint deactivateConstraints:gToolbarConstraints];
         gToolbarConstraints = nil;
     }
-    GXKRestoreToolbarDecorations();
-    if (logo) {
-        logo.hidden = logoWasHidden; // G 图标按原状态归还，不替用户决定隐藏。
-        logo.alpha = logoWasAlpha;
-    }
+    gToolbarObstacleComplete = NO;
 }
 
 // 工具条按钮：只在右侧画一条细分割线，让五个格子读起来像原生分栏，而不是五段浮空文字。
@@ -1048,126 +702,90 @@ static UIStackView *GXKMakeToolbar(UIView *row, UIColor *tint) {
     return stack;
 }
 
+static void GXKSyncToolbarStyle(UIView *body) {
+    UIFont *font = nil;
+    UIColor *tint = GXKToolbarTextStyle(body, &font);
+    gToolbarFont = font;
+    for (UIView *view in gToolbarStack.arrangedSubviews) {
+        if (![view isKindOfClass:[UIButton class]]) continue;
+        UIButton *button = (UIButton *)view;
+        if (![button.titleLabel.font isEqual:font]) button.titleLabel.font = font;
+        if (![[button titleColorForState:UIControlStateNormal] isEqual:tint]) {
+            [button setTitleColor:tint forState:UIControlStateNormal];
+            [button setTitleColor:[tint colorWithAlphaComponent:0.45] forState:UIControlStateHighlighted];
+        }
+        if ([button isKindOfClass:[GXKToolbarButton class]])
+            ((GXKToolbarButton *)button).gxkDivider.backgroundColor = [tint colorWithAlphaComponent:0.18];
+    }
+}
+
 static void GXKUpdateToolbar(UIViewController *vc) {
     if (gUpdatingToolbar || !vc || vc != gCurrentVC || !vc.isViewLoaded) return;
     gUpdatingToolbar = YES;
     UIView *root = vc.view;
     BOOL composing = GXKComposingStateCached(vc);
-
-    // 廉价路径：绑定仍有效且空位没变时只同步显隐，不做全树定位、不改几何。
-    if (gToolbarStack && gToolbarRow && gToolbarLogoView && gToolbarRow.window &&
-        gToolbarRow.window == root.window && [gToolbarRow isDescendantOfView:root] &&
-        GXKKeyIsVisible(gToolbarRow, root)) {
-        GXKSyncToolbarDecorations(composing);
-        // 组字中工具条整体隐藏，band 已还原成原生宽度，这时不必也不该按 band 重挂。
-        if (composing) {
-            UIStackView *stack = gToolbarStack;
-            if (stack.superview != gToolbarRow) [gToolbarRow addSubview:stack];
-            if (!stack.hidden) stack.hidden = YES;
-            GXKToolbarDiagnosticRequest(vc, @"composing-hidden"); // [DEBUG-toolbar]
+    BOOL bound = gToolbarStack && gToolbarHost == root && gToolbarStack.superview == root &&
+                 gToolbarRow && gToolbarLogoView.superview == gToolbarRow &&
+                 GXKKeyIsVisible(gToolbarLogoView, root) && GXKKeyIsVisible(gToolbarRow, root) && GXKKeyIsVisible(gToolbarNineBody, root);
+    if (bound) {
+        GXKSyncToolbarStyle(gToolbarNineBody);
+        CGRect band = CGRectZero;
+        BOOL measured = GXKToolbarBand(gToolbarRow, gToolbarLogoView, root, &band);
+        CGRect hostBand = measured ? [gToolbarRow convertRect:band toView:root] : CGRectZero;
+        BOOL clear = measured && GXKToolbarNativeSpaceClear(root, gToolbarLogoView, hostBand);
+        if (composing || !clear) {
+            gToolbarStack.hidden = YES;
+            GXKToolbarDiagnosticRequest(vc, composing ? @"composing-hidden" : @"native-content-hidden");
             gUpdatingToolbar = NO;
             return;
         }
-        CGRect band = CGRectZero;
-        if (GXKToolbarBand(gToolbarRow, gToolbarLogoView, root, &band) &&
-            fabs(band.origin.x - gToolbarBand.origin.x) < 0.5 &&
-            fabs(band.size.width - gToolbarBand.size.width) < 0.5 &&
-            fabs(band.origin.y - gToolbarBand.origin.y) < 0.5 &&
-            fabs(band.size.height - gToolbarBand.size.height) < 0.5) {
-            UIStackView *stack = gToolbarStack;
-            if (stack.superview != gToolbarRow) [gToolbarRow addSubview:stack];
-            if (stack.hidden) stack.hidden = NO;
-            GXKToolbarDiagnosticRequest(vc, @"fast-unchanged"); // [DEBUG-toolbar]
+        if (CGRectEqualToRect(band, gToolbarBand) && CGRectEqualToRect(hostBand, gToolbarStack.frame)) {
+            gToolbarStack.hidden = NO;
+            if (root.subviews.lastObject != gToolbarStack) [root bringSubviewToFront:gToolbarStack];
+            GXKToolbarDiagnosticRequest(vc, @"fast-unchanged");
             gUpdatingToolbar = NO;
             return;
         }
     }
-
-    UIView *row = nil;
-    UIView *logo = nil;
-    UIView *body = nil;
+    UIView *row = nil, *logo = nil, *body = nil;
     CGRect band = CGRectZero;
     if (!GXKToolbarScan(root, &row, &logo, &body, &band)) {
-        static int logged = 0;
-        if (logged < 3) { logged++; GXK_LOG(@"工具条: 无可用空位，保持原生（第 %d 次）", logged); }
-        GXKDetachToolbar(); // 26 键、未知布局、找不到 G 行、空位不足：完全保持原生，绝不撑高键盘。
-        GXKToolbarDiagnosticRequest(vc, @"scan-failed"); // [DEBUG-toolbar]
+        GXKDetachToolbar();
+        GXKToolbarDiagnosticRequest(vc, @"scan-failed");
         gUpdatingToolbar = NO;
         return;
     }
-
-    // 同一个宿主行（G 图标行）没变时复用现有 stack 与 5 个按钮：
-    // 只是空位宽度变了（旋转、主题、候选栏出现），没必要把整条视图重建一遍。
-    BOOL reuse = (gToolbarStack && gToolbarRow == row && gToolbarLogoView == logo &&
-                  gToolbarStack.superview == row);
-    if (!reuse) {
-        GXKDetachToolbar();
-        // 先让 band 内的原生图标（语音按钮等）让位，再按新的可见性重算空位：
-        // 被藏掉的邻居不再挡路，五个按钮能分到更多宽度，也不会再被压在下面。
-        if (!composing && GXKHideToolbarDecorations(row, logo, root, band) > 0) {
-            CGRect widened = CGRectZero;
-            if (GXKToolbarBand(row, logo, root, &widened) && widened.size.width > band.size.width) band = widened;
-        }
-    } else if (!composing && gToolbarHiddenViews.count == 0 &&
-               GXKHideToolbarDecorations(row, logo, root, band) > 0) {
-        CGRect widened = CGRectZero;
-        if (GXKToolbarBand(row, logo, root, &widened) && widened.size.width > band.size.width) band = widened;
-    }
+    CGRect hostBand = [row convertRect:band toView:root];
+    BOOL clear = GXKToolbarNativeSpaceClear(root, logo, hostBand);
+    BOOL reuse = gToolbarStack && gToolbarRow == row && gToolbarLogoView == logo &&
+                 gToolbarHost == root && gToolbarStack.superview == root;
+    if (!reuse) GXKDetachToolbar();
     if (!gToolbarTarget) gToolbarTarget = [[GXKToolbarTarget alloc] init];
     gToolbarTarget.controller = vc;
-
-    UIFont *nativeFont = nil;
-    UIColor *tint = GXKToolbarTextStyle(body, &nativeFont);
-    gToolbarFont = nativeFont;
-    UIStackView *stack = reuse ? gToolbarStack : GXKMakeToolbar(row, tint);
-    if (reuse) {
-        // 复用只同步配色：文字、字体、target 都没变，无需重设。
-        stack.backgroundColor = [UIColor clearColor];
-        for (UIView *arranged in stack.arrangedSubviews) {
-            if (![arranged isKindOfClass:[UIButton class]]) continue;
-            UIButton *button = (UIButton *)arranged;
-            [button setTitleColor:tint forState:UIControlStateNormal];
-            [button setTitleColor:[tint colorWithAlphaComponent:0.45] forState:UIControlStateHighlighted];
-            // 主题切换会换字体，复用路径也要同步，否则文字仍停在上一套字号。
-            if (gToolbarFont && ![button.titleLabel.font isEqual:gToolbarFont]) {
-                button.titleLabel.font = gToolbarFont;
-            }
-            if ([button isKindOfClass:[GXKToolbarButton class]]) {
-                GXKToolbarButton *ours = (GXKToolbarButton *)button;
-                ours.gxkDivider.backgroundColor = [tint colorWithAlphaComponent:0.18];
-            }
-        }
-    }
+    UIFont *font = nil;
+    UIColor *tint = GXKToolbarTextStyle(body, &font);
+    gToolbarFont = font;
+    UIStackView *stack = reuse ? gToolbarStack : GXKMakeToolbar(root, tint);
+    stack.backgroundColor = [UIColor clearColor];
     gToolbarStack = stack;
-    if (!reuse) {
-        gToolbarRow = row;
-        gToolbarLogoView = logo;
-        gToolbarLogoWasHidden = logo.isHidden;
-        gToolbarLogoWasAlpha = logo.alpha;
-    }
+    gToolbarRow = row;
+    gToolbarHost = root;
+    gToolbarLogoView = logo;
     gToolbarNineBody = body;
-    gToolbarBand = band;
-    // G 图标保持原样：band 从它右侧起算，不再需要 alpha 归零。
-    // 归零会把图标底下的圆形底图单独露出来，看着就像"条下面又冒出一个 G"。
-    stack.hidden = composing;
-    if (stack.superview != row) [row addSubview:stack];
-    // 只占 band 那一段：左右各贴住相邻可见兄弟的边界，绝不覆盖同行其它内容。
-    // 复用路径下先撤掉上一轮约束，否则常量会层层叠加。
-    if (gToolbarConstraints) {
-        [NSLayoutConstraint deactivateConstraints:gToolbarConstraints];
-        gToolbarConstraints = nil;
-    }
+    gToolbarBand = band; // Keep row-neighbour and diagnostic coordinates separate from host coordinates.
+    GXKSyncToolbarStyle(body);
+    stack.hidden = composing || !clear;
+    if (stack.superview != root) [root addSubview:stack];
+    if (gToolbarConstraints) [NSLayoutConstraint deactivateConstraints:gToolbarConstraints];
     gToolbarConstraints = @[
-        [stack.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:band.origin.x],
-        [stack.widthAnchor constraintEqualToConstant:band.size.width],
-        [stack.topAnchor constraintEqualToAnchor:row.topAnchor constant:band.origin.y],
-        [stack.heightAnchor constraintEqualToConstant:band.size.height],
+        [stack.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:hostBand.origin.x - root.bounds.origin.x],
+        [stack.widthAnchor constraintEqualToConstant:hostBand.size.width],
+        [stack.topAnchor constraintEqualToAnchor:root.topAnchor constant:hostBand.origin.y - root.bounds.origin.y],
+        [stack.heightAnchor constraintEqualToConstant:hostBand.size.height],
     ];
     [NSLayoutConstraint activateConstraints:gToolbarConstraints];
-    [row bringSubviewToFront:stack];
-    GXK_LOG(@"工具条: 宿主 %@ %.0fx%.0f 空位 %.0f@%.0f", NSStringFromClass(row.class),
-            row.bounds.size.width, row.bounds.size.height, band.size.width, band.origin.x);
-    GXKToolbarDiagnosticRequest(vc, reuse ? @"reuse-resampled" : @"new-resampled"); // [DEBUG-toolbar]
+    [root bringSubviewToFront:stack];
+    GXKToolbarDiagnosticRequest(vc, reuse ? @"reuse-resampled" : @"new-resampled");
     gUpdatingToolbar = NO;
 }
 
@@ -1402,6 +1020,8 @@ static void GXKUpdateActionKey(UIViewController *vc) {
             [cheapBtn setTitleColor:cheapColor forState:UIControlStateNormal];
             [cheapBtn setTitleColor:cheapColor forState:UIControlStateHighlighted];
         }
+        UIFont *cheapFont = GXKNativeActionFont(gEmojiSoftKeyView, root);
+        if (![cheapBtn.titleLabel.font isEqual:cheapFont]) cheapBtn.titleLabel.font = cheapFont;
         NSString *cheapTitle = GXKComposingStateCached(vc) ? @"重输" : @"换行";
         if (![[cheapBtn titleForState:UIControlStateNormal] isEqualToString:cheapTitle]) {
             [cheapBtn setTitle:cheapTitle forState:UIControlStateNormal];
@@ -1519,6 +1139,7 @@ static NSString *GXKPickerItemIdentifier(id item);
 
 static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
     if (gOrigTextDidChange) gOrigTextDidChange(self, _cmd, textInput);
+    gToolbarContentEpoch++;
     __weak UIViewController *weakVC = (UIViewController *)self;
     // 同一帧内可能连来多次文本回调：只让最后一次真正刷新，前面排队的直接丢弃。
     // 否则一次按键就能排出好几轮全量刷新，主线程被重复工作占满。
@@ -1542,6 +1163,7 @@ static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
 static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
     if (gOrigViewDidLayoutSubviews) gOrigViewDidLayoutSubviews(self, _cmd);
     if ((UIViewController *)self != gCurrentVC) return;
+    gToolbarContentEpoch++;
     // 布局回调一帧内可能来几十次（任何 setNeedsLayout 都会触发）：
     // 合并成一次异步刷新，只保留最后一次，避免同一帧反复全量重算。
     static NSUInteger gLayoutSeq;
@@ -1562,6 +1184,8 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
         GXKDetachActionKey();
         GXKDetachToolbar();
     }
+    if (gCurrentVC != (UIViewController *)self) GXKResetNativeKeyStyle();
+    gToolbarContentEpoch++;
     gCurrentVC = (UIViewController *)self;
     GXKRefreshComposingState((UIViewController *)self); // 新会话先取一次真实组字状态。
     GXKApplyTelemetryBlockIfNeeded(); // 兜底：构造函数时framework若未就绪，这里补一次。
@@ -1582,6 +1206,11 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
     // 先撤销当前绑定，原生生命周期引起的布局/异步事件不得重建旧按钮。
     if ((UIViewController *)self == gCurrentVC) {
         GXKToolbarDiagnosticStop((UIViewController *)self, @"keyboard-disappear"); // [DEBUG-toolbar]
+        GXKResetNativeKeyStyle();
+        gToolbarObstacleRoot = nil;
+        gToolbarObstacles = nil;
+        gToolbarKeyboardBodies = nil;
+        gToolbarObstacleComplete = NO;
         gCurrentVC = nil;
         gComposingActive = NO; // 扩展隐藏后组字缓存作废，下次出现重新采样。
         GXKStopPolling();

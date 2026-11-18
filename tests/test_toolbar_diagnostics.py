@@ -26,6 +26,7 @@ class ToolbarDiagnosticContracts(unittest.TestCase):
     def setUpClass(cls):
         cls.main = (ROOT / "dylib/gkx.m").read_text(encoding="utf-8")
         cls.diag = (ROOT / "dylib/toolbar_diagnostics.h").read_text(encoding="utf-8")
+        cls.layout = (ROOT / "dylib/toolbar_layout.h").read_text(encoding="utf-8")
         cls.code = re.sub(r"//[^\n]*", "", cls.diag)
 
     def body(self, name):
@@ -39,17 +40,65 @@ class ToolbarDiagnosticContracts(unittest.TestCase):
     def test_actual_style_selection_records_weak_source_without_new_scan(self):
         self.assertIn("static __weak UILabel *gToolbarStyleSource;", self.main)
         style = function_body(self.main, "static UIColor *GXKToolbarTextStyle")
-        self.assertIn("if (outFont) { *outFont = nil; gToolbarStyleSource = nil; }", style)
-        self.assertRegex(style, r"\*outFont = label\.font;\s*gToolbarStyleSource = label;")
+        self.assertIn("UILabel *label = GXKNativeKeyStyleLabel(body, root);", style)
+        self.assertRegex(style, r"\*outFont = label\.font \?: GXKNativeKeyFont\(body, root\);\s*gToolbarStyleSource = label;")
+        self.assertNotIn("arrayWithObject:", style)
         self.assertNotIn("GXKToolbarTextStyle(", self.code)
 
-    def test_band_observer_precedes_clamp_without_changing_band_math(self):
-        band = function_body(self.main, "static BOOL GXKToolbarBand(UIView")
-        self.assertLess(band.index("GXKToolbarDiagnosticBandObserved"), band.index("if (top < 0.0)"))
-        for expression in ("barHeight < 28.0", "barHeight > height", "right - left >= 200.0"):
+    def test_band_observer_records_unclamped_measured_geometry_without_owning_math(self):
+        band = function_body(self.layout, "static BOOL GXKToolbarBand(")
+        observed = band.index("GXKToolbarDiagnosticBandObserved(row, logo, glyph, top)")
+        self.assertLess(band.index("CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;"), observed)
+        self.assertLess(observed, band.index("CGRect candidate = CGRectMake(left, top, right - left, barHeight)"))
+        for expression in ("barHeight < 28.0", "right - left >= 200.0", "CGRectContainsRect(root.bounds, candidateInRoot)"):
             self.assertIn(expression, band)
-        self.assertIn("gToolbarDiagnosticBandRow", self.diag)
+        self.assertNotIn("barHeight > height", band)
+        self.assertNotIn("if (top < 0.0)", band)
+        observer = self.body("static void GXKToolbarDiagnosticBandObserved")
+        for value in ("gToolbarDiagnosticBandRow = row;", "gToolbarDiagnosticBandLogo = logo;",
+                      "gToolbarDiagnosticUsedGlyph = glyph;", "gToolbarDiagnosticUnclampedTop = unclampedTop;"):
+            self.assertIn(value, observer)
+        self.assertNotIn("GXKToolbarGlyphRect(", observer)
         self.assertIn("usedValid=", self.diag)
+
+    def test_glyph_anchor_reuses_layout_owner_without_local_fallback(self):
+        glyph = self.body("static NSString *GXKToolbarDiagnosticGlyph")
+        self.assertIn("if (!logo || !row || logo.superview != row)", glyph)
+        self.assertIn("BOOL measured = GXKToolbarGlyphRect(logo, row, outGlyph);", glyph)
+        self.assertLess(glyph.index("GXKToolbarGlyphRect(logo, row, outGlyph)"),
+                        glyph.index("while (pending.count"))
+        self.assertIn("BOOL valid = GXKToolbarImageRect(view, row, &rect);", glyph)
+        self.assertIn("mode=visible-native-layer measured=%d", glyph)
+        self.assertIn("NSStringFromCGRect(*outGlyph)", glyph)
+        # Detail may describe view bounds, but cannot replace the owner's picked geometry.
+        self.assertEqual(["*outGlyph = CGRectZero;"], re.findall(r"\*outGlyph\s*=[^;]*;", glyph))
+        for retired in ("fallback-square", "contentMode", "bestBottom", "bestArea", "CGRectMake(", "alignmentRectInsets"):
+            self.assertNotIn(retired, glyph)
+
+    def test_layer_evidence_is_bounded_current_and_preserves_original_contents_identity(self):
+        glyph = self.body("static NSString *GXKToolbarDiagnosticGlyph")
+        self.assertIn("[image isKindOfClass:[UIImage class]]", glyph)
+        self.assertIn("CALayer *layer = view.layer;", glyph)
+        self.assertRegex(glyph, r"for \(CALayer \*ancestor = layer; ancestor && depth\+\+ < 16; ancestor = ancestor\.superlayer\)")
+        self.assertIn("if (ancestor == gCurrentVC.view.layer) break;", glyph)
+        for evidence in ("layer.contentsGravity", "layer.contentsScale", "layer.contents == (__bridge id)image.CGImage",
+                         "layer.contentsRect", "layer.contentsCenter", "image.capInsets", "image.imageOrientation",
+                         "ancestor.bounds", "ancestor.position", "ancestor.masksToBounds", "ancestor.mask != nil",
+                         "ancestor.hidden", "ancestor.opacity", "ancestor.animationKeys.count > 0",
+                         "CATransform3DIsIdentity(ancestor.transform)"):
+            self.assertIn(evidence, glyph)
+        for field in ("visible=", "viewRow=", "layerImageAPI=", "gravity=", "contentsScale=", "contentsMatch=",
+                      "contentsRect=", "contentsCenter=", "capInsets=", "orientation=", "masks=", "animated="):
+            self.assertIn(field, glyph)
+
+    def test_shared_measurement_and_layer_detail_remain_read_only(self):
+        glyph = self.body("static NSString *GXKToolbarDiagnosticGlyph")
+        for forbidden in ("setImage:", "setContents:", "setOpacity:", "addSublayer:", "removeFromSuperlayer",
+                          "renderInContext:", "UIGraphics", "CGContext", "CGImageCreate", "GXKToolbarBand(",
+                          "GXKNativeKeyFont(", "GXKToolbarNativeSpaceClear(", "GXKUpdateToolbar("):
+            self.assertNotIn(forbidden, glyph)
+        self.assertNotRegex(glyph, r"\.(?:image|contents|contentsScale|contentsGravity|contentsRect|contentsCenter|"
+                           r"mask|masksToBounds|hidden|opacity|bounds|position|transform|sublayerTransform)\s*=(?!=)")
 
     def test_used_geometry_requires_current_tree_binding_not_freshness(self):
         snapshot = self.body("static NSString *GXKToolbarDiagnosticSnapshot")
@@ -73,7 +122,7 @@ class ToolbarDiagnosticContracts(unittest.TestCase):
 
     def test_all_refresh_results_request_diagnostics(self):
         update = function_body(self.main, "static void GXKUpdateToolbar(UIViewController *vc) {")
-        for reason in ("composing-hidden", "fast-unchanged", "scan-failed", "reuse-resampled", "new-resampled"):
+        for reason in ("composing-hidden", "native-content-hidden", "fast-unchanged", "scan-failed", "reuse-resampled", "new-resampled"):
             self.assertIn('@"' + reason + '"', update)
 
     def test_disabled_capture_returns_before_expensive_reads(self):
@@ -83,6 +132,9 @@ class ToolbarDiagnosticContracts(unittest.TestCase):
         self.assertLess(capture.index("!gToolbarDiagnosticActive"), capture.index("GXKToolbarDiagnosticSnapshot"))
         self.assertNotIn("NSTimer", self.code)
         self.assertNotIn("GXKComposingFullScan", self.code)
+        for production_owner in ("GXKNativeKeyStyleLabel(", "GXKNativeKeyFont(", "GXKToolbarNativeSpaceClear(",
+                                 "GXKToolbarBand(", "GXKUpdateToolbar("):
+            self.assertNotIn(production_owner, self.code)
 
     def test_delayed_reads_are_coalesced_and_generation_guarded(self):
         request = self.body("static void GXKToolbarDiagnosticRequest")
@@ -97,7 +149,7 @@ class ToolbarDiagnosticContracts(unittest.TestCase):
         for define in ("SECONDS 60.0", "INTERVAL 0.10", "MAX_SAMPLES 80", "MAX_CHARS 196608", "MAX_NODES 128"):
             self.assertIn("GXK_DIAGNOSTIC_" + define, self.diag)
         glyph = self.body("static NSString *GXKToolbarDiagnosticGlyph")
-        self.assertIn("visited < GXK_DIAGNOSTIC_MAX_NODES", glyph)
+        self.assertRegex(glyph, r"visited(?:\+\+)? < GXK_DIAGNOSTIC_MAX_NODES")
         self.assertIn("pending.count >= GXK_DIAGNOSTIC_MAX_NODES", glyph)
         self.assertIn("images.count < 8", glyph)
         self.assertIn("truncated=%d", glyph)

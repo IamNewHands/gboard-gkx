@@ -29,6 +29,7 @@ class ActionKeySourceContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = SOURCE.read_text(encoding="utf-8")
+        cls.native_style = (ROOT / "dylib/native_key_style.h").read_text(encoding="utf-8")
 
     def test_newline_is_a_newline_not_backslash_n(self):
         self.assertIn('[proxy insertText:@"\\n"]', self.source)
@@ -182,9 +183,70 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertNotIn("gActionNormalImage", fresh)
         self.assertNotIn("gActionHighlightedImage", fresh)
 
-    def test_font_lookup_does_not_construct_array_with_nil_owner(self):
-        font = function_body(self.source, "static UIFont *GXKNativeActionFont(UIView *key, UIView *root)")
-        self.assertLess(font.index("if (!body) return"), font.index("arrayWithObject:body"))
+    def test_action_and_toolbar_fonts_share_identified_native_key_owner(self):
+        self.assertIn('#import "native_key_style.h"', self.source)
+        font = function_body(self.source, "static UIFont *GXKNativeActionFont(")
+        self.assertIn("GXKNineKeyBodyForKey(key, root)", font)
+        self.assertIn("return GXKNativeKeyFont(body, root);", font)
+        self.assertNotIn("arrayWithObject:", font)
+        toolbar = function_body(self.source, "static UIColor *GXKToolbarTextStyle(")
+        self.assertIn("GXKNativeKeyStyleLabel(body, root)", toolbar)
+        self.assertIn("label.font ?: GXKNativeKeyFont(body, root)", toolbar)
+        self.assertNotIn("arrayWithObject:", toolbar)
+
+    def test_native_typography_owner_is_return_key_dictionary_label_not_candidate(self):
+        label = function_body(self.native_style, "static UILabel *GXKNativeReturnLabel(")
+        for required in ('key.restorationIdentifier isEqualToString:@"key_pos_9keys_return"',
+                         "isKindOfClass:keyClass", "isDescendantOfView:body", "GXKKeyIsVisible(key, root)",
+                         "respondsToSelector:@selector(idToViewDict)", 'contents[@"label"]',
+                         "isKindOfClass:[UILabel class]", "isDescendantOfView:key", "isKindOfClass:[UIFont class]"):
+            self.assertIn(required, label)
+        selection = function_body(self.native_style, "static UILabel *GXKNativeKeyStyleLabel(")
+        self.assertIn("GXKNativeReturnLabel(view, body, root)", selection)
+        self.assertIn("if (candidate && candidate != view) return nil;", selection)
+        self.assertIn("if ([view isKindOfClass:[UICollectionView class]]) continue;", selection)
+        self.assertIn("if (pending.count || !selected) return nil;", selection)
+        self.assertLess(selection.index("if (!body || !root"), selection.index("arrayWithObject:body"))
+        self.assertNotRegex(selection, r"(?:label|view)\.text(?:\b|\.)")
+
+    def test_native_font_cache_revalidates_key_and_label_before_throttled_discovery(self):
+        for weak in ("static __weak UIView *gNativeStyleBody;", "static __weak UIView *gNativeStyleKey;",
+                     "static __weak UILabel *gNativeStyleLabel;"):
+            self.assertIn(weak, self.native_style)
+        selection = function_body(self.native_style, "static UILabel *GXKNativeKeyStyleLabel(")
+        live = selection.index("GXKNativeReturnLabel(gNativeStyleKey, body, root)")
+        reuse = selection.index("gNativeStyleBody == body && live && live == gNativeStyleLabel")
+        throttle = selection.index("now - gNativeStyleScanAt < 0.25")
+        self.assertLess(live, reuse)
+        self.assertLess(reuse, throttle)
+        self.assertIn("visited++ < 300", selection)
+        self.assertIn("gNativeStyleKey = nil;", selection)
+        self.assertIn("gNativeStyleLabel = nil;", selection)
+        font = function_body(self.native_style, "static UIFont *GXKNativeKeyFont(")
+        self.assertIn("GXKNativeKeyStyleLabel(body, root).font", font)
+        self.assertIn('font ?: [UIFont fontWithName:@"Roboto-Regular" size:16.0] ?: [UIFont systemFontOfSize:16.0]', font)
+        self.assertNotIn("systemFontOfSize:22", font)
+        for hook in ("static void gkx_viewWillAppear(", "static void gkx_viewWillDisappear("):
+            self.assertIn("GXKResetNativeKeyStyle();", function_body(self.source, hook))
+        reset = function_body(self.native_style, "static void GXKResetNativeKeyStyle(")
+        for binding in ("gNativeStyleBody = nil;", "gNativeStyleKey = nil;", "gNativeStyleLabel = nil;", "gNativeStyleScanAt = 0;"):
+            self.assertIn(binding, reset)
+
+    def test_both_action_update_paths_resample_native_font_and_keep_both_titles(self):
+        update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
+        fast, full = update.split("UIView *currentKey = GXKFindNineKeyEmojiKey(root);", 1)
+        self.assertIn("GXKNativeActionFont(gEmojiSoftKeyView, root)", fast)
+        self.assertIn("cheapBtn.titleLabel.font = cheapFont", fast)
+        self.assertIn("GXKNativeActionFont(currentKey, root)", full)
+        self.assertIn("btn.titleLabel.font = font", full)
+        for body, variable in ((fast, "cheapTitle"), (full, "title")):
+            self.assertIn('GXKComposingStateCached(vc) ? @"重输" : @"换行"', body)
+            self.assertIn(f"setTitle:{variable} forState:UIControlStateNormal", body)
+            self.assertIn(f"setTitle:{variable} forState:UIControlStateHighlighted", body)
+        sync = function_body(self.source, "static void GXKSyncToolbarStyle(")
+        self.assertIn("GXKToolbarTextStyle(body, &font)", sync)
+        self.assertIn("button.titleLabel.font = font", sync)
+        self.assertIn("setTitleColor:tint forState:UIControlStateNormal", sync)
 
     def test_queued_updates_are_bound_to_original_controller(self):
         tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender")
