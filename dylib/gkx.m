@@ -544,6 +544,7 @@ static void GXKUpdateToolbar(UIViewController *vc);
 - (void)onPaste:(UIButton *)sender;
 - (void)onCut:(UIButton *)sender;
 - (void)onDismissKeyboard:(UIButton *)sender;
+- (void)onToolbarDiagnostic:(UILongPressGestureRecognizer *)gesture; // [DEBUG-toolbar]
 - (void)deleteBeforeCursor:(NSUInteger)count;
 - (BOOL)refuseWhileComposing:(UIButton *)sender;
 - (id<UITextDocumentProxy>)proxy;
@@ -574,6 +575,9 @@ static BOOL gUpdatingToolbar;
 static GXKToolbarTarget *gToolbarTarget;
 // 本拍工具条要用的字体：取自同键盘原生 UILabel，主题/字号变了跟着变。
 static UIFont *gToolbarFont;
+// [DEBUG-toolbar] 弱引用只记实际被选中的来源，不参与字体选择或延长原生标签生命周期。
+static __weak UILabel *gToolbarStyleSource;
+static void GXKToolbarDiagnosticBandObserved(UIView *row, UIView *logo, CGRect glyph, CGFloat unclampedTop);
 
 // band 内被工具条盖住的原生图标（九键顶部右侧语音按钮等）：挂载时 alpha=0，撤走时原样归还。
 static NSMutableArray<UIView *> *gToolbarHiddenViews;
@@ -736,6 +740,7 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
     if (barHeight < 28.0) barHeight = 28.0;
     if (barHeight > height) barHeight = height;
     CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;
+    GXKToolbarDiagnosticBandObserved(row, logo, glyph, top); // [DEBUG-toolbar] 只记夹回前的位置。
     if (top < 0.0) top = 0.0;
     if (top + barHeight > height) top = MAX(0.0, height - barHeight);
     // 五个中文按钮最少要 200pt；不够就整条不显示，保持原生。
@@ -838,7 +843,7 @@ static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIVi
 // 字号也会随主题变（原生键帽是 Roboto 16pt）。只固定 13pt 会被一眼看出是外挂，
 // 所以一次遍历同时拿颜色与字体，不额外多走一遍 800 节点。
 static UIColor *GXKToolbarTextStyle(UIView *body, UIFont **outFont) {
-    if (outFont) *outFont = nil;
+    if (outFont) { *outFont = nil; gToolbarStyleSource = nil; } // [DEBUG-toolbar]
     if (body) {
         NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:body];
         NSUInteger visited = 0;
@@ -850,7 +855,10 @@ static UIColor *GXKToolbarTextStyle(UIView *body, UIFont **outFont) {
                 UILabel *label = (UILabel *)view;
                 UIColor *color = label.textColor;
                 if ([color isKindOfClass:[UIColor class]]) {
-                    if (outFont && [label.font isKindOfClass:[UIFont class]]) *outFont = label.font;
+                    if (outFont && [label.font isKindOfClass:[UIFont class]]) {
+                        *outFont = label.font;
+                        gToolbarStyleSource = label; // [DEBUG-toolbar] 与真实取样同点，不另扫树。
+                    }
                     return color;
                 }
             }
@@ -864,6 +872,9 @@ static UIColor *GXKToolbarTextStyle(UIView *body, UIFont **outFont) {
 static UIColor *GXKToolbarTint(UIView *body) {
     return GXKToolbarTextStyle(body, NULL);
 }
+
+// [DEBUG-toolbar] 临时诊断单独归属；确认字号/对齐原因后随本组接线一起移除。
+#import "toolbar_diagnostics.h"
 
 static void GXKRestoreToolbarDecorations(void) {
     for (NSUInteger i = 0; i < gToolbarHiddenViews.count; i++) {
@@ -1024,6 +1035,14 @@ static UIStackView *GXKMakeToolbar(UIView *row, UIColor *tint) {
             button.gxkDivider = divider;
         }
         [button addTarget:gToolbarTarget action:NSSelectorFromString(actions[i]) forControlEvents:UIControlEventTouchUpInside];
+        if (i == 1) { // [DEBUG-toolbar] 仅「复制」长按诊断，普通点击不变。
+            UILongPressGestureRecognizer *diagnostic = [[UILongPressGestureRecognizer alloc]
+                initWithTarget:gToolbarTarget action:@selector(onToolbarDiagnostic:)];
+            diagnostic.minimumPressDuration = 0.8;
+            diagnostic.cancelsTouchesInView = YES;
+            [button addGestureRecognizer:diagnostic];
+            button.accessibilityHint = @"长按开始工具栏诊断，再长按停止并复制报告";
+        }
         [stack addArrangedSubview:button];
     }
     return stack;
@@ -1045,6 +1064,7 @@ static void GXKUpdateToolbar(UIViewController *vc) {
             UIStackView *stack = gToolbarStack;
             if (stack.superview != gToolbarRow) [gToolbarRow addSubview:stack];
             if (!stack.hidden) stack.hidden = YES;
+            GXKToolbarDiagnosticRequest(vc, @"composing-hidden"); // [DEBUG-toolbar]
             gUpdatingToolbar = NO;
             return;
         }
@@ -1057,6 +1077,7 @@ static void GXKUpdateToolbar(UIViewController *vc) {
             UIStackView *stack = gToolbarStack;
             if (stack.superview != gToolbarRow) [gToolbarRow addSubview:stack];
             if (stack.hidden) stack.hidden = NO;
+            GXKToolbarDiagnosticRequest(vc, @"fast-unchanged"); // [DEBUG-toolbar]
             gUpdatingToolbar = NO;
             return;
         }
@@ -1070,6 +1091,7 @@ static void GXKUpdateToolbar(UIViewController *vc) {
         static int logged = 0;
         if (logged < 3) { logged++; GXK_LOG(@"工具条: 无可用空位，保持原生（第 %d 次）", logged); }
         GXKDetachToolbar(); // 26 键、未知布局、找不到 G 行、空位不足：完全保持原生，绝不撑高键盘。
+        GXKToolbarDiagnosticRequest(vc, @"scan-failed"); // [DEBUG-toolbar]
         gUpdatingToolbar = NO;
         return;
     }
@@ -1145,10 +1167,21 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     [row bringSubviewToFront:stack];
     GXK_LOG(@"工具条: 宿主 %@ %.0fx%.0f 空位 %.0f@%.0f", NSStringFromClass(row.class),
             row.bounds.size.width, row.bounds.size.height, band.size.width, band.origin.x);
+    GXKToolbarDiagnosticRequest(vc, reuse ? @"reuse-resampled" : @"new-resampled"); // [DEBUG-toolbar]
     gUpdatingToolbar = NO;
 }
 
 @implementation GXKToolbarTarget
+
+// [DEBUG-toolbar] 单次长按只处理 began，抬手不触发普通复制。
+- (void)onToolbarDiagnostic:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+    UIViewController *vc = self.controller;
+    UIButton *button = [gesture.view isKindOfClass:[UIButton class]] ? (UIButton *)gesture.view : nil;
+    if (!vc || vc != gCurrentVC || !button ||
+        ![gToolbarStack.arrangedSubviews containsObject:button]) return;
+    GXKToolbarDiagnosticToggle(vc, button);
+}
 
 - (id<UITextDocumentProxy>)proxy {
     UIViewController *vc = self.controller;
@@ -1548,6 +1581,7 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
 static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
     // 先撤销当前绑定，原生生命周期引起的布局/异步事件不得重建旧按钮。
     if ((UIViewController *)self == gCurrentVC) {
+        GXKToolbarDiagnosticStop((UIViewController *)self, @"keyboard-disappear"); // [DEBUG-toolbar]
         gCurrentVC = nil;
         gComposingActive = NO; // 扩展隐藏后组字缓存作废，下次出现重新采样。
         GXKStopPolling();

@@ -30,6 +30,13 @@ A no-source reverse-engineering patch for the official **iOS Gboard 2.3.19** key
 * **Actions**: select all, copy, paste, cut and dismiss. Cutting requires a selection — the patch never loops `deleteBackward`. Successful actions stay silent to avoid stutter; only failures flash the button title.
 * **Glide Typing untouched**: the patch never swizzles `touchesBegan/Moved/Ended` on `GKBSoftKeyView`, so swipe typing stays exactly as smooth as stock.
 
+#### Temporary toolbar diagnostics (font changes / G alignment are not fixed)
+Capture is off by default. In the idle nine-key layout, hold **Copy for 0.8 s**; its title briefly reads 诊断. Wait **1.5 s** before reproducing typing, commitment and clearing. Hold Copy again to stop and copy the report, which can be pasted into chat. Ordinary Copy taps keep their original behavior.
+
+The report records the selected font source class/ancestor chain (not label text), configured point size, button/label widths, image-view glyph rectangles, parent/root geometry and pre/post-clamp band position. Configured point size is not the actual auto-shrunk drawing size, and image-view bounds are not opaque G pixels. Historical identity/tree binding, truncated scans and dropped samples are marked explicitly. Valid binding does not prove fresh geometry; compare the observation time with current rectangles.
+
+Regular refresh reads are coalesced to at most once per 0.1 s; start/stop snapshots read immediately outside that interval. The initial and newest states are retained in memory only, capped at 80 samples / 192 Ki UTF-16 characters. Capture stops after 60 s or when the keyboard disappears; return to nine-key and hold Copy to export the retained report. Process termination loses it. Timeout/disappearance never writes the clipboard automatically. No input content, persistence or uploads. Windows source tests do not prove an iOS build or real-device behavior. Remove the `[DEBUG-toolbar]` wiring, helper and related tests after the cause is confirmed.
+
 ### 4. G-logo page trimming and single search-history deletion
 * **YouTube and Contacts pages removed** with a three-layer fallback: `GKBFeatureFlagManager`'s `enableYouTubeMiniApp`/`enableContactsMiniApp` return a flag object whose `value` is `NO`, `GKBMiniAppExtensionBase`'s `isMiniAppEnabled:` returns `NO`, and `GKBMiniAppManager`'s `availablePickerItems` filters both out. If a class disappears in a future Gboard build, that layer is skipped and behaviour degrades to native.
 * **GIF and Sticker tabs removed** from the 26-key emoji panel, keeping only emoji and kaomoji. Their identifiers are literally `gif` and `sticker` (read from the `__data` CFString constants of `gboard_framework`) and are compared as whole words so `gift` is never matched.
