@@ -1,5 +1,7 @@
 # Gboard-GKX (iOS Gboard 键盘增强补丁)
 
+**中文** | [English](README.en.md)
+
 在 **iOS Gboard 2.3.19** 官方输入法基础上进行无源码逆向定制与轻量增强，通过 Objective-C 动态库（`libgkx.dylib`）注入与无损二进制改写实现。
 
 > **核心设计哲学**：**保持绝对原生，拒绝过度侵入**。
@@ -50,6 +52,7 @@
 * **分页入口**：`GKBMiniAppManager` 的 `availablePickerItems` 末尾追加一项「常用语」（`GKBExtensionSegmentedControlItem`，identifier `gxk_phrases`，图标用 `UIGraphicsImageRenderer` 现画「语」字，不依赖资源名）。`GKBMiniAppExtensionBase` 的 `miniAppPicker:didSelectItem:atIndex:` 命中该 identifier 时改为弹自己的面板，其余分页原样回落。
 * **分页项必须是 `GKBExtensionSegmentedControlItem`**（真机崩溃换来的结论）：分页条是 `GKBExtensionSegmentedControl`，它建按钮时对每个 item 依次发 `badgeableViewType`／`controlItemType`／`accessibilityIdentifier`／`accessibilityLabel`。早先用的 `GKBAppStripItem` 这四条一条都不响应，26 键点表情第一次打开分页条就 `-[GKBAppStripItem badgeableViewType]: unrecognized selector` 崩掉整个键盘扩展（九键的表情键被换成了重输/换行，所以历史版本从未走到这条链路）。该类只有无参 `init`，属性逐个 set；`setIdentifier:` 内部会同步 `accessibilityIdentifier`。
 * **面板是叠加层**：`GXKPhrasesPanel` 铺满键盘视图 `bounds`，`layoutSubviews` 手算 frame，**不新增任何约束、不改键盘高度**。顶部有标题、钉子按钮、「编辑」与关闭「×」，中间是常用语列表，底部一行提示。
+* **面板配色跟随键盘皮肤，而不是跟随系统外观**：Gboard 皮肤可以和系统深浅模式不一致，所以面板不读系统外观开关，改为直接采样键盘本体里面积最大的那块不透明背景色当底色、取同键盘原生标签的文字色当主文字色，再按底色亮度补一层对比度保护（对比度不够才退回内置色）。键盘换肤或深浅切换时由 `didMoveToWindow`／`traitCollectionDidChange:` 重算，且只在颜色真的变了才刷新；单元格不再露出系统白底，编辑器与钉子按钮同样处理。
 * **钉子固定**：钉子关闭（默认）时点一条常用语就上屏并立即关闭面板；钉子打开后点多少条都不关，可以连续输入。状态存 App Group 的 `GXKPhrasesPinned`。
 * **上屏方式**：通过 `UITextDocumentProxy` 的 `insertText:` 写入，和原生输入完全同一条路。
 * **维护入口两处，键盘里那个才是保底**：
@@ -137,7 +140,7 @@ gboard-gkx/
 
 ```powershell
 python tools/dict_converter.py `
-  --dir "%USERPROFILE%\AppData\Roaming\Rime\dicts" `
+  --dir "%APPDATA%\Rime\dicts" `
   -o "dist/user_dictionary.db" `
   --max 60000
 ```
@@ -160,7 +163,7 @@ Copy-Item dist/artifact/libgkx.dylib dist/libgkx.dylib -Force
 
 ```powershell
 python tools/inject.py `
-  --ipa "<local>\Gboard_2.3.19.ipa" `
+  --ipa "Gboard_2.3.19.ipa" `
   --dylib "dist/libgkx.dylib" `
   --dict "dist/user_dictionary.db" `
   --app-group "group.zunbengege.top" `
@@ -168,6 +171,8 @@ python tools/inject.py `
 ```
 
 `--app-group` 是必填参数，漏掉脚本直接退出（exit 2）。真机上漏掉这一步的包会表现为：打开 Gboard 应用闪退、键盘锁在 26 键切不到九键。
+
+> `group.zunbengege.top` 只是本机自签描述文件授权的**示例** App Group。换用你自己的描述文件时必须同步改三处：`dylib/gkx.m` 顶部的 `GXKGroup`、`tools/inject.py` 里的默认 group、以及打包命令的 `--app-group`。三处不一致同样表现为启动闪退或切不到九键。
 
 注入脚本将自动执行：
 1. 解包原 IPA 并解析 Unix 文件权限与时间戳；
@@ -186,5 +191,14 @@ python tools/inject.py `
    * iOS 拥有强力的键盘扩展常驻缓存机制，覆盖安装后若未生效，建议先在设置中删除 Gboard 键盘，重新添加并重新赋予完全访问权限；或重启宿主 App（如微信、备忘录）。
 4. **功能验收点**：
    * **词库测试**：拼音输入 `aerjinshan`（阿尔金山）、`wanxiang`（万象），候选栏前列能准确出现万象专有词。
-   * **九键重输/换行**：切换到九键，空闲时回车键上方为「换行」，点击插入换行符；输入拼音（如 `22`）时按键即刻切换为微红「重输」，点击立即清空拼音。
+   * **九键重输/换行**：切换到九键，空闲时回车键上方为「换行」，点击插入换行符；输入拼音（如 `22`）时按键即刻切换为「重输」，点击立即清空拼音。
    * **滑行输入**：在九键或全键盘上单手滑行划线，轨迹流畅自然，无任何断触卡顿。
+
+---
+
+## ⚠️ 免责声明与许可
+
+* 本项目**不包含**任何 Google 官方二进制或 IPA，仓库里只有注入源码、词库转换脚本与文档。使用前需自行取得正版 **Gboard 2.3.19** IPA。
+* 注入改造后的包**仅限个人设备自签测试**，不得分发、不得商用。Gboard 与 Mozc 的著作权归 Google 所有。
+* 自签描述文件、证书与 App Group 需自行准备；仓库里的 `group.zunbengege.top` 只是示例值。
+* 改造涉及未签名的二进制注入，升级系统或更换签名工具后行为可能变化，风险自负。

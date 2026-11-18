@@ -1947,9 +1947,9 @@ static UIColor *GXKPhraseTintColor(void) {
 }
 
 // 常用语面板原先写死浅灰底 + darkTextColor，键盘换成深色皮肤后整块面板仍是白底黑字，
-// 和键盘本体割裂。这里改成按「键盘本体实际颜色」取一套深浅配色：
-// 原生标签文字亮 = 深色皮肤 → 深底浅字；文字暗 = 浅色皮肤 → 浅底深字。
-// 不读系统外观开关：Gboard 皮肤可以跟系统外观不一致，只有键盘自己的文字色说了算。
+// 和键盘本体割裂。这里改成直接取「键盘本体实际颜色」：底色用键盘体里面积最大的那块
+// 不透明背景，文字色用同键盘原生标签色，再按底色亮度兜一层对比度保护。
+// 不读系统外观开关：Gboard 皮肤可以跟系统外观不一致，只有键盘自己的颜色说了算。
 static CGFloat GXKPhraseColorBrightness(UIColor *color) {
     if (![color isKindOfClass:[UIColor class]]) return 0.5;
     CGFloat r = 0.5, g = 0.5, b = 0.5, a = 1.0;
@@ -1961,10 +1961,41 @@ static CGFloat GXKPhraseColorBrightness(UIColor *color) {
     return 0.299 * r + 0.587 * g + 0.114 * b;
 }
 
-static BOOL GXKPhrasePrefersDark(UIView *body, UITraitCollection *traits) {
+// 键盘皮肤：键盘体里面积最大的那块不透明底色。九键单块键帽约占 1/9，候选条也到不了 1/4，
+// 25% 的面积门槛刚好挡住键帽与装饰块；整条链都取不到就返回 nil，由上层退回系统色。
+static UIColor *GXKPhraseSkinColor(UIView *body) {
+    if (!body) return nil;
+    CGFloat bodyArea = CGRectGetWidth(body.bounds) * CGRectGetHeight(body.bounds);
+    if (bodyArea <= 0.0) return nil;
+    UIColor *best = nil;
+    CGFloat bestArea = bodyArea * 0.25;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:body];
+    NSUInteger visited = 0;
+    while (stack.count && visited++ < 800) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        if (view.isHidden || view.alpha < 0.5) continue;
+        UIColor *color = view.backgroundColor;
+        CGColorRef cg = [color isKindOfClass:[UIColor class]] ? color.CGColor : NULL;
+        if (cg && CGColorGetAlpha(cg) >= 0.9) {
+            CGFloat area = CGRectGetWidth(view.bounds) * CGRectGetHeight(view.bounds);
+            if (area > bestArea) {
+                bestArea = area;
+                best = color;
+            }
+        }
+        [stack addObjectsFromArray:view.subviews];
+    }
+    return best;
+}
+
+// 深浅判定以键盘底色为准：0.5 就是中灰，深色皮肤一律落在下面、浅色皮肤在上面。
+// 底色取不到才退回原生文字亮度（0.55 让中灰文字也判浅色，跟键盘浅色皮肤对齐）。
+static BOOL GXKPhrasePrefersDark(UIView *body, UIColor *skin, UITraitCollection *traits) {
+    if ([skin isKindOfClass:[UIColor class]]) return GXKPhraseColorBrightness(skin) < 0.5;
     if (body) {
         UIColor *native = GXKToolbarTextStyle(body, NULL);
-        if ([native isKindOfClass:[UIColor class]]) return GXKPhraseColorBrightness(native) > 0.6;
+        if ([native isKindOfClass:[UIColor class]]) return GXKPhraseColorBrightness(native) > 0.55;
     }
     // 主 App 进程里没有键盘体，退回系统标签色在当前外观下的解析值。
     if (@available(iOS 13.0, *)) {
@@ -1972,30 +2003,35 @@ static BOOL GXKPhrasePrefersDark(UIView *body, UITraitCollection *traits) {
         if (traits && [probe respondsToSelector:@selector(resolvedColorWithTraitCollection:)]) {
             probe = [probe resolvedColorWithTraitCollection:traits];
         }
-        return GXKPhraseColorBrightness(probe) > 0.6;
+        return GXKPhraseColorBrightness(probe) > 0.55;
     }
     return NO;
 }
 
-static UIColor *GXKPhraseBackgroundColor(BOOL dark) {
+static UIColor *GXKPhraseBackgroundColor(UIColor *skin, BOOL dark) {
+    if ([skin isKindOfClass:[UIColor class]]) return skin;
     if (dark) return [UIColor colorWithRed:0.12 green:0.12 blue:0.13 alpha:1.0];
     if (@available(iOS 13.0, *)) return [UIColor systemBackgroundColor];
     return [UIColor whiteColor];
 }
 
-static UIColor *GXKPhrasePrimaryTextColor(BOOL dark) {
+// 文字色优先用键盘原生标签色，但必须和面板底色反着来：白字落浅底会直接看不见。
+static UIColor *GXKPhrasePrimaryTextColor(UIColor *native, BOOL dark) {
+    if ([native isKindOfClass:[UIColor class]] &&
+        (GXKPhraseColorBrightness(native) > 0.5) == dark) {
+        return native;
+    }
     if (dark) return [UIColor colorWithRed:0.94 green:0.94 blue:0.96 alpha:1.0];
     return [UIColor darkTextColor];
 }
 
-static UIColor *GXKPhraseSecondaryTextColor(BOOL dark) {
-    if (dark) return [UIColor colorWithRed:0.62 green:0.62 blue:0.66 alpha:1.0];
-    return [UIColor grayColor];
+// 次级文字与分割线都由主文字色降透明度得到，和键盘同色系，与仓库其它跟随皮肤的地方一致。
+static UIColor *GXKPhraseSecondaryTextColor(UIColor *native, BOOL dark) {
+    return [GXKPhrasePrimaryTextColor(native, dark) colorWithAlphaComponent:0.62];
 }
 
-static UIColor *GXKPhraseSeparatorColor(BOOL dark) {
-    if (dark) return [UIColor colorWithRed:1.0 green:1.0 blue:1.0 alpha:0.12];
-    return [UIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:0.10];
+static UIColor *GXKPhraseSeparatorColor(UIColor *native, BOOL dark) {
+    return [GXKPhrasePrimaryTextColor(native, dark) colorWithAlphaComponent:0.14];
 }
 
 // 分页条上的图标：直接画一个「语」字，避免依赖资源包里的图片名。
@@ -2062,6 +2098,12 @@ static void GXKPresentPhrasesEditor(UIViewController *from);
 // 当前配色是否深色：面板叠在键盘体上，深浅只能从键盘本体的原生文字色反推。
 @property (nonatomic, assign) BOOL darkAppearance;
 @property (nonatomic, assign) BOOL appearanceApplied;
+// 当前套用的键盘皮肤色与原生文字色：单元格与钉子按钮都从这里取，保证同一帧一致。
+@property (nonatomic, strong) UIColor *skinColor;
+@property (nonatomic, strong) UIColor *nativeTextColor;
+// 上一次套用的两个亮度值，用来判断「颜色真变了」而不是「回调又来了」。
+@property (nonatomic, assign) CGFloat skinBrightness;
+@property (nonatomic, assign) CGFloat textBrightness;
 - (void)reloadItems;
 - (void)dismissPanel;
 - (void)onEdit:(UIButton *)sender;
@@ -2075,7 +2117,9 @@ static void GXKPresentPhrasesEditor(UIViewController *from);
     self = [super initWithFrame:frame];
     if (!self) return nil;
     // 底色在 gxkApplyAppearance 里定：这一刻还没有父视图，拿不到键盘本体的颜色。
-    self.backgroundColor = GXKPhraseBackgroundColor(NO);
+    self.backgroundColor = GXKPhraseBackgroundColor(nil, NO);
+    self.skinBrightness = -1.0;
+    self.textBrightness = -1.0;
     self.tag = GXK_PHRASES_PANEL_TAG;
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 
@@ -2083,7 +2127,7 @@ static void GXKPresentPhrasesEditor(UIViewController *from);
     title.tag = GXK_PHRASES_TITLE_TAG;
     title.text = @"常用语";
     title.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
-    title.textColor = GXKPhrasePrimaryTextColor(NO);
+    title.textColor = GXKPhrasePrimaryTextColor(nil, NO);
     [self addSubview:title];
 
     UIButton *pin = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -2118,7 +2162,7 @@ static void GXKPresentPhrasesEditor(UIViewController *from);
     table.rowHeight = 40.0;
     table.backgroundColor = [UIColor clearColor];
     table.separatorInset = UIEdgeInsetsZero;
-    table.separatorColor = GXKPhraseSeparatorColor(NO);
+    table.separatorColor = GXKPhraseSeparatorColor(nil, NO);
     [self addSubview:table];
     _table = table;
 
@@ -2126,7 +2170,7 @@ static void GXKPresentPhrasesEditor(UIViewController *from);
     hint.tag = GXK_PHRASES_HINT_TAG;
     hint.text = @"还没有常用语。先复制文字再点右上角「编辑」→「+」，或打开 Gboard App → 设置 → 常用语。";
     hint.font = [UIFont systemFontOfSize:13.0];
-    hint.textColor = GXKPhraseSecondaryTextColor(NO);
+    hint.textColor = GXKPhraseSecondaryTextColor(nil, NO);
     hint.numberOfLines = 0;
     hint.textAlignment = NSTextAlignmentCenter;
     [self addSubview:hint];
@@ -2153,17 +2197,32 @@ static void GXKPresentPhrasesEditor(UIViewController *from);
 
 // 面板与单元格的深浅配色统一从这里刷；深浅没变就不重绘，避免 trait 回调里反复 reload。
 - (void)gxkApplyAppearance {
-    BOOL dark = GXKPhrasePrefersDark([self gxkStyleSource], self.traitCollection);
-    if (self.appearanceApplied && dark == self.darkAppearance) return;
+    UIView *body = [self gxkStyleSource];
+    UIColor *skin = GXKPhraseSkinColor(body);
+    UIColor *native = body ? GXKToolbarTextStyle(body, NULL) : nil;
+    if (![native isKindOfClass:[UIColor class]]) native = nil;
+    BOOL dark = GXKPhrasePrefersDark(body, skin, self.traitCollection);
+    CGFloat skinBrightness = GXKPhraseColorBrightness(skin);
+    CGFloat textBrightness = GXKPhraseColorBrightness(native);
+    // 深浅没变、两个色值也没变才算「没变化」：只比 dark 会让两套深色皮肤之间不刷新。
+    if (self.appearanceApplied && dark == self.darkAppearance &&
+        fabs(skinBrightness - self.skinBrightness) < 0.02 &&
+        fabs(textBrightness - self.textBrightness) < 0.02) {
+        return;
+    }
     self.darkAppearance = dark;
     self.appearanceApplied = YES;
+    self.skinBrightness = skinBrightness;
+    self.textBrightness = textBrightness;
+    self.skinColor = skin;
+    self.nativeTextColor = native;
 
-    self.backgroundColor = GXKPhraseBackgroundColor(dark);
+    self.backgroundColor = GXKPhraseBackgroundColor(skin, dark);
     UIView *title = [self viewWithTag:GXK_PHRASES_TITLE_TAG];
-    if ([title isKindOfClass:[UILabel class]]) ((UILabel *)title).textColor = GXKPhrasePrimaryTextColor(dark);
+    if ([title isKindOfClass:[UILabel class]]) ((UILabel *)title).textColor = GXKPhrasePrimaryTextColor(native, dark);
     UIView *hint = [self viewWithTag:GXK_PHRASES_HINT_TAG];
-    if ([hint isKindOfClass:[UILabel class]]) ((UILabel *)hint).textColor = GXKPhraseSecondaryTextColor(dark);
-    self.table.separatorColor = GXKPhraseSeparatorColor(dark);
+    if ([hint isKindOfClass:[UILabel class]]) ((UILabel *)hint).textColor = GXKPhraseSecondaryTextColor(native, dark);
+    self.table.separatorColor = GXKPhraseSeparatorColor(native, dark);
     [self updatePinTitle];
     [self.table reloadData]; // 单元格文字色跟着换。
 }
@@ -2202,7 +2261,7 @@ static void GXKPresentPhrasesEditor(UIViewController *from);
 - (void)updatePinTitle {
     BOOL pinned = GXKPhrasesPinned();
     [self.pinButton setTitle:(pinned ? @"已固定" : @"固定") forState:UIControlStateNormal];
-    UIColor *idle = GXKPhraseSecondaryTextColor(self.darkAppearance);
+    UIColor *idle = GXKPhraseSecondaryTextColor(self.nativeTextColor, self.darkAppearance);
     [self.pinButton setTitleColor:(pinned ? GXKPhraseTintColor() : idle)
                          forState:UIControlStateNormal];
 }
@@ -2273,7 +2332,7 @@ static void GXKPresentPhrasesEditor(UIViewController *from);
     cell.textLabel.numberOfLines = 2;
     // 单元格默认底色是系统白，深色面板上会亮成一条白块，必须跟着面板走。
     cell.backgroundColor = [UIColor clearColor];
-    cell.textLabel.textColor = GXKPhrasePrimaryTextColor(self.darkAppearance);
+    cell.textLabel.textColor = GXKPhrasePrimaryTextColor(self.nativeTextColor, self.darkAppearance);
     return cell;
 }
 
@@ -2584,6 +2643,7 @@ static void GXKInstallMainAppHooks(void) {
 @property (nonatomic, assign) BOOL dismissable;
 // 与键盘面板同一套深浅判断；主 App 里没有键盘体时退回系统外观。
 @property (nonatomic, assign) BOOL darkAppearance;
+@property (nonatomic, strong) UIColor *nativeTextColor;
 @end
 
 @implementation GXKPhrasesEditorController
@@ -2598,13 +2658,13 @@ static void GXKInstallMainAppHooks(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = GXKPhraseBackgroundColor(NO);
+    self.view.backgroundColor = GXKPhraseBackgroundColor(nil, NO);
     UITableView *table = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStylePlain];
     table.dataSource = self;
     table.delegate = self;
     table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     table.backgroundColor = [UIColor clearColor];
-    table.separatorColor = GXKPhraseSeparatorColor(NO);
+    table.separatorColor = GXKPhraseSeparatorColor(nil, NO);
     [self.view addSubview:table];
     self.table = table;
     self.navigationItem.rightBarButtonItem =
@@ -2621,11 +2681,15 @@ static void GXKInstallMainAppHooks(void) {
 }
 
 - (void)gxkApplyAppearance {
-    UIView *body = gToolbarNineBody;
-    BOOL dark = GXKPhrasePrefersDark((body && body.window) ? body : nil, self.traitCollection);
+    UIView *body = (gToolbarNineBody && gToolbarNineBody.window) ? gToolbarNineBody : nil;
+    UIColor *skin = GXKPhraseSkinColor(body);
+    UIColor *native = body ? GXKToolbarTextStyle(body, NULL) : nil;
+    if (![native isKindOfClass:[UIColor class]]) native = nil;
+    BOOL dark = GXKPhrasePrefersDark(body, skin, self.traitCollection);
     self.darkAppearance = dark;
-    self.view.backgroundColor = GXKPhraseBackgroundColor(dark);
-    self.table.separatorColor = GXKPhraseSeparatorColor(dark);
+    self.nativeTextColor = native;
+    self.view.backgroundColor = GXKPhraseBackgroundColor(skin, dark);
+    self.table.separatorColor = GXKPhraseSeparatorColor(native, dark);
     [self.table reloadData]; // 单元格文字色跟着换。
 }
 
@@ -2713,7 +2777,7 @@ static void GXKInstallMainAppHooks(void) {
     cell.textLabel.text = (indexPath.row < (NSInteger)self.items.count) ? self.items[indexPath.row] : @"";
     cell.textLabel.numberOfLines = 2;
     cell.backgroundColor = [UIColor clearColor];
-    cell.textLabel.textColor = GXKPhrasePrimaryTextColor(self.darkAppearance);
+    cell.textLabel.textColor = GXKPhrasePrimaryTextColor(self.nativeTextColor, self.darkAppearance);
     return cell;
 }
 

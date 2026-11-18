@@ -111,7 +111,7 @@ gboard-gkx/
 
 ```powershell
 # 1. 重新生成紧凑万象词库
-python tools/dict_converter.py --dir "%USERPROFILE%\AppData\Roaming\Rime\dicts" -o "dist/user_dictionary.db" --max 60000
+python tools/dict_converter.py --dir "%APPDATA%\Rime\dicts" -o "dist/user_dictionary.db" --max 60000
 
 # 2. 推送代码触发 GitHub Actions 编译 libgkx.dylib
 git add dylib/gkx.m
@@ -124,13 +124,13 @@ Copy-Item dist/artifact/libgkx.dylib dist/libgkx.dylib -Force
 
 # 4. 一键注入打包未签名 IPA（--app-group 必填，漏掉脚本直接退出；--dict 漏掉词库不生效）
 python tools/inject.py `
-  --ipa "<local>\Gboard_2.3.19.ipa" `
+  --ipa "Gboard_2.3.19.ipa" `
   --dylib "dist/libgkx.dylib" `
   --dict "dist/user_dictionary.db" `
   --app-group "group.zunbengege.top" `
   --out "dist/gboard-gkx-unsigned.ipa"
 #    若 dist 目录 ACL 拒绝创建临时目录（WinError 5），加 --keep 指向仓库外目录：
-#    --keep "<local>\gkx-pack-<tag>"，产物仍写 dist。
+#    --keep "<repo 外的临时目录>\gkx-pack-<tag>"，产物仍写 dist。
 
 # 5. 校验产物 Mach-O 与权限
 python tools/inspect_signed.py "dist/gboard-gkx-unsigned.ipa"

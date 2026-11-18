@@ -8,7 +8,7 @@
 
 ## TaskStartSnapshot
 
-- 日期：2026-11-14；cwd：<local>；仓库：<repo>。
+- 日期：2026-11-14；cwd：<local>；仓库：<local>/gboard-gkx。
 - 分支：main；HEAD：864f1e0d3968a38a419252febb2fcd3bbbc14fd8；开始时已跟踪文件干净。
 - git status 对旧 tests/gkx-test-* 目录有 Permission denied 警告；不清理或改写这些既有目录。
 - 生效基线：README.md、agent.md、dylib/gkx.m、.github/workflows/build-dylib.yml。无项目 AGENTS.md/CONTEXT.md。
