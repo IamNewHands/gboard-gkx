@@ -1,5 +1,16 @@
 # 已实测证据与未覆盖边界
 
+## 2026-11-18 log4 条带越行修复（本地源码阶段闭合，非编译/真机交付）
+
+- 日志：D:/GitHub_Clone/log4.txt 共43样本，18次有可靠G却band-width、25次no-measurable-logo。lower可见G=(17,26,22,20)、row=(0,26,402,44)；旧28pt居中hit band=(43,22,359,28)与upper完整carrier=(0,0,402,26)相交，width归零。
+- 原生只读正证据：原包D:/GitHub_Clone/Gboard_2.3.19.ipa SHA256 c011730153df537f226052e766bbbf71834b5afcfeb13cba12f365d049719731；appex member SHA256711bc3dbeaec7cce6551d48286a7e5322b460e78aaaafa580e2ccd7fafb86566、cryptid0、612classes。GKBHeaderLogoView classVM0x10149e6b8继承GKBSoftKeyView0x10149ed98，SoftKey通过dyld bind继承UIView。Logo hitTest VM[0x1002680c8,0x100268228) bodySHA256cd4b72f6bdab48d553bec0461323487a6a76149e88675604042c146d2d07e166；询问hostView.subviews.firstObject，命中GKBCircleView返回它，否则objc_msgSendSuper2。父SoftKey hitTest[0x10027deb8,0x10027df3c)在!isHidden&&_softKeyDef!=nil&&CGRectContainsPoint(bounds,point)时返回self。Circle hitTest[0x100292710,0x100292794)动画期间可命中expandedAnimationFrame。三完整函数在原包与3574c24包逐字节相同；appex29/framework28个category完整读取未见相关方法声明，不证明动态替换不存在。IDA disconnected，未重连/安装/联网。
+- 最小修复：同一Band把自有至少28pt的点击区域留在row/root内并同时避开selected Logo完整carrier；glyph同次成功测量单独发布，按钮title/divider对齐该center，字体不自动缩小，实际titleRect完整包含与font.lineHeight/文本高宽门控。原例几何变为(56,26,346,28)，文字center仍36而不是hitcenter40；346pt只证明几何参数，不保证UIKit显示。
+- 实测：基线130项/0.067s/OK；终验139项/0.041s/OK、git diff --check exit0，命令为bundled Python -m unittest discover -s tests && git diff --check。独立源码复核覆盖最终rowContains与诊断順序，无剩余Critical/Important；原数值回放遗漏rowContains的Minor已补合法非零bounds/左右越界/NaN/±Inf拒绝并独立运行8项exit0。诊断unclampedTop在夹限前记录，未改报告字段。
+- 未覆盖：UIKit实际CJK/font/titleRect（回放19.2pt只是参数非原生测量）、点击/z-order/softKeyDef、Circle动画expandedAnimationFrame、动态IMP、三态与9↔26；本机无iOS编译器/SDK，当前没有本轮CI/新IPA。文字高>20pt在原例不能完整容纳时安全不显示；不以缩字/溢出恢复。不称真机已修好，默认关闭的诊断保留至验收。每格69.2pt，currentTitle的「剪贴板空」等长失败提示可能超宽而整条安全隐藏，须真机检查提示与恢复。
+- 结构验证：helper bundle exit2 error: artifact file does not exist: D:\GitHub_Clone\gboard-gkx\docs\aegis\work\2026-11-18-toolbar-repair\task-intent-draft.json；check exit1缺docs/aegis/adr、baseline、specs、plans及README.md、INDEX.md、BASELINE-GOVERNANCE.md，为既有轻量Markdown工作区缺口，不扩大任务初始化治理结构，不影响源码测试或提供验收证明。
+
+- 收口：需求/架构边界aligned，实际产品结果needs-verification/可信度C；旧共中心可越行与自动缩字路径已被替换，无新fallback/nativehook。复杂度：gkx.m现2707行既有压力，本轮仅现有按钮layout的local-fix-without-new-responsibility和24行局部同步接线；Band仍唯一测量owner，visibility owner未改。新增94行几何回放不引入路由/通用框架，未声称整体结构改善；较大源文件的整体拆分不属于本轮。
+
 ## 2026-11-18 log3 空位修复交付（源码/编译/独立验包通过，真机待验收）
 
 - 修复源3574c24368a9a48df1ac6994bd463d6c6df258b5已推送main；fresh130项Python源码契约Ran130tests in0.039s/OK、git diff --check exit0，生产源码相对该CI提交无diff。独立源码复核无剩余Critical/Important；Python契约与几何回放不替代UIKit。

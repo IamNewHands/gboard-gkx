@@ -395,23 +395,49 @@ class PerfContracts(unittest.TestCase):
             self.assertNotIn("NSClassFromString", body, signature)
             self.assertIn("GXKClassCached(", body, signature)
 
-    def test_toolbar_band_uses_measured_glyph_without_row_height_clamp(self):
-        """A short header cannot move the text away from the live G center."""
+    def test_toolbar_hit_band_stays_in_row_without_moving_glyph_center(self):
+        """The native hit carrier and title anchor are separate, including cache hits."""
         band = function_body(self.layout, "static BOOL GXKToolbarBand(")
-        measured = band.index("GXKToolbarGlyphRect(logo, row, &glyph)")
-        self.assertLess(measured, band.index("if (gToolbarBandCacheValid &&"))
-        self.assertIn("if (!GXKToolbarGlyphRect(logo, row, &glyph))", band)
-        self.assertIn("gToolbarBandCacheValid = NO; return NO;", band)
-        for geometry in ("CGFloat left = CGRectGetMaxX(glyph) + 4.0;", "CGRectGetMaxX(row.bounds)",
+        self.assertLess(band.index("GXKToolbarGlyphRect(logo, row, &glyph)"),
+                        band.index("if (gToolbarBandCacheValid &&"))
+        for geometry in ("CGFloat left = CGRectGetMaxX(glyph) + 4.0;",
+                         "GXKToolbarContentRect(logo, root, &logoCarrierRoot)",
+                         "left = MAX(left, CGRectGetMaxX(logoCarrier))",
+                         "CGFloat barHeight = glyph.size.height;",
+                         "if (barHeight < 28.0) barHeight = 28.0;",
+                         "barHeight > row.bounds.size.height",
+                         "top = MAX(CGRectGetMinY(row.bounds), MIN(top, CGRectGetMaxY(row.bounds) - barHeight));",
                          "GXKToolbarNativeRightBoundary(root, logo, strip, &rightInRoot)",
-                         "CGFloat barHeight = glyph.size.height;", "if (barHeight < 28.0) barHeight = 28.0;",
-                         "CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;",
-                         "[row convertRect:candidate toView:root]", "right - left >= 200.0",
+                         "right - left >= 200.0", "CGRectContainsRect(row.bounds, candidate)",
                          "CGRectContainsRect(root.bounds, candidateInRoot)"):
             self.assertIn(geometry, band)
-        self.assertNotRegex(band, r"barHeight\s*>\s*(?:height|row\.bounds\.size\.height)")
-        self.assertNotRegex(band, r"top\s*=\s*(?:0(?:\.0)?|MAX\(|MIN\(|height\s*-)")
-        self.assertNotIn("CGRectMake(left, 0.0, right - left, height)", band)
+        self.assertLess(band.index("GXKToolbarDiagnosticBandObserved(row, logo, glyph, top)"),
+                        band.index("top = MAX("))
+        self.assertEqual(1, band.count("gToolbarGlyphRoot = CGRectZero;"))
+        self.assertIn("if (gToolbarBandCacheHit) gToolbarGlyphRoot = [row convertRect:glyph toView:root];", band)
+        self.assertIn("if (hit) gToolbarGlyphRoot = [row convertRect:glyph toView:root];", band)
+        self.assertNotIn("gToolbarGlyphRoot", function_body(self.layout, "static BOOL GXKToolbarVisibleImageRect("))
+
+    def test_title_alignment_is_absolute_bounded_and_refreshed_before_fast_return(self):
+        title = function_body(self.source, "- (CGRect)titleRectForContentRect:")
+        self.assertIn("[super titleRectForContentRect:contentRect]", title)
+        self.assertIn("self.gxkContentCenterY - title.size.height * 0.5", title)
+        self.assertIn("CGRectContainsRect(contentRect, title) ? title : CGRectZero", title)
+        self.assertNotIn("titleLabel.frame =", self.source)
+        geometry = function_body(self.source, "static BOOL GXKSyncToolbarGeometry(")
+        for required in ("CGRectGetMidY(gToolbarGlyphRoot) - CGRectGetMinY(hostBand)",
+                         "button.gxkContentCenterY = centerY;", "[button setNeedsLayout]",
+                         "MAX(font.lineHeight, textSize.height)", "centerY - textHeight * 0.5 < 0.0",
+                         "centerY + textHeight * 0.5 > slot.size.height", "textSize.width > slot.size.width",
+                         "CGRectIsEmpty([button titleRectForContentRect:slot])"):
+            self.assertIn(required, geometry)
+        update = function_body(self.source, "static void GXKUpdateToolbar(UIViewController *vc) {")
+        self.assertLess(update.index("GXKSyncToolbarGeometry(gToolbarStack, hostBand)"),
+                        update.index("if (CGRectEqualToRect(band, gToolbarBand)"))
+        self.assertLess(update.index("GXKSyncToolbarStyle(body);"),
+                        update.index("GXKSyncToolbarGeometry(stack, hostBand)"))
+        self.assertIn("adjustsFontSizeToFitWidth = NO", self.source)
+        self.assertNotIn("minimumScaleFactor = 0.75", self.source)
 
     def test_image_measurement_requires_identified_original_foreground_layer(self):
         image = function_body(self.layout, "static BOOL GXKToolbarVisibleImageRect(")

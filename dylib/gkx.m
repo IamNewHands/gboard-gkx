@@ -553,6 +553,7 @@ static CGRect gToolbarBandCacheGlyph;
 static CGRect gToolbarBandCacheRowInRoot;
 static CGRect gToolbarBandCacheRootBounds;
 static BOOL GXKToolbarNativeRightBoundary(UIView *root, UIView *logo, CGRect strip, CGFloat *outRight);
+static BOOL GXKToolbarContentRect(UIView *view, UIView *root, CGRect *outRect);
 static NSUInteger gToolbarBandCacheEpoch;
 static BOOL gToolbarBandCacheValid;
 static BOOL gToolbarBandCacheHit;
@@ -645,16 +646,23 @@ static void GXKDetachToolbar(void) {
 // 多一个视图就把五个按钮的宽度挤歪了。
 @interface GXKToolbarButton : UIButton
 @property (nonatomic, strong) UIView *gxkDivider;
+@property (nonatomic) CGFloat gxkContentCenterY;
 @end
 
 @implementation GXKToolbarButton
+- (CGRect)titleRectForContentRect:(CGRect)contentRect {
+    CGRect title = [super titleRectForContentRect:contentRect];
+    title.origin.y = self.gxkContentCenterY - title.size.height * 0.5;
+    return CGRectContainsRect(contentRect, title) ? title : CGRectZero;
+}
 - (void)layoutSubviews {
     [super layoutSubviews];
     UIView *divider = self.gxkDivider;
     if (!divider) return;
-    CGFloat inset = floor(self.bounds.size.height * 0.28);
-    divider.frame = CGRectMake(self.bounds.size.width - 0.5, inset, 0.5,
-                               MAX(0.0, self.bounds.size.height - inset * 2.0));
+    CGFloat halfHeight = MIN(self.bounds.size.height * 0.22,
+                             MIN(self.gxkContentCenterY, self.bounds.size.height - self.gxkContentCenterY));
+    divider.frame = CGRectMake(self.bounds.size.width - 0.5, self.gxkContentCenterY - halfHeight,
+                               0.5, MAX(0.0, halfHeight * 2.0));
 }
 @end
 
@@ -677,8 +685,7 @@ static UIStackView *GXKMakeToolbar(UIView *row, UIColor *tint) {
         GXKToolbarButton *button = [GXKToolbarButton buttonWithType:UIButtonTypeCustom];
         button.backgroundColor = [UIColor clearColor];
         button.adjustsImageWhenHighlighted = NO;
-        button.titleLabel.adjustsFontSizeToFitWidth = YES;
-        button.titleLabel.minimumScaleFactor = 0.75;
+        button.titleLabel.adjustsFontSizeToFitWidth = NO; // Keep the native font size; unfit titles cannot authorize display.
         button.titleLabel.font = font;
         [button setTitle:titles[i] forState:UIControlStateNormal];
         [button setTitleColor:tint forState:UIControlStateNormal];
@@ -723,6 +730,30 @@ static void GXKSyncToolbarStyle(UIView *body) {
     }
 }
 
+// Same current Band owns hit area and visual anchor; validate before every visible reuse.
+static BOOL GXKSyncToolbarGeometry(UIStackView *stack, CGRect hostBand) {
+    if (!GXKToolbarFiniteRect(hostBand) || !GXKToolbarFiniteRect(gToolbarGlyphRoot) || !stack.arrangedSubviews.count) return NO;
+    CGFloat centerY = CGRectGetMidY(gToolbarGlyphRoot) - CGRectGetMinY(hostBand);
+    CGRect slot = CGRectMake(0, 0, hostBand.size.width / stack.arrangedSubviews.count, hostBand.size.height);
+    for (GXKToolbarButton *button in stack.arrangedSubviews) {
+        if (![button isKindOfClass:[GXKToolbarButton class]]) return NO;
+        button.gxkContentCenterY = centerY;
+        [button setNeedsLayout];
+        UIFont *font = button.titleLabel.font;
+        if (!font) return NO;
+        CGSize textSize = [button.currentTitle sizeWithAttributes:@{NSFontAttributeName:font}];
+        CGFloat textHeight = MAX(font.lineHeight, textSize.height);
+        if (!isfinite(centerY) || !isfinite(textHeight) || textHeight <= 0.0 ||
+            centerY - textHeight * 0.5 < 0.0 || centerY + textHeight * 0.5 > slot.size.height ||
+            !isfinite(textSize.width) || textSize.width > slot.size.width ||
+            CGRectIsEmpty([button titleRectForContentRect:slot])) {
+            gToolbarSpaceGate = @"title-does-not-fit";
+            return NO;
+        }
+    }
+    return YES;
+}
+
 static void GXKUpdateToolbar(UIViewController *vc) {
     if (gUpdatingToolbar || !vc || vc != gCurrentVC || !vc.isViewLoaded) return;
     gUpdatingToolbar = YES;
@@ -737,7 +768,8 @@ static void GXKUpdateToolbar(UIViewController *vc) {
         CGRect band = CGRectZero;
         BOOL measured = GXKToolbarBand(gToolbarRow, gToolbarLogoView, root, &band);
         CGRect hostBand = measured ? [gToolbarRow convertRect:band toView:root] : CGRectZero;
-        BOOL clear = measured && GXKToolbarNativeSpaceClear(root, gToolbarLogoView, hostBand);
+        BOOL clear = measured && GXKToolbarNativeSpaceClear(root, gToolbarLogoView, hostBand) &&
+                     GXKSyncToolbarGeometry(gToolbarStack, hostBand);
         if (composing || !clear) {
             gToolbarStack.hidden = YES;
             GXKToolbarDiagnosticRequest(vc, composing ? @"composing-hidden" : @"native-content-hidden");
@@ -780,6 +812,7 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     gToolbarNineBody = body;
     gToolbarBand = band; // Keep row-neighbour and diagnostic coordinates separate from host coordinates.
     GXKSyncToolbarStyle(body);
+    clear = clear && GXKSyncToolbarGeometry(stack, hostBand);
     stack.hidden = composing || !clear;
     if (stack.superview != root) [root addSubview:stack];
     if (gToolbarConstraints) [NSLayoutConstraint deactivateConstraints:gToolbarConstraints];

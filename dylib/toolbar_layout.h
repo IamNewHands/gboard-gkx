@@ -6,6 +6,7 @@ static NSString *gToolbarScanGate;
 static NSString *gToolbarBandGate;
 static CGRect gToolbarImageDrawnRoot, gToolbarImageVisibleRoot;
 static CGRect gToolbarBandCandidateRoot;
+static CGRect gToolbarGlyphRoot; // Published only by the current Band measurement, never obstacle/diagnostic image reads.
 static CGRect gToolbarBandCacheCandidateRoot;
 static __weak UIView *gToolbarRightBoundary;
 static CGRect gToolbarRightBoundaryRect;
@@ -143,6 +144,7 @@ static BOOL GXKToolbarGlyphRect(UIView *view, UIView *base, CGRect *outRect) {
 static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outBand) {
     gToolbarBandGate = @"band-binding";
     gToolbarBandCandidateRoot = CGRectZero;
+    gToolbarGlyphRoot = CGRectZero;
     gToolbarRightBoundary = nil;
     gToolbarRightBoundaryRect = CGRectZero;
     if (outBand) *outBand = CGRectZero;
@@ -152,11 +154,23 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
     if (!GXKToolbarGlyphRect(logo, row, &glyph)) { gToolbarBandGate = @"band-glyph-missing"; gToolbarBandCacheValid = NO; return NO; }
     CGRect rowInRoot = [row convertRect:row.bounds toView:root];
     CGFloat left = CGRectGetMaxX(glyph) + 4.0;
+    // The selected G is a native soft key too: its complete hit carrier cannot be covered.
+    CGRect logoCarrierRoot = CGRectZero;
+    if (!GXKToolbarContentRect(logo, root, &logoCarrierRoot)) {
+        gToolbarBandGate = @"band-logo-carrier-unproven"; gToolbarBandCacheValid = NO; return NO;
+    }
+    CGRect logoCarrier = [row convertRect:logoCarrierRoot fromView:root];
+    if (!CGRectIsEmpty(logoCarrier)) left = MAX(left, CGRectGetMaxX(logoCarrier));
     CGFloat right = CGRectGetMaxX(row.bounds);
     CGFloat barHeight = glyph.size.height;
     if (barHeight < 28.0) barHeight = 28.0;
+    if (!GXKToolbarFiniteRect(rowInRoot) || barHeight > row.bounds.size.height) {
+        gToolbarBandGate = @"band-row-too-short"; gToolbarBandCacheValid = NO; return NO;
+    }
     CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;
-    GXKToolbarDiagnosticBandObserved(row, logo, glyph, top);
+    GXKToolbarDiagnosticBandObserved(row, logo, glyph, top); // Record the unclamped input, not the adjusted hit top.
+    // Constrain only our hit area; title/divider retain the separately measured G center.
+    top = MAX(CGRectGetMinY(row.bounds), MIN(top, CGRectGetMaxY(row.bounds) - barHeight));
     CGRect strip = [row convertRect:CGRectMake(left, top, MAX(0.0, right - left), barHeight) toView:root];
     CGFloat rightInRoot = CGRectGetMaxX(strip);
     // Re-read contents before cache reuse: image/text/items can change without an epoch event.
@@ -179,10 +193,12 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
         CGRectEqualToRect(gToolbarBandCacheCandidateRoot, candidateInRoot) &&
         gToolbarBandCacheEpoch == gToolbarBandEpoch) {
         gToolbarBandGate = gToolbarBandCacheHit ? @"band-cache-hit" : @"band-cache-rejected";
+        if (gToolbarBandCacheHit) gToolbarGlyphRoot = [row convertRect:glyph toView:root];
         if (outBand) *outBand = gToolbarBandCacheBand;
         return gToolbarBandCacheHit;
     }
-    BOOL hit = right - left >= 200.0 && CGRectContainsRect(root.bounds, candidateInRoot);
+    BOOL hit = right - left >= 200.0 && CGRectContainsRect(row.bounds, candidate) &&
+               CGRectContainsRect(root.bounds, candidateInRoot);
     gToolbarBandCacheCandidateRoot = candidateInRoot;
     gToolbarBandGate = hit ? @"band-clear" : right - left < 200.0 ? @"band-width" : @"band-outside-root";
     gToolbarBandCacheRow = row;
@@ -196,6 +212,7 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
     gToolbarBandCacheValid = YES;
     gToolbarBandCacheHit = hit;
     gToolbarBandCacheBand = hit ? candidate : CGRectZero;
+    if (hit) gToolbarGlyphRoot = [row convertRect:glyph toView:root];
     if (outBand) *outBand = gToolbarBandCacheBand;
     return hit;
 }
