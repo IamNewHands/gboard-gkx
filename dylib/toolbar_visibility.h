@@ -13,44 +13,93 @@ static NSString *gToolbarSpaceGate;
 static __weak UIView *gToolbarSpaceBlocker;
 static CGRect gToolbarSpaceBand;
 
-static BOOL GXKToolbarContentBlocks(UIView *view, UIView *root, CGRect band) {
-    if (!GXKKeyIsVisible(view, root)) return NO;
-    CGRect rect = [view convertRect:view.bounds toView:root];
-    if (CGRectIsEmpty(CGRectIntersection(rect, band))) return NO;
-    if ([view isKindOfClass:[UICollectionView class]]) {
-        UICollectionView *collection = (UICollectionView *)view;
-        if (collection.visibleCells.count) return YES;
-        NSInteger sections = collection.numberOfSections;
-        if (sections > 64) return YES;
-        for (NSInteger section = 0; section < sections; section++) {
-            if ([collection numberOfItemsInSection:section] > 0) return YES;
+// A successful empty rect means no visible content; NO means unproven geometry.
+static BOOL GXKToolbarClippedViewRect(UIView *view, UIView *root, BOOL overflow, CGRect *outRect) {
+    *outRect = CGRectZero;
+    if (!view || !root.window || view.window != root.window ||
+        (view != root && ![view isDescendantOfView:root])) return NO;
+    CGRect visible = overflow ? root.layer.bounds : [view.layer convertRect:view.layer.bounds toLayer:root.layer];
+    BOOL invisible = CGRectIsEmpty(visible);
+    if (!invisible && !GXKToolbarFiniteRect(visible)) return NO;
+    NSUInteger depth = 0;
+    for (CALayer *ancestor = view.layer; ancestor && depth++ < 64; ancestor = ancestor.superlayer) {
+        // Model bounds/opacity may already be empty while a presentation layer is still visible.
+        // No empty-space success is allowed before the entire ancestry has been validated.
+        if (ancestor.animationKeys.count || !CATransform3DIsIdentity(ancestor.transform) ||
+            !CATransform3DIsIdentity(ancestor.sublayerTransform)) return NO;
+        if (ancestor.hidden || ancestor.opacity < 0.05) invisible = YES;
+        // A mask can only remove pixels, so its full bounds remain a conservative obstacle.
+        if (ancestor.masksToBounds || ancestor == root.layer) {
+            CGRect clip = [ancestor convertRect:ancestor.bounds toLayer:root.layer];
+            if (CGRectIsEmpty(clip)) invisible = YES;
+            else if (!GXKToolbarFiniteRect(clip)) return NO;
+            if (!invisible) {
+                visible = CGRectIntersection(visible, clip);
+                invisible = CGRectIsEmpty(visible);
+                if (!invisible && !GXKToolbarFiniteRect(visible)) return NO;
+            }
         }
-        return NO;
+        if (ancestor == root.layer) { *outRect = invisible ? CGRectZero : visible; return YES; }
     }
-    if ([view isKindOfClass:[UILabel class]]) {
-        UILabel *label = (UILabel *)view;
-        return label.text.length > 0 || label.attributedText.length > 0;
-    }
-    Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
-    if ((keyClass && [view isKindOfClass:keyClass]) || [view isKindOfClass:[UIButton class]]) return YES;
-    if ([view respondsToSelector:@selector(image)]) {
-        UIImage *image = [(id<GXKNativeIconContent>)view image];
-        return [image isKindOfClass:[UIImage class]] && GXKToolbarIconSized(view.bounds);
-    }
-    return YES; // Native keys and buttons own their hit regions.
+    return NO;
 }
 
-static BOOL GXKToolbarNativeSpaceClear(UIView *root, UIView *logo, CGRect band) {
+static BOOL GXKToolbarContentRect(UIView *view, UIView *root, CGRect *outRect) {
+    *outRect = CGRectZero;
+    CGRect carrier = CGRectZero;
+    // Even nil image/text/items must not bypass an active layer or ancestor animation.
+    if (!GXKToolbarClippedViewRect(view, root, NO, &carrier)) return NO;
+    Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
+    BOOL key = (keyClass && [view isKindOfClass:keyClass]) || [view isKindOfClass:[UIButton class]];
+    if (!key && [view isKindOfClass:[UICollectionView class]]) {
+        UICollectionView *collection = (UICollectionView *)view;
+        BOOL populated = collection.visibleCells.count > 0;
+        NSInteger sections = collection.numberOfSections;
+        if (sections > 64) populated = YES;
+        for (NSInteger section = 0; !populated && section < sections; section++)
+            if ([collection numberOfItemsInSection:section] > 0) populated = YES;
+        if (!populated) return YES; // Supplementary/custom descendants are registered separately.
+    } else if (!key && [view isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)view;
+        if (!(label.text.length > 0 || label.attributedText.length > 0)) return YES;
+    } else if (!key && [view respondsToSelector:@selector(image)]) {
+        UIImage *image = [(id<GXKNativeIconContent>)view image];
+        BOOL animated = [view isKindOfClass:[UIImageView class]] && [(UIImageView *)view isAnimating];
+        if (![image isKindOfClass:[UIImage class]] && !animated) return YES;
+        // Physical image geometry has no 8..64pt anchor-size authorization.
+        if (GXKToolbarVisibleImageRect(view, root, outRect)) return YES;
+        // Unsupported drawing may extend beyond an unclipped carrier. Never infer empty space.
+        CALayer *layer = view.layer;
+        BOOL bounded = layer.masksToBounds || [layer.contentsGravity isEqualToString:kCAGravityResize] ||
+                       [layer.contentsGravity isEqualToString:kCAGravityResizeAspect];
+        return GXKToolbarClippedViewRect(view, root, !bounded, outRect);
+    }
+    // Native keys/buttons own their complete clipped hit regions, even with empty title/image.
+    *outRect = carrier;
+    return YES;
+}
+
+static BOOL GXKToolbarContentBlocks(UIView *view, UIView *root, CGRect band) {
+    CGRect rect = CGRectZero;
+    if (!GXKToolbarContentRect(view, root, &rect)) return YES;
+    return !CGRectIsEmpty(CGRectIntersection(rect, band));
+}
+
+static BOOL GXKToolbarPrepareNativeObstacles(UIView *root, UIView *logo) {
     gToolbarSpaceGate = @"invalid-band-binding";
     gToolbarSpaceBlocker = nil;
-    gToolbarSpaceBand = band;
-    if (!root || !logo || !CGRectContainsRect(root.bounds, band)) return NO;
+    if (!root || !logo || ![logo isDescendantOfView:root]) return NO;
     BOOL rebuild = gToolbarObstacleRoot != root || gToolbarObstacleLogo != logo ||
                    gToolbarObstacleEpoch != gToolbarContentEpoch ||
                    !gToolbarObstacleComplete;
     if (!rebuild) {
         for (UIView *view in gToolbarObstacles) {
             if (![view isDescendantOfView:root]) { rebuild = YES; break; }
+        }
+    }
+    if (!rebuild) {
+        for (UIView *body in gToolbarKeyboardBodies) {
+            if (![body isDescendantOfView:root]) { rebuild = YES; break; }
         }
     }
     if (rebuild) {
@@ -77,10 +126,12 @@ static BOOL GXKToolbarNativeSpaceClear(UIView *root, UIView *logo, CGRect band) 
             // Include hidden objects in the registry: they may become visible without replacement.
             BOOL key = [view isKindOfClass:keyClass];
             BOOL collection = [view isKindOfClass:[UICollectionView class]];
-            BOOL leaf = key || collection || [view isKindOfClass:[UIButton class]];
+            BOOL leaf = key || [view isKindOfClass:[UIButton class]];
             // Register the carrier even while its image is nil; contents can appear without an epoch change.
             BOOL icon = [view respondsToSelector:@selector(image)];
-            if (leaf || icon || [view isKindOfClass:[UILabel class]]) [gToolbarObstacles addObject:view];
+            // Supplementary/reusable cells can draw without a label or image child.
+            BOOL reusable = [view isKindOfClass:[UICollectionReusableView class]];
+            if (leaf || collection || icon || reusable || [view isKindOfClass:[UILabel class]]) [gToolbarObstacles addObject:view];
             if (!leaf) [pending addObjectsFromArray:view.subviews];
         }
         gToolbarSpaceGate = @"obstacle-tree-incomplete";
@@ -102,6 +153,37 @@ static BOOL GXKToolbarNativeSpaceClear(UIView *root, UIView *logo, CGRect band) 
     }
     gToolbarSpaceGate = @"nine-body-not-visible";
     if (!nineVisible) return NO;
+    gToolbarSpaceGate = @"obstacles-prepared";
+    return YES;
+}
+
+// Same live content owner as the final overlap check. No sibling-frame occupancy inference.
+static BOOL GXKToolbarNativeRightBoundary(UIView *root, UIView *logo, CGRect strip, CGFloat *outRight) {
+    gToolbarSpaceBand = strip;
+    if (!GXKToolbarPrepareNativeObstacles(root, logo)) return NO;
+    CGFloat right = CGRectGetMaxX(strip);
+    for (UIView *view in gToolbarObstacles) {
+        CGRect rect = CGRectZero;
+        if (!GXKToolbarContentRect(view, root, &rect)) {
+            gToolbarSpaceGate = @"obstacle-geometry-unproven";
+            gToolbarSpaceBlocker = view;
+            return NO;
+        }
+        if (CGRectIsEmpty(CGRectIntersection(rect, strip))) continue;
+        CGFloat edge = MAX(CGRectGetMinX(strip), CGRectGetMinX(rect));
+        if (edge < right) { right = edge; gToolbarRightBoundary = view; gToolbarRightBoundaryRect = rect; }
+    }
+    *outRight = right;
+    return YES;
+}
+
+static BOOL GXKToolbarNativeSpaceClear(UIView *root, UIView *logo, CGRect band) {
+    gToolbarSpaceBand = band;
+    if (!root || !logo || !CGRectContainsRect(root.bounds, band)) {
+        gToolbarSpaceGate = @"invalid-band-binding";
+        return NO;
+    }
+    if (!GXKToolbarPrepareNativeObstacles(root, logo)) return NO;
     for (UIView *view in gToolbarObstacles) {
         if (GXKToolbarContentBlocks(view, root, band)) {
             gToolbarSpaceGate = @"native-obstacle";

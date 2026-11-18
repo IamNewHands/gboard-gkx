@@ -208,7 +208,7 @@ class ToolbarDiagnosticContracts(unittest.TestCase):
         for field in ("lastDecision=", "decisionOwnerCurrent=", "scanGate=", "bandGate=", "bandCandidateRoot=",
                       "spaceGate=", "spaceBandRoot=", "blocker=", "blockerChain=", "obstacleComplete=", "logoCandidate["):
             self.assertIn(field, self.diag)
-        space = function_body(self.visibility, "static BOOL GXKToolbarNativeSpaceClear")
+        space = function_body(self.visibility, "static BOOL GXKToolbarPrepareNativeObstacles") + function_body(self.visibility, "static BOOL GXKToolbarNativeSpaceClear")
         self.assertIn('gToolbarSpaceGate = @"independent-qwerty";', space)
         self.assertIn("gToolbarSpaceBlocker = body;", space)
         self.assertIn('gToolbarSpaceGate = @"native-obstacle";', space)

@@ -169,7 +169,7 @@ class PerfContracts(unittest.TestCase):
 
     def test_native_obstacle_registry_is_weak_event_scoped_and_complete(self):
         """Discovery is event-scoped; hidden carriers remain eligible for live changes."""
-        registry = function_body(self.visibility, "static BOOL GXKToolbarNativeSpaceClear(")
+        registry = function_body(self.visibility, "static BOOL GXKToolbarPrepareNativeObstacles(")
         for required in ("gToolbarObstacleRoot != root", "gToolbarObstacleLogo != logo",
                          "gToolbarObstacleEpoch != gToolbarContentEpoch", "!gToolbarObstacleComplete",
                          "[NSHashTable weakObjectsHashTable]", "visited++ < 800",
@@ -185,7 +185,7 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("gToolbarObstacleComplete = NO;", detach)
 
     def test_keyboard_owner_registry_shares_complete_discovery_without_hidden_pruning(self):
-        registry = function_body(self.visibility, "static BOOL GXKToolbarNativeSpaceClear(")
+        registry = function_body(self.visibility, "static BOOL GXKToolbarPrepareNativeObstacles(")
         discover = registry[registry.index("if (rebuild) {"):registry.index("gToolbarObstacleComplete = YES;")]
         self.assertIn("static NSHashTable<UIView *> *gToolbarKeyboardBodies;", self.visibility)
         self.assertIn("gToolbarKeyboardBodies = [NSHashTable weakObjectsHashTable];", discover)
@@ -200,9 +200,9 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("if (pending.count) return NO;", discover)
 
     def test_reuse_requires_live_nine_owner_and_rejects_independent_qwerty_without_band_overlap(self):
-        registry = function_body(self.visibility, "static BOOL GXKToolbarNativeSpaceClear(")
+        registry = function_body(self.visibility, "static BOOL GXKToolbarPrepareNativeObstacles(")
         live = registry[registry.index("gToolbarObstacleComplete = YES;") + len("gToolbarObstacleComplete = YES;"):]
-        owners = live[live.index("BOOL nineVisible = NO;"):live.index("for (UIView *view in gToolbarObstacles)")]
+        owners = live[live.index("BOOL nineVisible = NO;"):live.index('gToolbarSpaceGate = @"obstacles-prepared";')]
         self.assertIn("for (UIView *body in gToolbarKeyboardBodies)", owners)
         self.assertIn("if (!GXKKeyIsVisible(body, root)) continue;", owners)
         code = re.sub(r"//[^\n]*", "", owners)
@@ -217,19 +217,21 @@ class PerfContracts(unittest.TestCase):
         for band_condition in ("band", "CGRect", "GXKToolbarContentBlocks", "convertRect:"):
             self.assertNotIn(band_condition, owners)
         self.assertNotIn("if (rebuild)", live)
-        self.assertLess(live.index("if (!nineVisible) return NO;"), live.index("GXKToolbarContentBlocks(view, root, band)"))
+        self.assertIn("GXKToolbarPrepareNativeObstacles(root, logo)", function_body(self.visibility, "static BOOL GXKToolbarNativeSpaceClear("))
 
     def test_native_content_is_checked_live_not_alpha_masked(self):
-        blocks = function_body(self.visibility, "static BOOL GXKToolbarContentBlocks(")
-        for required in ("GXKKeyIsVisible(view, root)", "CGRectIntersection(rect, band)",
-                         "collection.visibleCells.count", "numberOfItemsInSection:section",
+        content = function_body(self.visibility, "static BOOL GXKToolbarContentRect(")
+        for required in ("collection.visibleCells.count", "numberOfItemsInSection:section",
                          "label.text.length > 0", "label.attributedText.length > 0"):
-            self.assertIn(required, blocks)
-        registry = function_body(self.visibility, "static BOOL GXKToolbarNativeSpaceClear(")
-        self.assertIn("CGRectContainsRect(root.bounds, band)", registry)
-        self.assertIn("GXKToolbarContentBlocks(view, root, band)", registry)
-        for native_class in ("GKBSoftKeyView", "UICollectionView", "UIButton", "UILabel"):
-            self.assertIn(native_class, registry)
+            self.assertIn(required, content)
+        blocks = function_body(self.visibility, "static BOOL GXKToolbarContentBlocks(")
+        self.assertIn("GXKToolbarContentRect(view, root, &rect)", blocks)
+        self.assertIn("CGRectIntersection(rect, band)", blocks)
+        self.assertIn("if (!GXKToolbarContentRect(view, root, &rect)) return YES;", blocks)
+        final = function_body(self.visibility, "static BOOL GXKToolbarNativeSpaceClear(")
+        self.assertIn("CGRectContainsRect(root.bounds, band)", final)
+        self.assertIn("GXKToolbarPrepareNativeObstacles(root, logo)", final)
+        self.assertIn("GXKToolbarContentBlocks(view, root, band)", final)
         toolbar = self.source[self.source.index("#pragma mark - 顶部工具条"):self.source.index("#pragma mark - 按需轮询")]
         code = re.sub(r"//[^\n]*", "", toolbar + self.visibility)
         self.assertNotRegex(code, r"\.alpha\s*=(?!=)")
@@ -237,19 +239,61 @@ class PerfContracts(unittest.TestCase):
             self.assertNotIn(retired, code)
 
     def test_native_image_carrier_is_registered_empty_and_contents_checked_live(self):
-        registry = function_body(self.visibility, "static BOOL GXKToolbarNativeSpaceClear(")
+        registry = function_body(self.visibility, "static BOOL GXKToolbarPrepareNativeObstacles(")
         discover = registry[registry.index("if (rebuild) {"):registry.index("gToolbarObstacleComplete = YES;")]
         self.assertIn("BOOL icon = [view respondsToSelector:@selector(image)];", discover)
-        self.assertIn("if (leaf || icon || [view isKindOfClass:[UILabel class]]) [gToolbarObstacles addObject:view];", discover)
+        self.assertIn("BOOL reusable = [view isKindOfClass:[UICollectionReusableView class]];", discover)
+        self.assertIn("if (leaf || collection || icon || reusable || [view isKindOfClass:[UILabel class]]) [gToolbarObstacles addObject:view];", discover)
         self.assertNotIn("[(id<GXKNativeIconContent>)view image]", discover)
-        blocks = function_body(self.visibility, "static BOOL GXKToolbarContentBlocks(")
-        self.assertIn("UIImage *image = [(id<GXKNativeIconContent>)view image];", blocks)
-        self.assertIn("[image isKindOfClass:[UIImage class]] && GXKToolbarIconSized(view.bounds)", blocks)
-        priority = "if ((keyClass && [view isKindOfClass:keyClass]) || [view isKindOfClass:[UIButton class]]) return YES;"
-        self.assertIn(priority, blocks)
-        self.assertLess(blocks.index(priority), blocks.index("if ([view respondsToSelector:@selector(image)])"))
-        live_reuse = registry[registry.index("gToolbarObstacleComplete = YES;"):]
-        self.assertIn("GXKToolbarContentBlocks(view, root, band)", live_reuse)
+        content = function_body(self.visibility, "static BOOL GXKToolbarContentRect(")
+        self.assertIn("UIImage *image = [(id<GXKNativeIconContent>)view image];", content)
+        self.assertIn("GXKToolbarVisibleImageRect(view, root, outRect)", content)
+        self.assertNotIn("GXKToolbarIconSized", content)
+        self.assertIn("GXKToolbarClippedViewRect(view, root, !bounded, outRect)", content)
+        self.assertIn("BOOL key = (keyClass && [view isKindOfClass:keyClass]) || [view isKindOfClass:[UIButton class]];", content)
+        self.assertIn("else if (!key && [view respondsToSelector:@selector(image)])", content)
+
+    def test_boundary_reads_same_live_rect_owner_before_cache_and_handles_left_crossing(self):
+        band = function_body(self.layout, "static BOOL GXKToolbarBand(")
+        self.assertLess(band.index("GXKToolbarNativeRightBoundary("), band.index("if (gToolbarBandCacheValid &&"))
+        self.assertIn("CGRectEqualToRect(gToolbarBandCacheCandidateRoot, candidateInRoot)", band)
+        self.assertNotIn("sibling.frame", band)
+        boundary = function_body(self.visibility, "static BOOL GXKToolbarNativeRightBoundary(")
+        self.assertIn("GXKToolbarContentRect(view, root, &rect)", boundary)
+        self.assertIn("CGRectIntersection(rect, strip)", boundary)
+        self.assertIn("MAX(CGRectGetMinX(strip), CGRectGetMinX(rect))", boundary)
+        self.assertIn('gToolbarSpaceGate = @"obstacle-geometry-unproven";', boundary)
+
+    def test_clipping_owner_rejects_complex_geometry_and_preserves_overflow_conservatively(self):
+        clip = function_body(self.visibility, "static BOOL GXKToolbarClippedViewRect(")
+        for required in ("overflow ? root.layer.bounds", "ancestor.hidden", "ancestor.opacity < 0.05",
+                         "ancestor.animationKeys.count", "CATransform3DIsIdentity(ancestor.transform)",
+                         "CATransform3DIsIdentity(ancestor.sublayerTransform)", "depth++ < 64",
+                         "ancestor.masksToBounds || ancestor == root.layer", "CGRectIntersection(visible, clip)"):
+            self.assertIn(required, clip)
+        anchor = function_body(self.layout, "static BOOL GXKToolbarImageRect(")
+        self.assertIn("GXKToolbarVisibleImageRect(view, base, &measured)", anchor)
+        self.assertIn("if (!GXKToolbarIconSized(measured)) return NO;", anchor)
+        physical = function_body(self.layout, "static BOOL GXKToolbarVisibleImageRect(")
+        self.assertNotIn("GXKToolbarIconSized", physical)
+        registry = function_body(self.visibility, "static BOOL GXKToolbarPrepareNativeObstacles(")
+        self.assertIn("BOOL leaf = key || [view isKindOfClass:[UIButton class]];", registry)
+        self.assertIn("for (UIView *body in gToolbarKeyboardBodies)", registry)
+        self.assertIn("![body isDescendantOfView:root]", registry)
+
+    def test_empty_content_never_bypasses_animated_layer_ancestry(self):
+        """Model opacity/bounds/nil contents cannot prove presentation pixels are absent."""
+        clip = function_body(self.visibility, "static BOOL GXKToolbarClippedViewRect(")
+        self.assertEqual(clip.count("return YES;"), 1)
+        self.assertIn("*outRect = invisible ? CGRectZero : visible; return YES;", clip)
+        self.assertLess(clip.index("ancestor.animationKeys.count"), clip.index("ancestor.opacity < 0.05"))
+        self.assertLess(clip.index("ancestor.animationKeys.count"), clip.index("if (ancestor == root.layer)"))
+        self.assertNotIn("if (CGRectIsEmpty(visible)) return YES;", clip)
+        self.assertNotIn("if (CGRectIsEmpty(clip)) return YES;", clip)
+        content = function_body(self.visibility, "static BOOL GXKToolbarContentRect(")
+        validation = content.index("GXKToolbarClippedViewRect(view, root, NO, &carrier)")
+        for empty_check in ("if (!populated) return YES;", "if (!(label.text.length", "if (![image isKindOfClass"):
+            self.assertLess(validation, content.index(empty_check))
 
     def test_toolbar_reuses_root_host_stack_and_replaces_constraints(self):
         """Same row/logo/root may reuse; only the patch stack receives constraints."""
@@ -358,9 +402,8 @@ class PerfContracts(unittest.TestCase):
         self.assertLess(measured, band.index("if (gToolbarBandCacheValid &&"))
         self.assertIn("if (!GXKToolbarGlyphRect(logo, row, &glyph))", band)
         self.assertIn("gToolbarBandCacheValid = NO; return NO;", band)
-        for geometry in ("CGRectGetMaxX(r) <= CGRectGetMinX(glyph) + 0.5",
-                         "CGRectGetMinX(r) >= CGRectGetMaxX(glyph) - 0.5",
-                         "CGFloat iconRight = CGRectGetMaxX(glyph);", "left = iconRight + 4.0;",
+        for geometry in ("CGFloat left = CGRectGetMaxX(glyph) + 4.0;", "CGRectGetMaxX(row.bounds)",
+                         "GXKToolbarNativeRightBoundary(root, logo, strip, &rightInRoot)",
                          "CGFloat barHeight = glyph.size.height;", "if (barHeight < 28.0) barHeight = 28.0;",
                          "CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;",
                          "[row convertRect:candidate toView:root]", "right - left >= 200.0",
@@ -371,7 +414,7 @@ class PerfContracts(unittest.TestCase):
         self.assertNotIn("CGRectMake(left, 0.0, right - left, height)", band)
 
     def test_image_measurement_requires_identified_original_foreground_layer(self):
-        image = function_body(self.layout, "static BOOL GXKToolbarImageRect(")
+        image = function_body(self.layout, "static BOOL GXKToolbarVisibleImageRect(")
         for required in ('NSClassFromString(@"GKBImageLayer")', "isKindOfClass:imageLayerClass",
                          "isKindOfClass:[UIImage class]", "respondsToSelector:@selector(image)",
                          "[(id<GXKNativeIconContent>)layer image] != image",
@@ -388,7 +431,7 @@ class PerfContracts(unittest.TestCase):
         self.assertNotIn("renderInContext", image)
 
     def test_image_geometry_uses_layer_pixel_scale_and_only_proven_gravity(self):
-        image = function_body(self.layout, "static BOOL GXKToolbarImageRect(")
+        image = function_body(self.layout, "static BOOL GXKToolbarVisibleImageRect(")
         for required in ("!isfinite(layer.contentsScale)", "layer.contentsScale <= 0.0",
                          "CGImageGetWidth(image.CGImage) / layer.contentsScale",
                          "CGImageGetHeight(image.CGImage) / layer.contentsScale",
@@ -406,7 +449,7 @@ class PerfContracts(unittest.TestCase):
             self.assertIn(required, finite)
 
     def test_image_measurement_clips_live_ancestors_and_rejects_complex_or_detached_geometry(self):
-        image = function_body(self.layout, "static BOOL GXKToolbarImageRect(")
+        image = function_body(self.layout, "static BOOL GXKToolbarVisibleImageRect(")
         for required in ("!root.window", "view.window != root.window", "![base isDescendantOfView:root]",
                          "![view isDescendantOfView:root]", "depth++ < 64", "ancestor = ancestor.superlayer",
                          "ancestor.hidden", "ancestor.opacity < 0.05", "ancestor.mask", "ancestor.animationKeys.count",
@@ -415,7 +458,7 @@ class PerfContracts(unittest.TestCase):
                          "if (ancestor.masksToBounds)", "[ancestor convertRect:ancestor.bounds toLayer:root.layer]",
                          "visible = CGRectIntersection(visible, clip)", "if (!GXKToolbarFiniteRect(visible)) return NO;",
                          "if (ancestor == root.layer)", "CGRectIntersection(visible, root.layer.bounds)",
-                         "[root.layer convertRect:visible toLayer:base.layer]", "!GXKToolbarIconSized(measured)"):
+                         "[root.layer convertRect:visible toLayer:base.layer]"):
             self.assertIn(required, image)
         success = image.index("return YES;")
         self.assertLess(image.index("visible = CGRectIntersection(visible, clip)"), success)
@@ -477,7 +520,7 @@ class PerfContracts(unittest.TestCase):
 
     def test_toolbar_cache_includes_fresh_glyph_and_root_geometry(self):
         band = function_body(self.layout, "static BOOL GXKToolbarBand(")
-        for required in ("gToolbarBandCacheSignature == signature", "gToolbarBandCacheEpoch == gToolbarBandEpoch",
+        for required in ("CGRectEqualToRect(gToolbarBandCacheCandidateRoot, candidateInRoot)", "gToolbarBandCacheEpoch == gToolbarBandEpoch",
                          "CGSizeEqualToSize(gToolbarBandCacheRowSize, row.bounds.size)",
                          "CGRectEqualToRect(gToolbarBandCacheGlyph, glyph)",
                          "CGRectEqualToRect(gToolbarBandCacheRowInRoot, rowInRoot)",
@@ -486,7 +529,8 @@ class PerfContracts(unittest.TestCase):
                          "gToolbarBandCacheRootBounds = root.bounds;", "return gToolbarBandCacheHit;"):
             self.assertIn(required, band)
         self.assertLess(band.index("GXKToolbarGlyphRect(logo, row, &glyph)"), band.index("if (gToolbarBandCacheValid &&"))
-        self.assertLess(band.index("if (gToolbarBandCacheValid &&"), band.index("CGFloat left = 0.0;"))
+        self.assertLess(band.index("GXKToolbarNativeRightBoundary(root, logo, strip, &rightInRoot)"),
+                        band.index("if (gToolbarBandCacheValid &&"))
         detach = function_body(self.source, "static void GXKDetachToolbar(void) {")
         self.assertIn("gToolbarBandEpoch++;", detach)
         self.assertIn("gToolbarBandCacheValid = NO;", detach)

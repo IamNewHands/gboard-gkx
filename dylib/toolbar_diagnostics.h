@@ -40,6 +40,8 @@ static void GXKToolbarDiagnosticResetGates(void) {
     gToolbarScanGate = @"not-evaluated";
     gToolbarBandGate = @"not-evaluated";
     gToolbarBandCandidateRoot = CGRectZero;
+    gToolbarRightBoundary = nil;
+    gToolbarRightBoundaryRect = CGRectZero;
     gToolbarSpaceGate = @"not-evaluated";
     gToolbarSpaceBand = CGRectZero;
     gToolbarSpaceBlocker = nil;
@@ -224,6 +226,9 @@ static NSString *GXKToolbarDiagnosticSnapshot(UIViewController *vc) {
     NSString *spaceGate = gToolbarSpaceGate ?: @"not-run";
     NSString *blocker = GXKToolbarDiagnosticView(gToolbarSpaceBlocker, root);
     NSString *blockerChain = GXKToolbarDiagnosticChain(gToolbarSpaceBlocker);
+    NSString *rightBoundary = GXKToolbarDiagnosticView(gToolbarRightBoundary, root);
+    NSString *rightBoundaryChain = GXKToolbarDiagnosticChain(gToolbarRightBoundary);
+    CGRect rightBoundaryRect = gToolbarRightBoundaryRect;
     // This validates the historical observation's identity/tree binding, not its freshness.
     BOOL usedValid = root && row && logo && logo.superview == row &&
                      (row == root || [row isDescendantOfView:root]) &&
@@ -233,12 +238,13 @@ static NSString *GXKToolbarDiagnosticSnapshot(UIViewController *vc) {
     CGFloat usedMid = CGRectGetMidY(gToolbarDiagnosticUsedGlyph);
     CGFloat bandMid = CGRectGetMidY(gToolbarBand);
     return [NSString stringWithFormat:
-        @"composingCached=%d stackHidden=%d feedbackActive=%d\nlastDecision=%@ decisionOwnerCurrent=%d scanGate=%@ bandGate=%@ bandCandidateRoot=%@ spaceGate=%@ spaceBandRoot=%@ obstacleComplete=%d obstacles=%lu keyboardBodies=%lu contentEpoch=%lu obstacleEpoch=%lu\nblocker=%@\nblockerChain=%@\nactionButton=%@\nselectedFont=%@/%.2f sourceCurrentFont=%@/%.2f\nsource=%@\nsourceChain=%@\nroot=%@\nrow=%@\nrowParent=%@\nlogo=%@\nbody=%@\nstack=%@\nbandRow=%@ cacheValid=%d epoch=%lu\nusedValid=%d usedGlyphRow=%@ unclampedTop=%.2f finalTop=%.2f usedBandDeltaY=%.2f freshBandDeltaY=%.2f usedObservationUptime=%.3f\nfreshGlyph: %@\n%@",
+        @"composingCached=%d stackHidden=%d feedbackActive=%d\nlastDecision=%@ decisionOwnerCurrent=%d scanGate=%@ bandGate=%@ bandCandidateRoot=%@ spaceGate=%@ spaceBandRoot=%@ obstacleComplete=%d obstacles=%lu keyboardBodies=%lu contentEpoch=%lu obstacleEpoch=%lu\nrightBound=%@\nrightBoundContentRoot=%@\nrightBoundChain=%@\nblocker=%@\nblockerChain=%@\nactionButton=%@\nselectedFont=%@/%.2f sourceCurrentFont=%@/%.2f\nsource=%@\nsourceChain=%@\nroot=%@\nrow=%@\nrowParent=%@\nlogo=%@\nbody=%@\nstack=%@\nbandRow=%@ cacheValid=%d epoch=%lu\nusedValid=%d usedGlyphRow=%@ unclampedTop=%.2f finalTop=%.2f usedBandDeltaY=%.2f freshBandDeltaY=%.2f usedObservationUptime=%.3f\nfreshGlyph: %@\n%@",
         gComposingActive, stack.hidden, GXKToolbarDiagnosticNow() < gToolbarDiagnosticFeedbackUntil,
         decision, vc == gToolbarDiagnosticLastOwner && root == gToolbarDiagnosticLastRoot, scanGate, gToolbarBandGate ?: @"not-run",
         NSStringFromCGRect(gToolbarBandCandidateRoot), spaceGate, NSStringFromCGRect(gToolbarSpaceBand),
         gToolbarObstacleComplete, (unsigned long)gToolbarObstacles.count, (unsigned long)gToolbarKeyboardBodies.count,
-        (unsigned long)gToolbarContentEpoch, (unsigned long)gToolbarObstacleEpoch, blocker, blockerChain,
+        (unsigned long)gToolbarContentEpoch, (unsigned long)gToolbarObstacleEpoch,
+        rightBoundary, NSStringFromCGRect(rightBoundaryRect), rightBoundaryChain, blocker, blockerChain,
         GXKToolbarDiagnosticView(gActionKeyButton, root),
         gToolbarFont.fontName ?: @"fallback-16", gToolbarFont ? (double)gToolbarFont.pointSize : 16.0,
         source.font.fontName ?: @"none", (double)source.font.pointSize,

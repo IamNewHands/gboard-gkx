@@ -7,6 +7,8 @@ static NSString *gToolbarBandGate;
 static CGRect gToolbarImageDrawnRoot, gToolbarImageVisibleRoot;
 static CGRect gToolbarBandCandidateRoot;
 static CGRect gToolbarBandCacheCandidateRoot;
+static __weak UIView *gToolbarRightBoundary;
+static CGRect gToolbarRightBoundaryRect;
 // Read native image-layer geometry; never infer drawing from UIView.contentMode or a full-row logo frame.
 static BOOL GXKToolbarIconSized(CGRect rect) {
     CGSize size = rect.size;
@@ -21,7 +23,7 @@ static BOOL GXKToolbarFiniteRect(CGRect rect) {
 
 // GKBImageViewWithBackground.layer is the foreground GKBImageLayer. Its background is a sibling,
 // and template/tinted images use a mask. Only the proven, unmasked original-image path is measured.
-static BOOL GXKToolbarImageRect(UIView *view, UIView *base, CGRect *outRect) {
+static BOOL GXKToolbarVisibleImageRect(UIView *view, UIView *base, CGRect *outRect) {
     if (outRect) *outRect = CGRectZero;
     gToolbarImageGate = @"binding";
     gToolbarImageDrawnRoot = CGRectZero;
@@ -77,7 +79,7 @@ static BOOL GXKToolbarImageRect(UIView *view, UIView *base, CGRect *outRect) {
             if (!GXKToolbarFiniteRect(visible)) return NO;
             gToolbarImageGate = @"visible-icon-size";
             CGRect measured = [root.layer convertRect:visible toLayer:base.layer];
-            if (!GXKToolbarFiniteRect(measured) || !GXKToolbarIconSized(measured)) return NO;
+            if (!GXKToolbarFiniteRect(measured)) return NO;
             gToolbarImageGate = @"measured";
             if (outRect) *outRect = measured;
             return YES;
@@ -85,6 +87,18 @@ static BOOL GXKToolbarImageRect(UIView *view, UIView *base, CGRect *outRect) {
     }
     gToolbarImageGate = @"layer-ancestry-incomplete";
     return NO; // Detached or incomplete layer ancestry cannot authorize an anchor.
+}
+
+// Only anchors require icon size. Physical obstacles may be partially clipped or larger.
+static BOOL GXKToolbarImageRect(UIView *view, UIView *base, CGRect *outRect) {
+    if (outRect) *outRect = CGRectZero;
+    CGRect measured = CGRectZero;
+    if (!GXKToolbarVisibleImageRect(view, base, &measured)) return NO;
+    gToolbarImageGate = @"visible-icon-size";
+    if (!GXKToolbarIconSized(measured)) return NO;
+    gToolbarImageGate = @"measured";
+    if (outRect) *outRect = measured;
+    return YES;
 }
 
 static void GXKToolbarGlyphCollect(UIView *view, UIView *base, NSMutableArray<NSValue *> *out) {
@@ -125,78 +139,50 @@ static BOOL GXKToolbarGlyphRect(UIView *view, UIView *base, CGRect *outRect) {
     return YES;
 }
 
-// 只借 G 图标那一段空白：左右边界各自停在最近一个可见兄弟视图之前。
-// 宁可窄到不显示，也绝不盖住候选栏或右侧功能图标。
+// Only actual visible native contents delimit the G band; containers alone reserve no pixels.
 static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outBand) {
     gToolbarBandGate = @"band-binding";
     gToolbarBandCandidateRoot = CGRectZero;
+    gToolbarRightBoundary = nil;
+    gToolbarRightBoundaryRect = CGRectZero;
     if (outBand) *outBand = CGRectZero;
-    if (!row || !logo || logo.superview != row) return NO;
-    CGFloat width = row.bounds.size.width;
+    if (!row || !logo || logo.superview != row || !root) return NO;
     CGRect logoRect = logo.frame;
     CGRect glyph = CGRectZero;
     if (!GXKToolbarGlyphRect(logo, row, &glyph)) { gToolbarBandGate = @"band-glyph-missing"; gToolbarBandCacheValid = NO; return NO; }
     CGRect rowInRoot = [row convertRect:row.bounds toView:root];
-    // 邻居签名：只读 frame/hidden/alpha，不做可见性上溯，代价是一次很短的循环。
-    NSUInteger signature = row.subviews.count * 2654435761u;
-    for (UIView *sibling in row.subviews) {
-        if (sibling == logo) continue;
-        CGRect sr = sibling.frame;
-        // 先落成有符号再转无符号：负坐标直接转 unsigned 是未定义行为。
-        signature = signature * 31u
-                  + (NSUInteger)(NSInteger)(CGRectGetMinX(sr) * 4.0)
-                  + (NSUInteger)(NSInteger)(CGRectGetMaxX(sr) * 4.0) * 7u
-                  + (NSUInteger)(NSInteger)(CGRectGetMinY(sr) * 4.0) * 13u
-                  + (NSUInteger)(NSInteger)(CGRectGetMaxY(sr) * 4.0) * 17u
-                  + (sibling.isHidden ? 1u : 0u) * 19u
-                  + (NSUInteger)(NSInteger)(sibling.alpha * 100.0) * 23u
-                  + (sibling == gToolbarStack ? 1u : 0u) * 29u;
+    CGFloat left = CGRectGetMaxX(glyph) + 4.0;
+    CGFloat right = CGRectGetMaxX(row.bounds);
+    CGFloat barHeight = glyph.size.height;
+    if (barHeight < 28.0) barHeight = 28.0;
+    CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;
+    GXKToolbarDiagnosticBandObserved(row, logo, glyph, top);
+    CGRect strip = [row convertRect:CGRectMake(left, top, MAX(0.0, right - left), barHeight) toView:root];
+    CGFloat rightInRoot = CGRectGetMaxX(strip);
+    // Re-read contents before cache reuse: image/text/items can change without an epoch event.
+    if (!GXKToolbarNativeRightBoundary(root, logo, strip, &rightInRoot)) {
+        gToolbarBandGate = @"band-native-space-unproven";
+        gToolbarBandCandidateRoot = strip;
+        gToolbarBandCacheValid = NO;
+        return NO;
     }
+    right = [row convertPoint:CGPointMake(rightInRoot, CGRectGetMinY(strip)) fromView:root].x;
+    CGRect candidate = CGRectMake(left, top, right - left, barHeight);
+    CGRect candidateInRoot = [row convertRect:candidate toView:root];
+    gToolbarBandCandidateRoot = candidateInRoot;
     if (gToolbarBandCacheValid && gToolbarBandCacheRow == row && gToolbarBandCacheLogo == logo &&
         CGSizeEqualToSize(gToolbarBandCacheRowSize, row.bounds.size) &&
         CGRectEqualToRect(gToolbarBandCacheLogoFrame, logoRect) &&
         CGRectEqualToRect(gToolbarBandCacheGlyph, glyph) &&
         CGRectEqualToRect(gToolbarBandCacheRowInRoot, rowInRoot) &&
         CGRectEqualToRect(gToolbarBandCacheRootBounds, root.bounds) &&
-        gToolbarBandCacheSignature == signature &&
+        CGRectEqualToRect(gToolbarBandCacheCandidateRoot, candidateInRoot) &&
         gToolbarBandCacheEpoch == gToolbarBandEpoch) {
         gToolbarBandGate = gToolbarBandCacheHit ? @"band-cache-hit" : @"band-cache-rejected";
-        gToolbarBandCandidateRoot = gToolbarBandCacheCandidateRoot;
         if (outBand) *outBand = gToolbarBandCacheBand;
         return gToolbarBandCacheHit;
     }
-    // 用图形矩形而不是 logo 视图矩形：视图常是整行宽，图形只占左边一小块。
-    // 用视图右缘算 left 会把它推到整行之外，band 宽度不足 200pt，工具条整条消失。
-    // 邻居也按图形矩形判左右：视图整行宽时，右侧功能图标会被误判成"在视图里面"，
-    // 右边界就落到行末，工具条会盖住它们。
-    CGFloat left = 0.0;
-    CGFloat right = width;
-    for (UIView *sibling in row.subviews) {
-        if (sibling == logo || sibling == gToolbarStack) continue; // 自己的条不算邻居。
-        if (sibling.isHidden || sibling.alpha < 0.05) continue;
-        if (!GXKKeyIsVisible(sibling, root)) continue;
-        CGRect r = sibling.frame;
-        if (CGRectGetMaxX(r) <= CGRectGetMinX(glyph) + 0.5) {
-            if (CGRectGetMaxX(r) > left) left = CGRectGetMaxX(r);
-        } else if (CGRectGetMinX(r) >= CGRectGetMaxX(glyph) - 0.5) {
-            if (CGRectGetMinX(r) < right) right = CGRectGetMinX(r);
-        }
-    }
-    CGFloat iconRight = CGRectGetMaxX(glyph);
-    if (iconRight > left) left = iconRight + 4.0;
-    // 竖向贴住已测量的可见图片中心；拿不到图层证据就不显示。
-    // 这样五个字读起来是 G 图标同一行的原生文字，而不是另起一条横带。
-    CGFloat barHeight = glyph.size.height;
-    // 高度至少 28pt：图形本身可能只有 20pt（图标留白），按它做条会挤到字。
-    // 仍以图形中心为准做垂直居中，所以视觉上还是"和 G 同一行"。
-    if (barHeight < 28.0) barHeight = 28.0;
-    CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;
-    GXKToolbarDiagnosticBandObserved(row, logo, glyph, top); // [DEBUG-toolbar] 实际 row 坐标，不再夹回 header。
-    // 五个中文按钮最少要 200pt；不够就整条不显示，保持原生。
-    CGRect candidate = CGRectMake(left, top, right - left, barHeight);
-    CGRect candidateInRoot = [row convertRect:candidate toView:root];
     BOOL hit = right - left >= 200.0 && CGRectContainsRect(root.bounds, candidateInRoot);
-    gToolbarBandCandidateRoot = candidateInRoot;
     gToolbarBandCacheCandidateRoot = candidateInRoot;
     gToolbarBandGate = hit ? @"band-clear" : right - left < 200.0 ? @"band-width" : @"band-outside-root";
     gToolbarBandCacheRow = row;
@@ -206,11 +192,10 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
     gToolbarBandCacheGlyph = glyph;
     gToolbarBandCacheRowInRoot = rowInRoot;
     gToolbarBandCacheRootBounds = root.bounds;
-    gToolbarBandCacheSignature = signature;
     gToolbarBandCacheEpoch = gToolbarBandEpoch;
     gToolbarBandCacheValid = YES;
     gToolbarBandCacheHit = hit;
-    gToolbarBandCacheBand = hit ? CGRectMake(left, top, right - left, barHeight) : CGRectZero;
+    gToolbarBandCacheBand = hit ? candidate : CGRectZero;
     if (outBand) *outBand = gToolbarBandCacheBand;
     return hit;
 }

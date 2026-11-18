@@ -1,6 +1,6 @@
 # 最新续跑状态
 
-- 当前状态：诊断 v2 源提交 cb5c13e 已推送、Actions44279394930 编译成功、unsigned IPA 结构与字节校验 PASS，待用户 LCSign 自签安装并返回报告。上一版20b57f6真机验收失败（整行工具栏消失、只剩G），显示根因仍未证实、不宣称已修复。以下旧修复记录是历史证据；本次v2交付在末节。
+- 当前状态：用户已提供 log3.txt 并明确继续修复。19 个真机样本中 6 个空闲态被 band-width 拦截（x43..56，仅13pt<200），13个组字/过渡态无可测G；此前所有space分支均未执行。正在修复实际可见内容空位判断，尚未编译/交付本轮IPA，不宣称真机恢复。以下旧修复/诊断交付均为历史证据。
 - 修复源提交：main / 20b57f6863c1fe953d1deacef15bc5d76514e1b7，已推送 origin=https://github.com/IamNewHands/gboard-gkx.git；本地与远端该 SHA 一致。
 - 已完成：稳定回车字体 owner、真实 foreground GKBImageLayer 与祖先 masksToBounds 测量、根坐标约束、弱引用原生障碍及九键/独立26键实时门控；独立复核通过，最终118项回归 OK。
 - CI：https://github.com/IamNewHands/gboard-gkx/actions/runs/44266198725，headSha 与修复提交相同，macOS 15 arm64/iOS12+ clang、QuartzCore 链接、ldid 与 artifact 上传均成功，编译日志无 warning/error。
@@ -9,6 +9,17 @@
 - 更正：Chrome/CDP 不应作为 GitHub CLI 的前置条件；用户指定 CLI 后已直接推送和编译。此前失败来自受限 schannel 凭据/网络上下文，不是 CI；当前 danger-full-access 成功。校验器一度错误要求每个 Gboard 可执行文件含完整 group 字符串；原包真实 owner 为共享框架，已纠正并加强允许变更之外的字节对比，产物无重打包。
 - 真机下一步：LCSign 自签安装此包，检查初始/输入中/清空后三态字体与G对齐、工具栏点击及9↔26切换；测量不完整或可见G不足8pt时仍会安全不显示。诊断默认关闭，长按复制0.8秒开始/停止内存采样；验收通过后移除诊断接线。
 - 工作区保护：预存 CON 与 probe-zwb2izzd/ 无关，不 stage、不删除；新提取目录 dist/pack-20b57f6 保留。没有 PR/Release、强推或新增分支。
+
+## log3 空位修复（2026-11-18 18:35，进行中）
+
+- TaskStartSnapshot：main / 57e385e25020e549c1e672399a4feede065386ef；仅预存CON未跟踪。用户授权代码修复、测试/独立审阅、直接push main、Actions编译及unsigned IPA，无PR/Release。
+- Change Necessity / Decision: code-change：不能靠改字号或放宽200pt门槛修复“容器外框被当成内容”的责任错误。最小边界为布局/实际内容owner共用可见障碍矩形、临时边界取证与对应契约测试；原生几何/输入/手势不改。
+- PatchShape / CanonicalOwner：原band逐兄弟外框边界与NativeSpaceClear实际内容判据分裂；改为共享弱注册表和同一ContentRect，最近右侧实际内容限制band，最终仍重查全部障碍及九键/独立26键。ArchitectureReviewRequired: yes（共享几何/内容接口），采用只读owner审阅及最终独立审阅；无需新架构文档。
+- Minimality / OwnerFit：在现有layout/visibility文件抽出注册准备/实际矩形/right边界helper；不新增fallback owner。失效责任为任意兄弟UIView.frame决定占位；合法右侧按键/候选/图片保留实际内容与完整裁切后触摸区域。内部code-retirement，无外部契约/持久化删除；不删除文件或原生对象。缓存必须先评估实时内容矩形再复用，不能靠旧兄弟签名/epoch证明空位。TDD Route: off。
+- 已检查风险：上部G的36pt载体外框与实际可见22x2pt不同，障碍测量与G锚点授权分离（锚点仍8..64）；不支持的非空图片用保守裁切后外框，复杂/动画几何不能授权空间。空collection需继续检查其子视图以保留supplementary内容。原包静态NIB不能证明本次x56对象当前为空，修复按实时内容判断，不硬编码类名/x56。
+- 验证计划：日志几何回放与非空候选/右图标/跨左边界/祖先裁切/大图片/既有载体无事件内容翻转/9↔26反例；Python源码契约非UIKit，云端clang与原包字节/ZIP/加载/权限独立校验后交付待真机验收。默认关闭的v2诊断保留，增补真实rightBound对象，根因修复并真机验收后再撤。
+- 续跑实测（18:57）：129项静态契约已通过，前轮“1失败”为旧工作树记录而非当前结果；前轮space-repair-review因上游模型报错中断，没有审阅结论，本轮重启space-review/package-review。独立审阅定位model opacity/bounds判空可先于祖先animation检查；现同一ClippedViewRect完整检查图层链，到root唯一成功出口，ContentRect即使nil image/text/items也先验证载体链。注册UICollectionReusableView并继续检查子视图，保留自绘supplementary完整区域。新鲜130项/0.038s/OK、git diff --check exit0。
+- 覆盖边界：弱注册表对已登记载体每次重读内容；新增/移除子树仍依赖controller文字/布局/生命周期epoch，无事件结构突变未经UIKit验证。保守拒绝动画/复杂图层，可能过渡中暂时隐藏；不承诺自动放行。本轮源码独立复核Important动画项已关闭、无剩余Critical/Important；fresh130项/0.036s/OK。用户本轮明确回复“直接推送，后续不要再询问了，记到记忆里”，已授权直接push main/Actions/unsignedIPA，不包含强推、PR/Release/原包上传。打包校验器来源与固定原包断言缺口由package-review补强中；生产源码先提交编译，验包闭合后交付。
 
 ## 整行消失回归：诊断 v2（2026-11-18）
 

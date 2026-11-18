@@ -543,8 +543,8 @@ static __weak UIView *gToolbarHost;
 static __weak UIView *gToolbarLogoView;
 static __weak UIView *gToolbarNineBody;
 static CGRect gToolbarBand;
-// band 只由「宿主行尺寸 + G 图标位置 + 同行可见邻居」决定。后者的判定要沿父链 convertRect，
-// 是这条路径上唯一还会每拍重复的工作：用邻居几何算一个签名，签名没变就直接复用上次结果。
+// Cache validates measured G/root geometry and the freshly computed native-content boundary.
+// Native content is always read first; discovery alone is event-scoped.
 static __weak UIView *gToolbarBandCacheRow;
 static __weak UIView *gToolbarBandCacheLogo;
 static CGSize gToolbarBandCacheRowSize;
@@ -552,7 +552,7 @@ static CGRect gToolbarBandCacheLogoFrame;
 static CGRect gToolbarBandCacheGlyph;
 static CGRect gToolbarBandCacheRowInRoot;
 static CGRect gToolbarBandCacheRootBounds;
-static NSUInteger gToolbarBandCacheSignature;
+static BOOL GXKToolbarNativeRightBoundary(UIView *root, UIView *logo, CGRect strip, CGFloat *outRight);
 static NSUInteger gToolbarBandCacheEpoch;
 static BOOL gToolbarBandCacheValid;
 static BOOL gToolbarBandCacheHit;
