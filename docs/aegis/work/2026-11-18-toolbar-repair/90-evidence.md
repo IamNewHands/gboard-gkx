@@ -1,5 +1,15 @@
 # 已实测证据与未覆盖边界
 
+## 2026-11-18 17:53 诊断 v2 交付实测
+
+- 用户在旧包20b57f6上报告整行工具栏消失、只剩G；旧包编译/结构成功不证明显示已修复。当前v2只补可达诊断与反馈可靠性，不改变生产显示门禁。
+- 127项Python源码契约（0.036s）和git diff --check exit0；独立复核无Critical/Important。源码证明门禁保持、摘要与延迟反馈绑定到当前owner/root；不替代UIKit。
+- 源cb5c13ebd2400e912a64b4c9b322332bba52f4d8已推送；https://github.com/IamNewHands/gboard-gkx/actions/runs/44279394930 success（build28s），arm64/iOS12+编译链接和ldid成功，编译步骤无warning/error。平台注释提示Node20 actions强制Node24、macOS arm64容量提示；未改本次构建范围。
+- CI artifact14415678917（libgkx），archive SHA2566987bbbb7fdcc43b1e2e2b3ad7a0438c53a3fba4b78391e3fb9221d6b900d2a1，经API精确SHA/run/artifact/未过期身份、archive哈希、ZIP CRC和dylib字节比对通过。dylib SHA256f85732573758523cc8497ddd2866d46593d7d40caac4a116baf81823336afe39。
+- dist/gboard-gkx-cb5c13e-toolbar-diagnostic-v2-unsigned.ipa：35971004bytes，SHA256d30d7a5f6228569eab2f068a57cc4531e29940fbada8e23e1700b6622fb16ad0；dist/gboard-gkx-cb5c13e-toolbar-diagnostic-v2-verification.json为PASS回执。执行dist/package-toolbar-diagnostic-v2.sh含preflight/注入/final全部exit0。
+- ZIP2050条，仅新增dylib与词库、移除3旧签名文件；Gboard2.3.19与keyboard-service扩展保持。两个exe各一个@rpath/libgkx.dylib，原段/RPATH不移动；group真实owner为共享框架8处。允许的二进制差异为共享框架176bytes、主exe28bytes、appex27bytes，所有其余2045原生文件逐字节与权限保持。
+- 未覆盖：iPhone17Pro/iOS27自签后的UIKit长按/输入/字体/G/三态/9↔26。需要用户长按「换行」0.8秒开始，等2秒输入拼音、清空，再长按停止，返回首行为GXK toolbar diagnostic v2的剪贴板报告。60秒超时不自动写剪贴板。诊断默认关闭、60s/80样本/196608字符，不读输入、无网络或磁盘日志；根因修复并真机验收后退役。源码/构建/包证据可信，设备修复结论仍needs-verification。
+
 ## 2026-11-18 16:27 交付前实测
 
 - 修复提交20b57f6863c1fe953d1deacef15bc5d76514e1b7已推送 main；Actions44266198725 success，clang arm64/iOS12+/QuartzCore 编译成功，无编译 warning/error。
