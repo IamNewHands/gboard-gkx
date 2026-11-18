@@ -1,18 +1,18 @@
 # 最新续跑状态
 
-- 当前状态：log4条带越行源码修复与本地回归闭合；139项Python源码契约与数值回放通过，最终独立源码复核无剩余Critical/Important，诊断Minor与数值回放Minor均已闭合。点击条带夹限在原生row/root内，完整G按键区域保留，文字单独对齐实测G；不以image-only或缩字恢复显示。本轮仅本地源码交付，提交以main最新fix(toolbar): separate native-safe hit band from G-aligned titles为准；未推送/编译/产出新IPA，UIKit/真机验收未完成。旧3574c24包仍是上一轮产物，不能冒充本轮修复包。
+- 当前状态：用户已授权推送/编译/出包，修复源ab5fafd54a89a68b9faf1b3ef5f8b0eea21c2826及CI-only提交ccdb888505211f1fff485e363190c8432771976b已推送main。首次macos-15分配失败；仅改macos-15-intel后run44302485661编译/伪签名/上传成功。新未签名IPA已生成且preflight/inject/final通过，独立最终验包exit0/PASS，实物哈希与回执一致，进入文件交付。139项源码/数值回归及23项验包测试通过；UIKit/真机仍needs-verification。旧3574c24包保留，不是本轮交付。
 
 ## log4 条带越行修复（本地源码阶段闭合；真机needs-verification）
 
-- TaskStartSnapshot：main / a02c806；仅预存 CON 与 probe-zwb2izzd/ 无关，不修改或暂存。用户本轮要求继续修复；本轮先闭合本地修复/回归/复核，不把旧文档的发布授权当成本轮新授权。
+- 修复开始时TaskStartSnapshot：main / a02c806；仅预存 CON 与 probe-zwb2izzd/ 无关，不修改或暂存。当时仅授权本地修复；后续用户明确要求推送并编译出包，发布阶段从ab5fafd开始，CI-only重试为ccdb888；不把旧文档授权当作新授权。
 - Change Necessity / Decision: code-change：log4 的下方真实 G 可见 root=(17,26,22,20)，28pt 自有条带居中后 root=(43,22,359,28)，向上侵入原生上行 4pt；完整原生命中障碍使宽度归零。改字号或放宽 200pt 不解决条带所有权错误。
 - PatchShape / CanonicalOwner：现有 GXKToolbarBand 同时负责文字锚点与 hit band，最小修复在 toolbar_layout.h 将 hit band 约束在实测 row 内，向现有 GXKToolbarButton 传递同次实测 G 中心，单独布局自有 title/divider；bound/rebuild/cache 路径共享此测量。ArchitectureReviewRequired: yes（共享视觉与交互几何），采用独立只读设计/最终复核，不新增布局或 fallback owner。TDD Route: off。
 - Minimality / OwnerFit：退役“最小28pt点击条带必须与G共用中心且可越行”的内部责任；保留 G 实际可见图中心、原生回车字体、28pt目标、透明五格、原生所有键/候选/图片和独立26键优先。既有大 gkx.m 仅现有按钮布局及局部接线，不新增原生hook；不修改原生几何/alpha/hidden/globaltouch/键盘高度，不删除文件/持久化/外部契约。Anti-Entropy: code-retirement / delete-first，保留合法原生命中 carrier；无不可逆删除。
 - 原生正证据：原包 GKBHeaderLogoView 继承 GKBSoftKeyView，有 hitTest:withEvent:；Logo 圆形host分支以外回到父类，父类在 softKeyDef 非nil 时按 bounds 返回self。不能把上部全宽Logo改当纯图像/忽略它；本轮 visibility owner不变。
-- 验证计划：log4 4pt越行回放、非零 row bounds/上下沿/过短row/无G/原生障碍/实际文字高不足/字号变化与同band G移动；fresh Python源码契约加几何回放及最终diff独立复核。回放不是UIKit；本机无iOS clang/SDK，CI、新IPA及iPhone文字/点击/三态/9↔26仍需分开验证。诊断默认关闭并暂时保留，真机验收后撤。
+- 验证计划：log4 4pt越行回放、非零 row bounds/上下沿/过短row/无G/原生障碍/实际文字高不足/字号变化与同band G移动；fresh Python源码契约加几何回放及最终diff独立复核。回放不是UIKit；本机无iOS clang/SDK。当前CI/新IPA已验证结构，iPhone文字/点击/三态/9↔26仍未验证。诊断默认关闭并暂时保留，真机验收后撤。
 
-- 本轮终验：139项/0.041s/OK，diff check exit0；独立源码复核覆盖最终rowContains与unclamped诊断顺序；独立测试增量8项/exit0，覆盖合法非零bounds、candidate越出row与NaN/±Inf。可信度C仅指产品修复尚缺UIKit/真机证据，不否定本地已执行结果。任务内8文件，预存CON保留；未新建分支/worktree，无后台job。
-- 续跑：先读本段、90-evidence.md与agent.md，再核对main HEAD/工作树；下一个有效动作是获得本轮推送/CI/出包授权后对精确提交编译与验包，真机测初始/组字/清空、G文字中心、触摸、9↔26和空剪贴板失败提示恢复。不得重发旧包或由346pt几何宽度推导已显示。
+- 本轮终验：139项/0.067s/OK，diff check exit0；独立源码复核覆盖最终rowContains与unclamped诊断顺序；独立测试增量8项/exit0，覆盖合法非零bounds、candidate越出row与NaN/±Inf。可信度C仅指产品修复尚缺UIKit/真机证据，不否定本地已执行结果。任务内8文件，预存CON保留；未新建分支/worktree，无后台job。
+- 续跑：推送/编译/本地出包授权已满足；先读本段、90-evidence.md与agent.md，再核对main HEAD/工作树；最终独立验包已通过；交付dist/gboard-gkx-ccdb888-toolbar-space-repair-unsigned.ipa。用户用LCSign自签验证初始/组字/清空、G文字中心、触摸、9↔26和空剪贴板失败提示恢复。不得重发旧包或由346pt几何宽度推导已显示；不上传原IPA，不创建Release。
 
 ## 旧修复交付（以下至log3章节均为历史，不是当前源提交）
 - 修复源提交：main / 20b57f6863c1fe953d1deacef15bc5d76514e1b7，已推送 origin=https://github.com/IamNewHands/gboard-gkx.git；本地与远端该 SHA 一致。
