@@ -118,6 +118,8 @@ static NSString *GXKProbeKeyLine(UIView *view) {
 
 static void GXKProbeDumpSymbols(NSString *reason, UIView *root);
 static void GXKProbeAttachSymbolTap(UIView *root);
+static UIView *GXKProbeSymbolHost(UIView *root);
+static BOOL gProbeWasOnSymbols;
 
 static void GXKProbeNoteLayout(NSString *reason) {
     if (!gProbeMarked) return;
@@ -143,12 +145,24 @@ static void GXKProbeNoteLayout(NSString *reason) {
     if ([fingerprint isEqualToString:gProbeLastFingerprint ?: @""]) return;
     gProbeLastFingerprint = fingerprint;
     GXKProbeLog(@"layout", @"%@ body=%@ keys=%@", reason, GXKProbeClassName(body),
-                GXKProbeClip(fingerprint, 500));
-    GXKProbeDumpSymbols(reason, vc.view);
-    GXKProbeAttachSymbolTap(vc.view);
+                GXKProbeClip(fingerprint, 300));
+    // A page flip is the interesting event: record who drove it, once per flip.
+    UIView *symbolHost = GXKProbeSymbolHost(vc.view);
+    BOOL onSymbols = symbolHost != nil;
+    if (onSymbols != gProbeWasOnSymbols) {
+        gProbeWasOnSymbols = onSymbols;
+        GXKProbeLog(@"page", @"%@ -> %@ stack=%@", onSymbols ? @"symbols" : @"keys",
+                    reason, GXKProbeStack());
+    }
+    if (onSymbols) {
+        GXKProbeDumpSymbols(reason, vc.view);
+        GXKProbeAttachSymbolTap(vc.view);
+    }
 }
 
 // ---- v4: symbol page inventory (public UIKit only) ----
+
+static UIView *GXKProbeSymbolHost(UIView *root);
 
 static NSString *GXKProbeRect(CGRect rect, UIView *root) {
     return [NSString stringWithFormat:@"%.0f,%.0f,%.0f,%.0f",
@@ -342,12 +356,47 @@ static void gxk_probe_void_bool(id self, SEL _cmd, BOOL value) {
     if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, value);
 }
 
-// A substring match ("Key") would sweep hundreds of unrelated classes; only the
-// keyboard's own prefixes are touched.
-static BOOL GXKProbeNameAllowed(const char *name) {
-    if (!name) return NO;
-    return strncmp(name, "GKB", 3) == 0 || strncmp(name, "UIKeyboard", 10) == 0 ||
-           strncmp(name, "TIKeyboard", 10) == 0 || strncmp(name, "TUIKeyboard", 11) == 0;
+// Only classes that DECLARE the selector are hooked. Inheriting a method is not
+// enough: matching by class-name prefix missed every owner in v3-v5 (switch=0).
+static BOOL GXKProbeDeclares(Class cls, SEL sel) {
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    if (!methods) return NO;
+    BOOL found = NO;
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(methods[i]) == sel) { found = YES; break; }
+    }
+    free(methods);
+    return found;
+}
+
+static id gxk_probe_id_void(id self, SEL _cmd) {
+    IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
+    if (gProbeMarked) {
+        GXKProbeLog(@"switch", @"%@ -%s stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
+                    GXKProbeStack());
+    }
+    if (!orig) return nil;
+    return ((id (*)(id, SEL))orig)(self, _cmd);
+}
+
+static void gxk_probe_void_bool_obj(id self, SEL _cmd, BOOL value, id arg) {
+    IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
+    if (gProbeMarked) {
+        GXKProbeLog(@"switch", @"%@ -%s(%d,%@) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
+                    (int)value, GXKProbeClassName(arg), GXKProbeStack());
+    }
+    if (orig) ((void (*)(id, SEL, BOOL, id))orig)(self, _cmd, value, arg);
+}
+
+static id gxk_probe_id_obj_obj(id self, SEL _cmd, id a, id b) {
+    IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
+    if (gProbeMarked) {
+        GXKProbeLog(@"switch", @"%@ -%s(%@,%@) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
+                    GXKProbeClassName(a), GXKProbeClassName(b), GXKProbeStack());
+    }
+    if (!orig) return nil;
+    return ((id (*)(id, SEL, id, id))orig)(self, _cmd, a, b);
 }
 
 static void GXKProbeSwizzle(SEL sel, IMP hook) {
@@ -358,7 +407,7 @@ static void GXKProbeSwizzle(SEL sel, IMP hook) {
     count = objc_getClassList(classes, count);
     for (int i = 0; i < count; i++) {
         Class cls = classes[i];
-        if (!cls || !GXKProbeNameAllowed(class_getName(cls))) continue;
+        if (!cls || !GXKProbeDeclares(cls, sel)) continue;
         Method method = class_getInstanceMethod(cls, sel);
         if (!method) continue;
         IMP current = method_getImplementation(method);
@@ -375,8 +424,12 @@ static void GXKProbeInstallHooks(void) {
     if (gProbeHooksInstalled) return;
     gProbeHooksInstalled = YES;
     GXKProbeSwizzle(@selector(keyboardViewWithLayoutName:), (IMP)gxk_probe_id_obj);
+    GXKProbeSwizzle(@selector(addKeyboardView:withLayoutName:), (IMP)gxk_probe_id_obj_obj);
     GXKProbeSwizzle(@selector(setSoftkeyLayoutName:), (IMP)gxk_probe_void_obj);
+    GXKProbeSwizzle(@selector(setLayoutName:), (IMP)gxk_probe_void_obj);
+    GXKProbeSwizzle(@selector(parseLayoutName), (IMP)gxk_probe_id_void);
     GXKProbeSwizzle(@selector(updateLayoutAnimated:), (IMP)gxk_probe_void_bool);
+    GXKProbeSwizzle(@selector(updateLayoutAnimated:completion:), (IMP)gxk_probe_void_bool_obj);
     GXKProbeLog(@"hook", @"installed");
 }
 
