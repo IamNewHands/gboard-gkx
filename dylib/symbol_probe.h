@@ -188,8 +188,9 @@ static void GXKProbeDumpSymbols(NSString *reason, UIView *root) {
                              GXKProbeRect([host convertRect:host.bounds toView:root], root)];
     if ([host isKindOfClass:[UIScrollView class]]) {
         UIScrollView *scroll = (UIScrollView *)host;
-        [head appendFormat:@" offset=%@ size=%@",
-         GXKProbeRect(scroll.contentOffset, root), GXKProbeRect(scroll.contentSize, root)];
+        [head appendFormat:@" offset=%.0f,%.0f size=%.0f,%.0f",
+         scroll.contentOffset.x, scroll.contentOffset.y,
+         scroll.contentSize.width, scroll.contentSize.height];
     }
     if ([host isKindOfClass:[UICollectionView class]]) {
         UICollectionView *collection = (UICollectionView *)host;
