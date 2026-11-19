@@ -175,8 +175,25 @@ static UIView *GXKProbeSymbolHost(UIView *root) {
     return nil;
 }
 
-// Every label text and frame on the symbol page, in mount order: this is what the
-// double-tap lock has to reason about, and none of it needs a private accessor.
+// The glyph and its pair sit on separate layers, so a one-level scan finds nothing.
+static void GXKProbeCollectLabels(UIView *view, UIView *root, NSMutableArray<NSString *> *out,
+                                  NSUInteger depth) {
+    if (!out || depth > 3 || out.count >= 8) return;
+    for (UIView *child in view.subviews) {
+        if ([child isKindOfClass:[UILabel class]]) {
+            UILabel *label = (UILabel *)child;
+            [out addObject:[NSString stringWithFormat:@"'%@'|%@|h=%d|%@",
+                            label.text ?: @"",
+                            GXKProbeRect([label convertRect:label.bounds toView:root], root),
+                            label.isHidden, label.font.fontName]];
+        } else {
+            GXKProbeCollectLabels(child, root, out, depth + 1);
+        }
+    }
+}
+
+// Every label text and frame on the symbol page, ordered by collection index: this is
+// what the double-tap lock has to reason about, and none of it needs a private accessor.
 static void GXKProbeDumpSymbols(NSString *reason, UIView *root) {
     UIView *host = GXKProbeSymbolHost(root);
     if (!host) {
@@ -200,44 +217,31 @@ static void GXKProbeDumpSymbols(NSString *reason, UIView *root) {
         [head appendFormat:@" cells=%ld", (long)items];
     }
     GXKProbeLog(@"symbols", @"%@", head);
-    // Visible cells first: they carry the real on-screen geometry.
-    NSMutableArray<UIView *> *targets = [NSMutableArray array];
+    // Cells are emitted by collection index, never by visibleCells order: the index is
+    // the only stable key the double-tap lock can hold on to.
+    NSMutableArray<NSIndexPath *> *indexes = [NSMutableArray array];
     if ([host isKindOfClass:[UICollectionView class]]) {
-        for (UICollectionViewCell *cell in ((UICollectionView *)host).visibleCells) [targets addObject:cell];
-    }
-    if (!targets.count) {
-        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:host];
-        NSUInteger visited = 0;
-        while (stack.count && visited++ < 400 && targets.count < 40) {
-            UIView *view = stack.lastObject;
-            [stack removeLastObject];
-            [targets addObject:view];
-            [stack addObjectsFromArray:view.subviews];
+        UICollectionView *collection = (UICollectionView *)host;
+        for (UICollectionViewCell *cell in collection.visibleCells) {
+            NSIndexPath *path = [collection indexPathForCell:cell];
+            if (path) [indexes addObject:path];
         }
+        [indexes sortUsingComparator:^NSComparisonResult(NSIndexPath *a, NSIndexPath *b) {
+            if (a.item == b.item) return NSOrderedSame;
+            return a.item < b.item ? NSOrderedAscending : NSOrderedDescending;
+        }];
     }
     NSUInteger emitted = 0;
-    for (UIView *view in targets) {
-        if (emitted++ >= 40) break;
-        NSMutableString *line = [NSMutableString stringWithFormat:@"cell=%@ frame=%@",
-                                 GXKProbeClassName(view),
-                                 GXKProbeRect([view convertRect:view.bounds toView:root], root)];
-        NSString *ident = view.restorationIdentifier;
-        if ([ident isKindOfClass:[NSString class]] && ident.length) [line appendFormat:@" id=%@", ident];
-        if ([view isKindOfClass:[UILabel class]]) {
-            NSString *text = ((UILabel *)view).text;
-            if ([text isKindOfClass:[NSString class]]) [line appendFormat:@" text=%@", text];
-        }
+    for (NSIndexPath *path in indexes) {
+        if (emitted++ >= 24) break;
+        UICollectionViewCell *cell = [((UICollectionView *)host) cellForItemAtIndexPath:path];
+        if (!cell) continue;
+        NSMutableString *line = [NSMutableString stringWithFormat:@"i=%ld frame=%@",
+                                 (long)path.item,
+                                 GXKProbeRect([cell convertRect:cell.bounds toView:root], root)];
         NSMutableArray<NSString *> *labels = [NSMutableArray array];
-        for (UIView *child in view.subviews) {
-            if (![child isKindOfClass:[UILabel class]]) continue;
-            UILabel *label = (UILabel *)child;
-            NSString *text = label.text ?: @"";
-            [labels addObject:[NSString stringWithFormat:@"%@|%@|hidden=%d|%@", text,
-                               GXKProbeRect([label convertRect:label.bounds toView:root], root),
-                               label.isHidden, label.font.fontName]];
-        }
-        if (labels.count) [line appendFormat:@" labels=[%@]", [labels componentsJoinedByString:@";"]];
-        [line appendFormat:@" sub=%lu", (unsigned long)view.subviews.count];
+        GXKProbeCollectLabels(cell, root, labels, 0);
+        [line appendFormat:@" labels=[%@]", [labels componentsJoinedByString:@";"]];
         GXKProbeLog(@"symbols", @"%@", line);
     }
 }
@@ -254,17 +258,23 @@ static void GXKProbeDumpSymbols(NSString *reason, UIView *root) {
     UIView *host = gesture.view;
     if (![host isKindOfClass:[UIView class]]) return;
     CGPoint point = [gesture locationInView:host];
-    UIView *hit = [host hitTest:point withEvent:nil];
-    NSMutableArray<NSString *> *chain = [NSMutableArray array];
-    for (UIView *view = hit; view && view != host && chain.count < 6; view = view.superview) {
-        NSString *ident = view.restorationIdentifier;
-        NSString *text = [view isKindOfClass:[UILabel class]] ? ((UILabel *)view).text : nil;
-        [chain addObject:[NSString stringWithFormat:@"%@%@%@", GXKProbeClassName(view),
-                          ident.length ? [@"#" stringByAppendingString:ident] : @"",
-                          text.length ? [@"(" stringByAppendingFormat:@"%@)", text] : @""]];
+    NSMutableString *line = [NSMutableString stringWithFormat:@"at=%.0f,%.0f", point.x, point.y];
+    if ([host isKindOfClass:[UICollectionView class]]) {
+        UICollectionView *collection = (UICollectionView *)host;
+        // hitTest: on the collection itself returns nil (it forwards through its own
+        // gesture pipeline), so resolve the cell from the point instead.
+        NSIndexPath *path = [collection indexPathForItemAtPoint:point];
+        [line appendFormat:@" i=%ld", (long)(path ? path.item : -1)];
+        UICollectionViewCell *cell = path ? [collection cellForItemAtIndexPath:path] : nil;
+        if (cell) {
+            NSMutableArray<NSString *> *labels = [NSMutableArray array];
+            GXKProbeCollectLabels(cell, collection, labels, 0);
+            [line appendFormat:@" labels=[%@]", [labels componentsJoinedByString:@";"]];
+            CGPoint inCell = [gesture locationInView:cell];
+            [line appendFormat:@" inCell=%.0f,%.0f", inCell.x, inCell.y];
+        }
     }
-    GXKProbeLog(@"tap", @"at=%.0f,%.0f chain=%@", point.x, point.y,
-                chain.count ? [chain componentsJoinedByString:@" < "] : @"none");
+    GXKProbeLog(@"tap", @"%@", line);
 }
 @end
 
@@ -279,6 +289,7 @@ static void GXKProbeAttachSymbolTap(UIView *root) {
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
         initWithTarget:gProbeSymbolTap action:@selector(onSymbolTap:)];
     tap.cancelsTouchesInView = NO; // never swallow the real key tap.
+    tap.delaysTouchesEnded = NO;
     [host addGestureRecognizer:tap];
     GXKProbeLog(@"tap", @"attached to %@", GXKProbeClassName(host));
 }
@@ -372,14 +383,14 @@ static void GXKProbeInstallHooks(void) {
 static NSString *GXKProbeReport(void) {
     NSMutableString *out = [NSMutableString string];
     @synchronized(GXKProbeLock()) {
-        [out appendFormat:@"GXK symbol probe v4\niOS=%@ lines=%lu%s\n",
+        [out appendFormat:@"GXK symbol probe v5\niOS=%@ lines=%lu%s\n",
          [UIDevice currentDevice].systemVersion,
          (unsigned long)(gProbeRing ? gProbeRing.count : 0),
          gProbeMarked ? " marked" : ""];
         [out appendString:@"read-only: every hooked call forwards; no key property is read.\n"
                            "layout = visible key identifiers of the 9-key body, in mount order.\n"
                            "symbols host= = the symbol page container (key_pos_9keys_symbols).\n"
-                           "symbols cell= = one visible cell: frame, label texts, fonts.\n"
+                           "symbols i= = one visible cell by collection index: frame, label texts, fonts.\n"
                            "tap = one finger tap on the symbol page: hit chain from label up.\n"];
         if (gProbeRing) [out appendString:[gProbeRing componentsJoinedByString:@""]];
     }
