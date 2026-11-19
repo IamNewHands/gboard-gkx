@@ -1245,9 +1245,14 @@ static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
     });
 }
 
+// symbol_doubletap.h 在下方引入（它依赖 GXKSwizzleOrSkip），这里先声明布局回调要用到的失效函数。
+static void GXKSymbolInvalidatePageCache(void);
+
 static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
     if (gOrigViewDidLayoutSubviews) gOrigViewDidLayoutSubviews(self, _cmd);
     if ((UIViewController *)self != gCurrentVC) return;
+    // 换页必然触发布局：符号页判定的缓存此刻失效，下一次询问重新扫描。
+    GXKSymbolInvalidatePageCache();
     gToolbarContentEpoch++;
     // 布局回调一帧内可能来几十次（任何 setNeedsLayout 都会触发）：
     // 合并成一次异步刷新，只保留最后一次，避免同一帧反复全量重算。
@@ -1278,6 +1283,7 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     GXKApplyMiniAppAndSuggestionHooks(); // 分页裁剪与历史删除：类未就绪时下次出现再试。
     GXKInstallPhrasesHooks(); // 常用语分页：同上。
     GXKInstallMainAppHooks(); // 主 App 侧入口（键盘进程里类不存在，自然跳过）。
+    GXKSymbolInstallHooks(); // 符号页双击/停留：构造函数时类若未加载，这里补挂。
 
     // 部署外部万象词库
     GXKEnsureUserDictionaryDeployed();
@@ -1439,6 +1445,9 @@ static void GXKSwizzleOrSkip(NSString *className, NSString *selName, IMP imp, vo
     if (orig) *orig = (void *)method_getImplementation(m);
     method_setImplementation(m, imp);
 }
+
+// 九键符号页：双击上屏并停留（依赖上面的 GXKSwizzleOrSkip）。
+#import "symbol_doubletap.h"
 
 static void GXKInstallMiniAppHooks(void) {
     if (gxk_mini_app_hooked) return;
@@ -2718,6 +2727,9 @@ static void gkx_init(void) {
 
     // 只掐无意义上报；翻译/YouTube/天气不受影响。
     GXKApplyTelemetryBlockIfNeeded();
+
+    // 符号页双击/停留：类在构造阶段可能还没加载，先试一次，viewWillAppear 里再补。
+    GXKSymbolInstallHooks();
 
     // 主 App 进程里根本没有键盘控制器，viewWillAppear 那套接线永远不触发，
     // 所以设置主菜单的「常用语」入口必须在这里挂一次；键盘进程里这些类不存在，自然跳过。
