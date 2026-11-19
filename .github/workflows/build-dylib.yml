@@ -10,8 +10,12 @@ on:
 jobs:
   build:
     runs-on: macos-15-intel
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Show toolchain
         run: |
@@ -53,3 +57,20 @@ jobs:
           name: libgkx
           path: out/libgkx.dylib
           if-no-files-found: error
+
+      # The artifact blob host is not reachable from the build machine that consumes
+      # this dylib, so the same bytes are also committed to a dedicated branch.
+      - name: Publish to builds branch
+        run: |
+          set -euo pipefail
+          SHORT="${GITHUB_SHA::7}"
+          git config user.name "gkx-ci"
+          git config user.email "gkx-ci@users.noreply.github.com"
+          git checkout --orphan builds-tmp
+          git rm -rf --cached . >/dev/null
+          mkdir -p builds
+          cp out/libgkx.dylib "builds/libgkx-${SHORT}.dylib"
+          printf '%s\n' "${GITHUB_SHA}" > builds/LATEST
+          git add -f builds
+          git commit -m "build ${SHORT}"
+          git push -f origin HEAD:builds
