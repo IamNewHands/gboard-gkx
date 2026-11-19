@@ -531,7 +531,6 @@ static void GXKUpdateToolbar(UIViewController *vc);
 - (void)onPaste:(UIButton *)sender;
 - (void)onCut:(UIButton *)sender;
 - (void)onDismissKeyboard:(UIButton *)sender;
-- (void)onToolbarDiagnostic:(UILongPressGestureRecognizer *)gesture; // [DEBUG-toolbar]
 - (void)deleteBeforeCursor:(NSUInteger)count;
 - (BOOL)refuseWhileComposing:(UIButton *)sender;
 - (id<UITextDocumentProxy>)proxy;
@@ -564,10 +563,6 @@ static BOOL gUpdatingToolbar;
 static GXKToolbarTarget *gToolbarTarget;
 // 本拍工具条要用的字体：取自同键盘原生 UILabel，主题/字号变了跟着变。
 static UIFont *gToolbarFont;
-// [DEBUG-toolbar] 弱引用只记实际被选中的来源，不参与字体选择或延长原生标签生命周期。
-static __weak UILabel *gToolbarStyleSource;
-static void GXKToolbarDiagnosticBandObserved(UIView *row, UIView *logo, CGRect glyph, CGFloat unclampedTop);
-
 // 工具条四条几何约束：复用 stack 时先撤旧约束，避免常量层层叠加。
 static NSArray<NSLayoutConstraint *> *gToolbarConstraints;
 // 「全选」记下的文本与时间：紧接着的「剪切」直接作用于同一段内容，不再要求系统选区。
@@ -578,20 +573,16 @@ static NSTimeInterval gToolbarSelectAllAt;
 // 全选之后多少秒内点剪切仍视为「剪全部」。
 #define GXK_SELECT_ALL_WINDOW 15.0
 
-// [DEBUG-toolbar] Coordinate only diagnostic-owned titles with ordinary error feedback.
-static NSString *GXKToolbarDiagnosticFlashBaseline(UIButton *button);
-static BOOL GXKToolbarDiagnosticFeedbackOwns(UIButton *button);
-
 // 点击反馈只改标题 1.1 秒，不弹面板、不改几何：键盘扩展里最省事也最不容易卡。
 static void GXKFlashTitle(UIButton *button, NSString *text) {
     if (!button || !text.length) return;
-    NSString *original = GXKToolbarDiagnosticFlashBaseline(button);
+    NSString *original = [button titleForState:UIControlStateNormal];
     if (!original.length) return;
     [button setTitle:text forState:UIControlStateNormal];
     __weak UIButton *weakButton = button;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIButton *live = weakButton;
-        if (live && !GXKToolbarDiagnosticFeedbackOwns(live)) [live setTitle:original forState:UIControlStateNormal];
+        if (live) [live setTitle:original forState:UIControlStateNormal];
     });
 }
 
@@ -604,7 +595,6 @@ static UIColor *GXKToolbarTextStyle(UIView *body, UIFont **outFont) {
     UILabel *label = GXKNativeKeyStyleLabel(body, root);
     if (outFont) {
         *outFont = label.font ?: GXKNativeKeyFont(body, root);
-        gToolbarStyleSource = label;
     }
     if (body && GXKNineKeyBodyForKey(gEmojiSoftKeyView, root) == body &&
         GXKKeyIsVisible(gEmojiSoftKeyView, root) && GXKNativeIconForKey(gEmojiSoftKeyView) == gActionNativeIcon) {
@@ -619,9 +609,6 @@ static UIColor *GXKToolbarTextStyle(UIView *body, UIFont **outFont) {
 static UIColor *GXKToolbarTint(UIView *body) {
     return GXKToolbarTextStyle(body, NULL);
 }
-
-// [DEBUG-toolbar] 默认关闭；保留到修复包完成真机字体/对齐/点击验证，随后撤掉诊断接线。
-#import "toolbar_diagnostics.h"
 
 static void GXKDetachToolbar(void) {
     UIStackView *stack = gToolbarStack;
@@ -650,9 +637,26 @@ static void GXKDetachToolbar(void) {
 @end
 
 @implementation GXKToolbarButton
+// 顶条行只有 22pt 高。UIButton 在 contentEdgeInsets 之外还会留 6pt 上下内边距，
+// 22pt 行因此只剩 10pt 内容区，16pt 标题（19.09pt 高）根本放不下，
+// titleRectForContentRect 退化成 CGRectZero，整条工具栏被判 title-does-not-fit 而永不显示。
+// 内容区直接取 bounds：标题只受这一行的真实高度约束。
+- (CGRect)contentRectForBounds:(CGRect)bounds {
+    return bounds;
+}
 - (CGRect)titleRectForContentRect:(CGRect)contentRect {
     CGRect title = [super titleRectForContentRect:contentRect];
+    if (CGRectIsEmpty(title) && self.titleLabel.font) {
+        // 系统偶尔仍按内部内边距判定放不下；用字体度量兜底，尺寸仍是真实标题尺寸。
+        CGSize natural = [self.currentTitle sizeWithAttributes:@{NSFontAttributeName:self.titleLabel.font}];
+        title = CGRectMake(CGRectGetMinX(contentRect), 0.0, natural.width, natural.height);
+    }
+    if (CGRectIsEmpty(title) || CGRectIsEmpty(contentRect)) return CGRectZero;
+    if (title.size.height > contentRect.size.height) title.size.height = contentRect.size.height;
+    if (title.size.width > contentRect.size.width) title.size.width = contentRect.size.width;
+    title.origin.x = CGRectGetMidX(contentRect) - title.size.width * 0.5;
     title.origin.y = self.gxkContentCenterY - title.size.height * 0.5;
+    title.origin.y = MAX(CGRectGetMinY(contentRect), MIN(title.origin.y, CGRectGetMaxY(contentRect) - title.size.height));
     return CGRectContainsRect(contentRect, title) ? title : CGRectZero;
 }
 - (void)layoutSubviews {
@@ -700,14 +704,6 @@ static UIStackView *GXKMakeToolbar(UIView *row, UIColor *tint) {
             button.gxkDivider = divider;
         }
         [button addTarget:gToolbarTarget action:NSSelectorFromString(actions[i]) forControlEvents:UIControlEventTouchUpInside];
-        if (i == 1) { // [DEBUG-toolbar] 仅「复制」长按诊断，普通点击不变。
-            UILongPressGestureRecognizer *diagnostic = [[UILongPressGestureRecognizer alloc]
-                initWithTarget:gToolbarTarget action:@selector(onToolbarDiagnostic:)];
-            diagnostic.minimumPressDuration = 0.8;
-            diagnostic.cancelsTouchesInView = YES;
-            [button addGestureRecognizer:diagnostic];
-            button.accessibilityHint = @"长按开始工具栏诊断，再长按停止并复制报告";
-        }
         [stack addArrangedSubview:button];
     }
     return stack;
@@ -741,21 +737,23 @@ static BOOL GXKSyncToolbarGeometry(UIStackView *stack, CGRect hostBand) {
         if (!font) return NO;
         CGSize textSize = [button.currentTitle sizeWithAttributes:@{NSFontAttributeName:font}];
         CGFloat textHeight = MAX(font.lineHeight, textSize.height);
+        // 标题实际可用的矩形就是这个按钮的内容区，判定必须和它一致，
+        // 否则 22pt 行上的 6pt 内边距会把本来放得下的标题判成放不下。
+        CGRect content = [button contentRectForBounds:slot];
         // The G center is the anchor, but a header row shorter than the icon pulls the band up:
         // keep the title inside that band instead of dropping the whole toolbar.
         CGFloat centerY = anchorY;
         if (isfinite(centerY) && isfinite(textHeight) && textHeight > 0.0 &&
-            isfinite(slot.size.height) && slot.size.height >= textHeight) {
-            centerY = MAX(textHeight * 0.5, MIN(centerY, slot.size.height - textHeight * 0.5));
+            isfinite(content.size.height) && content.size.height >= textHeight) {
+            centerY = MAX(textHeight * 0.5, MIN(centerY, content.size.height - textHeight * 0.5));
         }
         button.gxkContentCenterY = centerY;
         [button setNeedsLayout];
         if (!isfinite(centerY) || !isfinite(textHeight) || textHeight <= 0.0 ||
-            centerY - textHeight * 0.5 < 0.0 || centerY + textHeight * 0.5 > slot.size.height ||
-            !isfinite(textSize.width) || textSize.width > slot.size.width ||
-            CGRectIsEmpty([button titleRectForContentRect:slot])) {
-            gToolbarSpaceGate = @"title-does-not-fit";
-            return NO;
+            centerY - textHeight * 0.5 < 0.0 || centerY + textHeight * 0.5 > content.size.height ||
+            !isfinite(textSize.width) || textSize.width > content.size.width ||
+            CGRectIsEmpty([button titleRectForContentRect:content])) {
+            return NO; // A title that cannot fit its own content rect would clip: keep native.
         }
     }
     return YES;
@@ -765,7 +763,6 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     if (gUpdatingToolbar || !vc || vc != gCurrentVC || !vc.isViewLoaded) return;
     gUpdatingToolbar = YES;
     UIView *root = vc.view;
-    GXKToolbarDiagnosticBegin(vc);
     BOOL composing = GXKComposingStateCached(vc);
     BOOL bound = gToolbarStack && gToolbarHost == root && gToolbarStack.superview == root &&
                  gToolbarRow && gToolbarLogoView.superview == gToolbarRow &&
@@ -779,24 +776,20 @@ static void GXKUpdateToolbar(UIViewController *vc) {
                      GXKSyncToolbarGeometry(gToolbarStack, hostBand);
         if (composing || !clear) {
             gToolbarStack.hidden = YES;
-            GXKToolbarDiagnosticRequest(vc, composing ? @"composing-hidden" : @"native-content-hidden");
             gUpdatingToolbar = NO;
             return;
         }
         if (CGRectEqualToRect(band, gToolbarBand) && CGRectEqualToRect(hostBand, gToolbarStack.frame)) {
             gToolbarStack.hidden = NO;
             if (root.subviews.lastObject != gToolbarStack) [root bringSubviewToFront:gToolbarStack];
-            GXKToolbarDiagnosticRequest(vc, @"fast-unchanged");
             gUpdatingToolbar = NO;
             return;
         }
     }
     UIView *row = nil, *logo = nil, *body = nil;
     CGRect band = CGRectZero;
-    GXKToolbarDiagnosticResetGates(); // A fresh scan cannot inherit a prior bound-path attempt.
     if (!GXKToolbarScan(root, &row, &logo, &body, &band)) {
         GXKDetachToolbar();
-        GXKToolbarDiagnosticRequest(vc, @"scan-failed");
         gUpdatingToolbar = NO;
         return;
     }
@@ -817,7 +810,7 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     gToolbarHost = root;
     gToolbarLogoView = logo;
     gToolbarNineBody = body;
-    gToolbarBand = band; // Keep row-neighbour and diagnostic coordinates separate from host coordinates.
+    gToolbarBand = band; // Keep row-neighbour coordinates separate from host coordinates.
     GXKSyncToolbarStyle(body);
     clear = clear && GXKSyncToolbarGeometry(stack, hostBand);
     stack.hidden = composing || !clear;
@@ -831,21 +824,10 @@ static void GXKUpdateToolbar(UIViewController *vc) {
     ];
     [NSLayoutConstraint activateConstraints:gToolbarConstraints];
     [root bringSubviewToFront:stack];
-    GXKToolbarDiagnosticRequest(vc, reuse ? @"reuse-resampled" : @"new-resampled");
     gUpdatingToolbar = NO;
 }
 
 @implementation GXKToolbarTarget
-
-// [DEBUG-toolbar] 单次长按只处理 began，抬手不触发普通复制。
-- (void)onToolbarDiagnostic:(UILongPressGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateBegan) return;
-    UIViewController *vc = self.controller;
-    UIButton *button = [gesture.view isKindOfClass:[UIButton class]] ? (UIButton *)gesture.view : nil;
-    if (!vc || vc != gCurrentVC || !button ||
-        ![gToolbarStack.arrangedSubviews containsObject:button]) return;
-    GXKToolbarDiagnosticToggle(vc, button);
-}
 
 - (id<UITextDocumentProxy>)proxy {
     UIViewController *vc = self.controller;
@@ -989,28 +971,11 @@ static void GXKBumpPolling(NSInteger ticks) {
 
 @interface GXKActionKeyTarget : NSObject
 - (void)onActionKeyTapped:(UIButton *)sender;
-- (void)onActionKeyDiagnostic:(UILongPressGestureRecognizer *)gesture;
 @end
 
 static void GXKUpdateActionKey(UIViewController *vc);
 
 @implementation GXKActionKeyTarget
-// [DEBUG-toolbar] The patch key remains reachable when the toolbar has detached.
-- (void)onActionKeyDiagnostic:(UILongPressGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateBegan) return;
-    UIViewController *vc = gCurrentVC;
-    UIButton *button = [gesture.view isKindOfClass:[UIButton class]] ? (UIButton *)gesture.view : nil;
-    if (!vc || !vc.isViewLoaded || ![vc isKindOfClass:[UIInputViewController class]] ||
-        !button || button != gActionKeyButton || button.superview != gActionHost ||
-        !GXKKeyIsVisible(button, vc.view) ||
-        GXKNineKeyBodyForKey(gEmojiSoftKeyView, vc.view) == nil ||
-        GXKActionHostForKey(gEmojiSoftKeyView) != gActionHost ||
-        GXKNativeIconForKey(gEmojiSoftKeyView) != gActionNativeIcon ||
-        ((id<GXKNativeSoftKeyContent>)gEmojiSoftKeyView).softKeyDef != gActionSoftKeyDef ||
-        !GXKModelHasNativeActions(gActionSoftKeyDef)) return;
-    GXKToolbarDiagnosticToggle(vc, button); // No input action or layout mutation.
-}
-
 - (void)onActionKeyTapped:(UIButton *)sender {
     UIViewController *vc = gCurrentVC;
     if (!vc || ![vc isKindOfClass:[UIInputViewController class]] || sender != gActionKeyButton) return;
@@ -1086,8 +1051,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         UIFont *cheapFont = GXKNativeActionFont(gEmojiSoftKeyView, root);
         if (![cheapBtn.titleLabel.font isEqual:cheapFont]) cheapBtn.titleLabel.font = cheapFont;
         NSString *cheapTitle = GXKComposingStateCached(vc) ? @"重输" : @"换行";
-        if (!(cheapBtn == gToolbarDiagnosticFeedbackButton && GXKToolbarDiagnosticNow() < gToolbarDiagnosticFeedbackUntil) &&
-            ![[cheapBtn titleForState:UIControlStateNormal] isEqualToString:cheapTitle]) {
+        if (![[cheapBtn titleForState:UIControlStateNormal] isEqualToString:cheapTitle]) {
             [cheapBtn setTitle:cheapTitle forState:UIControlStateNormal];
             [cheapBtn setTitle:cheapTitle forState:UIControlStateHighlighted];
             cheapBtn.accessibilityLabel = cheapTitle;
@@ -1149,13 +1113,6 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         btn.titleLabel.minimumScaleFactor = 0.85;
         btn.autoresizingMask = UIViewAutoresizingNone; // 每帧按currentKey换算frame，不随父视图拉伸。
         [btn addTarget:gActionTarget action:@selector(onActionKeyTapped:) forControlEvents:UIControlEventTouchUpInside];
-        // [DEBUG-toolbar] Scoped to our button, never native G or the keyboard root.
-        UILongPressGestureRecognizer *diagnostic = [[UILongPressGestureRecognizer alloc]
-            initWithTarget:gActionTarget action:@selector(onActionKeyDiagnostic:)];
-        diagnostic.minimumPressDuration = 0.8;
-        diagnostic.cancelsTouchesInView = YES;
-        [btn addGestureRecognizer:diagnostic];
-        btn.accessibilityHint = @"长按开始工具栏诊断，再长按停止并复制报告";
         gEmojiSoftKeyView = currentKey;
         gActionNativeIcon = icon;
         gActionSoftKeyDef = model;
@@ -1188,8 +1145,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         [btn setTitleColor:color forState:UIControlStateHighlighted];
     }
     NSString *title = GXKComposingStateCached(vc) ? @"重输" : @"换行";
-    if (!(btn == gToolbarDiagnosticFeedbackButton && GXKToolbarDiagnosticNow() < gToolbarDiagnosticFeedbackUntil) &&
-        ![[btn titleForState:UIControlStateNormal] isEqualToString:title]) {
+    if (![[btn titleForState:UIControlStateNormal] isEqualToString:title]) {
         [btn setTitle:title forState:UIControlStateNormal];
         [btn setTitle:title forState:UIControlStateHighlighted];
         btn.accessibilityLabel = title;
@@ -1277,7 +1233,6 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
 static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
     // 先撤销当前绑定，原生生命周期引起的布局/异步事件不得重建旧按钮。
     if ((UIViewController *)self == gCurrentVC) {
-        GXKToolbarDiagnosticStop((UIViewController *)self, @"keyboard-disappear"); // [DEBUG-toolbar]
         GXKResetNativeKeyStyle();
         gToolbarObstacleRoot = nil;
         gToolbarObstacles = nil;

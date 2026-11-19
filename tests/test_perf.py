@@ -202,17 +202,12 @@ class PerfContracts(unittest.TestCase):
     def test_reuse_requires_live_nine_owner_and_rejects_independent_qwerty_without_band_overlap(self):
         registry = function_body(self.visibility, "static BOOL GXKToolbarPrepareNativeObstacles(")
         live = registry[registry.index("gToolbarObstacleComplete = YES;") + len("gToolbarObstacleComplete = YES;"):]
-        owners = live[live.index("BOOL nineVisible = NO;"):live.index('gToolbarSpaceGate = @"obstacles-prepared";')]
+        owners = live[live.index("BOOL nineVisible = NO;"):]
         self.assertIn("for (UIView *body in gToolbarKeyboardBodies)", owners)
         self.assertIn("if (!GXKKeyIsVisible(body, root)) continue;", owners)
         code = re.sub(r"//[^\n]*", "", owners)
-        self.assertRegex(code, r"if \(\[body isKindOfClass:nineClass\]\) nineVisible = YES;\s*"
-                              r"else if \(\[body isKindOfClass:qwertyClass\]\) \{")
-        qwerty = function_body(code, "else if ([body isKindOfClass:qwertyClass])")
-        self.assertIn("return NO;", qwerty)
-        self.assertNotIn("return YES;", qwerty)
-        self.assertIn('gToolbarSpaceGate = @"independent-qwerty";', qwerty)
-        self.assertIn("gToolbarSpaceBlocker = body;", qwerty)
+        self.assertIn("if ([body isKindOfClass:nineClass]) nineVisible = YES;", code)
+        self.assertIn("else if ([body isKindOfClass:qwertyClass]) return NO;", code)
         self.assertIn("if (!nineVisible) return NO;", owners)
         for band_condition in ("band", "CGRect", "GXKToolbarContentBlocks", "convertRect:"):
             self.assertNotIn(band_condition, owners)
@@ -262,7 +257,7 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("GXKToolbarContentRect(view, root, &rect)", boundary)
         self.assertIn("CGRectIntersection(rect, strip)", boundary)
         self.assertIn("MAX(CGRectGetMinX(strip), CGRectGetMinX(rect))", boundary)
-        self.assertIn('gToolbarSpaceGate = @"obstacle-geometry-unproven";', boundary)
+        self.assertIn("if (!GXKToolbarContentRect(view, root, &rect)) return NO;", boundary)
 
     def test_clipping_owner_rejects_complex_geometry_and_preserves_overflow_conservatively(self):
         clip = function_body(self.visibility, "static BOOL GXKToolbarClippedViewRect(")
@@ -277,7 +272,7 @@ class PerfContracts(unittest.TestCase):
         # A clipped header G keeps its drawn rect as the last resort; the drawn rect is still measured.
         self.assertIn("CGRect drawn = root ? [root.layer convertRect:gToolbarImageDrawnRoot toLayer:base.layer] : CGRectZero;", anchor)
         self.assertIn("if (!GXKToolbarIconSized(drawn)) return NO;", anchor)
-        self.assertIn('gToolbarImageGate = @"drawn-icon-size";', anchor)
+        self.assertNotIn("gToolbarImageGate", self.layout)
         physical = function_body(self.layout, "static BOOL GXKToolbarVisibleImageRect(")
         self.assertNotIn("GXKToolbarIconSized", physical)
         registry = function_body(self.visibility, "static BOOL GXKToolbarPrepareNativeObstacles(")
@@ -418,8 +413,6 @@ class PerfContracts(unittest.TestCase):
                          "right - left >= 200.0", "CGRectContainsRect(row.bounds, candidate)",
                          "CGRectContainsRect(root.bounds, candidateInRoot)"):
             self.assertIn(geometry, band)
-        self.assertLess(band.index("GXKToolbarDiagnosticBandObserved(row, logo, glyph, top)"),
-                        band.index("top = MAX("))
         self.assertEqual(1, band.count("gToolbarGlyphRoot = CGRectZero;"))
         self.assertIn("if (gToolbarBandCacheHit) gToolbarGlyphRoot = [row convertRect:glyph toView:root];", band)
         self.assertIn("if (hit) gToolbarGlyphRoot = [row convertRect:glyph toView:root];", band)
@@ -433,11 +426,12 @@ class PerfContracts(unittest.TestCase):
         self.assertNotIn("titleLabel.frame =", self.source)
         geometry = function_body(self.source, "static BOOL GXKSyncToolbarGeometry(")
         for required in ("CGFloat anchorY = CGRectGetMidY(gToolbarGlyphRoot) - CGRectGetMinY(hostBand);",
-                         "centerY = MAX(textHeight * 0.5, MIN(centerY, slot.size.height - textHeight * 0.5));",
+                         "CGRect content = [button contentRectForBounds:slot];",
+                         "centerY = MAX(textHeight * 0.5, MIN(centerY, content.size.height - textHeight * 0.5));",
                          "button.gxkContentCenterY = centerY;", "[button setNeedsLayout]",
                          "MAX(font.lineHeight, textSize.height)", "centerY - textHeight * 0.5 < 0.0",
-                         "centerY + textHeight * 0.5 > slot.size.height", "textSize.width > slot.size.width",
-                         "CGRectIsEmpty([button titleRectForContentRect:slot])"):
+                         "centerY + textHeight * 0.5 > content.size.height", "textSize.width > content.size.width",
+                         "CGRectIsEmpty([button titleRectForContentRect:content])"):
             self.assertIn(required, geometry)
         update = function_body(self.source, "static void GXKUpdateToolbar(UIViewController *vc) {")
         self.assertLess(update.index("GXKSyncToolbarGeometry(gToolbarStack, hostBand)"),
@@ -524,15 +518,13 @@ class PerfContracts(unittest.TestCase):
 
     def test_logo_selection_requires_complete_nine_key_scan_not_tree_order(self):
         scan = function_body(self.layout, "static BOOL GXKToolbarScan(")
-        for required in ("NSMutableArray<NSArray *> *logoCandidates", "if (stack.count || !body || qwertyVisible || !logoCandidates.count) {",
+        for required in ("NSMutableArray<NSArray *> *logoCandidates",
+                         "if (stack.count || !body || qwertyVisible || !logoCandidates.count) return NO;",
                          "if (!GXKToolbarGlyphRect(view, root, &glyph) || CGRectIsEmpty(glyph))",
                          "CGRect bodyRect = [body convertRect:body.bounds toView:root];",
                          "CGFloat gap = CGRectGetMinY(bodyRect) - CGRectGetMaxY(glyph);",
                          "BOOL better = (!logo || gap < bestGap - 0.5)"):
             self.assertIn(required, scan)
-        rejected = function_body(scan, "if (stack.count || !body || qwertyVisible || !logoCandidates.count)")
-        self.assertIn("return NO;", rejected)
-        self.assertNotIn("return YES;", rejected)
         self.assertLess(scan.index("isKindOfClass:nineClass"), scan.index("isKindOfClass:qwertyClass"))
         self.assertNotIn("if (!logo && [view isKindOfClass:logoClass]", scan)
 
@@ -577,7 +569,7 @@ class PerfContracts(unittest.TestCase):
                          "GXKToolbarNativeSpaceClear(root, gToolbarLogoView, hostBand)",
                          "if (composing || !clear)", "gToolbarStack.hidden = YES;"):
             self.assertIn(required, fast)
-        self.assertLess(fast.index("GXKToolbarNativeSpaceClear"), fast.index('"fast-unchanged"'))
+        self.assertLess(fast.index("GXKToolbarNativeSpaceClear"), fast.index("if (CGRectEqualToRect(band, gToolbarBand)"))
         self.assertIn("stack.hidden = composing || !clear;", update)
 
 

@@ -8,10 +8,6 @@ static NSHashTable<UIView *> *gToolbarKeyboardBodies;
 static NSUInteger gToolbarContentEpoch;
 static NSUInteger gToolbarObstacleEpoch;
 static BOOL gToolbarObstacleComplete;
-// [DEBUG-toolbar] Last production decision survives stack detachment.
-static NSString *gToolbarSpaceGate;
-static __weak UIView *gToolbarSpaceBlocker;
-static CGRect gToolbarSpaceBand;
 
 // A successful empty rect means no visible content; NO means unproven geometry.
 static BOOL GXKToolbarClippedViewRect(UIView *view, UIView *root, BOOL overflow, CGRect *outRect) {
@@ -86,8 +82,6 @@ static BOOL GXKToolbarContentBlocks(UIView *view, UIView *root, CGRect band) {
 }
 
 static BOOL GXKToolbarPrepareNativeObstacles(UIView *root, UIView *logo) {
-    gToolbarSpaceGate = @"invalid-band-binding";
-    gToolbarSpaceBlocker = nil;
     if (!root || !logo || ![logo isDescendantOfView:root]) return NO;
     BOOL rebuild = gToolbarObstacleRoot != root || gToolbarObstacleLogo != logo ||
                    gToolbarObstacleEpoch != gToolbarContentEpoch ||
@@ -112,7 +106,6 @@ static BOOL GXKToolbarPrepareNativeObstacles(UIView *root, UIView *logo) {
         Class keyClass = GXKClassCached(@"GKBSoftKeyView", &gCachedKeyClass);
         Class nineClass = GXKClassCached(@"GKB9KeysSoftKeyboardView", &gCachedNineKeyClass);
         Class qwertyClass = GXKClassCached(@"GKBZhQwertySoftKeyboardView", &gCachedQwertyClass);
-        gToolbarSpaceGate = @"keyboard-class-unavailable";
         if (!keyClass || !nineClass || !qwertyClass) return NO;
         NSMutableArray<UIView *> *pending = [NSMutableArray arrayWithObject:root];
         NSUInteger visited = 0;
@@ -134,8 +127,7 @@ static BOOL GXKToolbarPrepareNativeObstacles(UIView *root, UIView *logo) {
             if (leaf || collection || icon || reusable || [view isKindOfClass:[UILabel class]]) [gToolbarObstacles addObject:view];
             if (!leaf) [pending addObjectsFromArray:view.subviews];
         }
-        gToolbarSpaceGate = @"obstacle-tree-incomplete";
-        if (pending.count) return NO;
+        if (pending.count) return NO; // Partial traversal cannot authorize the registry.
         gToolbarObstacleComplete = YES;
     }
     // Revalidate owners on every reuse, independently of whether their keys overlap the band.
@@ -145,53 +137,33 @@ static BOOL GXKToolbarPrepareNativeObstacles(UIView *root, UIView *logo) {
     for (UIView *body in gToolbarKeyboardBodies) {
         if (!GXKKeyIsVisible(body, root)) continue;
         if ([body isKindOfClass:nineClass]) nineVisible = YES; // Nine-key inherits the QWERTY class.
-        else if ([body isKindOfClass:qwertyClass]) {
-            gToolbarSpaceGate = @"independent-qwerty";
-            gToolbarSpaceBlocker = body;
-            return NO;
-        }
+        else if ([body isKindOfClass:qwertyClass]) return NO; // Independent 26-key body keeps native.
     }
-    gToolbarSpaceGate = @"nine-body-not-visible";
     if (!nineVisible) return NO;
-    gToolbarSpaceGate = @"obstacles-prepared";
     return YES;
 }
 
 // Same live content owner as the final overlap check. No sibling-frame occupancy inference.
 static BOOL GXKToolbarNativeRightBoundary(UIView *root, UIView *logo, CGRect strip, CGFloat *outRight) {
-    gToolbarSpaceBand = strip;
     if (!GXKToolbarPrepareNativeObstacles(root, logo)) return NO;
     CGFloat right = CGRectGetMaxX(strip);
     for (UIView *view in gToolbarObstacles) {
         CGRect rect = CGRectZero;
-        if (!GXKToolbarContentRect(view, root, &rect)) {
-            gToolbarSpaceGate = @"obstacle-geometry-unproven";
-            gToolbarSpaceBlocker = view;
-            return NO;
-        }
+        if (!GXKToolbarContentRect(view, root, &rect)) return NO;
         if (CGRectIsEmpty(CGRectIntersection(rect, strip))) continue;
         CGFloat edge = MAX(CGRectGetMinX(strip), CGRectGetMinX(rect));
-        if (edge < right) { right = edge; gToolbarRightBoundary = view; gToolbarRightBoundaryRect = rect; }
+        if (edge < right) right = edge;
     }
     *outRight = right;
     return YES;
 }
 
 static BOOL GXKToolbarNativeSpaceClear(UIView *root, UIView *logo, CGRect band) {
-    gToolbarSpaceBand = band;
-    if (!root || !logo || !CGRectContainsRect(root.bounds, band)) {
-        gToolbarSpaceGate = @"invalid-band-binding";
-        return NO;
-    }
+    if (!root || !logo || !CGRectContainsRect(root.bounds, band)) return NO;
     if (!GXKToolbarPrepareNativeObstacles(root, logo)) return NO;
     for (UIView *view in gToolbarObstacles) {
-        if (GXKToolbarContentBlocks(view, root, band)) {
-            gToolbarSpaceGate = @"native-obstacle";
-            gToolbarSpaceBlocker = view;
-            return NO;
-        }
+        if (GXKToolbarContentBlocks(view, root, band)) return NO;
     }
-    gToolbarSpaceGate = @"space-clear";
     return YES;
 }
 #endif
