@@ -1,5 +1,14 @@
 # 已实测证据与未覆盖边界
 
+## 2026-11-19 顶条 22pt 行锚点修复（源码/编译/独立验包通过，真机待验）
+
+- 修复源 d0398c00e749f77205e484f988fb7c9901cc586b 已推送 main（parent 8954dfe）。本地 139 项 python -m unittest discover -s tests 全绿（Ran 139 tests / OK），git 工作区仅预存 ?? CON。git push 报 schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e)，改用 REST API（POST git/blobs → git/trees base_tree=8954dfe tree → git/commits → PATCH git/refs/heads/main）完成推送；--input 必须走文件，内联 base64 报 FileNotFoundError: [WinError 206]。
+- log5.txt 28 样本证据链：全部 lastDecision=scan-failed；t=2.286 起 scanGate=no-measurable-logo（23/28），t=0/2.097/9.885 为 band-unavailable + bandGate=band-width（bandCandidateRoot={{56,26},{0,28}}、spaceBandRoot={{56,26},{346,28}}、rightBound=GKBCandidatesCollectionView root={{56,26},{301,44}}）。顶条 G 的 drawnRoot={{17,24},{22,22}} 但 visibleRoot={{17,24},{22,2}}（祖先 CALayer {{0,0},{402,26}} masks=1），visibleIconSized=0 → imageGate=visible-icon-size。九键候选行 logoCandidate[2] frame {{0,0},{56,44}} 在 t=2.286–2.9 变 {{0,0},{0,44}}，t=9.885 恢复 measured=1 picked={{17,0},{22,20}}。
+- 修复语义：ImageRect 的 IconSized 失败后取未裁切 drawn 矩形（gate drawn-icon-size）而非放宽容差；Band 用 carrierIsRow（carrier 宽 ≥ row 宽-8pt）跳过全宽 logo 容器，并把 barHeight 夹到 row 高度、下限 18pt；Scan 变候选循环（Band 失败 removeObjectAtIndex:bestIndex 重试）；SyncToolbarGeometry 把 centerY 夹进 slot。8..64pt、200pt、原生内容判空、九键/独立26键门控全部未放宽。
+- CI https://github.com/IamNewHands/gboard-gkx/actions/runs/44442047216 success；artifact 14491073381（libgkx，77614 bytes，archive SHA256 4cb2b3164034f62480b6e31da9d149c47202a15a5ec5380c8c1a9d8554ced250），下载 dylib 232048 bytes、SHA256 030b928dcdc46162c23b9b7b29549166a32c08e577087c28a49df6f4c6585764，arm64 magic 0xfeedfacf。
+- 产物 dist/gboard-gkx-d0398c0-toolbar-space-repair-unsigned.ipa 35974329 bytes / SHA256 018ccd07e43c622d8c54d4083599217d020d6b5075c501229c6c63771cbfa4ac；dist/gboard-gkx-d0398c0-toolbar-space-repair-verification.json 为 PASS。dist/verify-toolbar-space-repair.py preflight 与 final 均 exit0；2050 条目、移除 3 个旧 CodeResources、8 group 槽 = group.zunbengege.top、2045 原生资源字节/权限不变、仅 gboard_framework 176 / 主 exe 28 / appex 27 bytes 差异、arm64 段/section/linkedit、RPATH、755-644 通过。dylib strings 含 drawn-icon-size、band-row-too-short、scan-success。
+- 未覆盖：iPhone17Pro/iOS27 自签后的 UIKit 真实显示、G 与文字对齐、点击、9↔26 切换、三态与空剪贴板失败提示；Python 契约与几何回放不替代 UIKit。本机无 iOS SDK/clang，只能靠 CI 编译。诊断仍默认关闭并临时保留，真机验收后退役。
+
 ## 2026-11-18 log4 条带越行修复（源码/编译/独立验包通过，真机待验）
 
 - 日志：D:/GitHub_Clone/log4.txt 共43样本，18次有可靠G却band-width、25次no-measurable-logo。lower可见G=(17,26,22,20)、row=(0,26,402,44)；旧28pt居中hit band=(43,22,359,28)与upper完整carrier=(0,0,402,26)相交，width归零。

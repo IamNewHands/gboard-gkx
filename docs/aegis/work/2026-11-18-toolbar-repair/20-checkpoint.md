@@ -1,6 +1,16 @@
 # 最新续跑状态
 
-- 当前状态：用户已授权推送/编译/出包，修复源ab5fafd54a89a68b9faf1b3ef5f8b0eea21c2826及CI-only提交ccdb888505211f1fff485e363190c8432771976b已推送main。首次macos-15分配失败；仅改macos-15-intel后run44302485661编译/伪签名/上传成功。新未签名IPA已生成且preflight/inject/final通过，独立最终验包exit0/PASS，实物哈希与回执一致，进入文件交付。139项源码/数值回归及23项验包测试通过；UIKit/真机仍needs-verification。旧3574c24包保留，不是本轮交付。
+## 顶条 22pt 行锚点修复交付（2026-11-19；源码/CI/独立验包通过，真机待验收）
+
+- 源码提交 d0398c00e749f77205e484f988fb7c9901cc586b 已推送 main（parent 8954dfe），5 文件：dylib/toolbar_layout.h、dylib/gkx.m、dylib/toolbar_diagnostics.h、tests/test_perf.py、tests/test_toolbar_geometry.py。本地提交对象 6df4713 因 git push 报 schannel SEC_E_NO_CREDENTIALS 无法直推，改用 GitHub REST API 建 blob/tree/commit 后 PATCH refs/heads/main 完成；脚本 /d/GitHub_Clone/_push_api.sh（gh api --input 文件，/tmp 不可写用 D:/GitHub_Clone/_pushtmp）。本地已 git reset --soft origin/main 对齐，工作区仅预存 ?? CON。
+- 根因（log5.txt 28 样本逐帧）：可测量的 G 只在九键候选行 logoCandidate[2]（frame {{0,0},{56,44}}，row y=26），t=2.286–2.9 期间该候选宽度归零 → scanGate=no-measurable-logo；顶条 22pt 行的 G 被祖先 CALayer {{0,0},{402,26}} masks=1 裁成 visibleRoot={{17,24},{22,2}}，ImageRect 的 8..64pt IconSized 拒绝；t=0 唯一可用 band 又因全宽 logo 容器 carrier（402pt）把 left 抬到 right（NativeRightBoundary=56）→ band 宽 0 → bandGate=band-width。
+- 修复：① GXKToolbarImageRect 在 visible 失败时用未裁切 drawn 矩形兜底（gate 新增 drawn-icon-size）；② Band 跳过全宽 logo carrier（carrierIsRow 判定），允许 barHeight 压到 row 高度，最低 18pt；③ Scan 从"选最近 G 一次"改为候选循环，Band 失败就剔除该候选重试；④ GXKSyncToolbarGeometry 把 centerY 夹进 slot（保留原 title-does-not-fit 门控）。未放宽 8..64pt、200pt 带宽、原生内容判空、九键/独立26键门控。
+- 验证：gboard-gkx 下 python -m unittest discover -s tests → Ran 139 tests / OK（多次复跑）。非 UIKit 执行，不证明真机显示。
+- CI：https://github.com/IamNewHands/gboard-gkx/actions/runs/44442047216 success（macos-15-intel，arm64/iOS12+/QuartzCore/ldid），artifact 14491073381 libgkx 77614 bytes，archive SHA256 4cb2b3164034f62480b6e31da9d149c47202a15a5ec5380c8c1a9d8554ced250；dylib SHA256 030b928dcdc46162c23b9b7b29549166a32c08e577087c28a49df6f4c6585764。
+- 产物：dist/gboard-gkx-d0398c0-toolbar-space-repair-unsigned.ipa，35974329 bytes（34.31 MiB），SHA256 018ccd07e43c622d8c54d4083599217d020d6b5075c501229c6c63771cbfa4ac；回执 dist/gboard-gkx-d0398c0-toolbar-space-repair-verification.json 为 PASS。preflight 与 final 均 exit0；2050 ZIP 条目、仅移除 3 个旧 CodeResources、8 个 group 槽替换为 group.zunbengege.top、除允许 3 文件差异（176/28/27 bytes）外 2045 原生资源字节与权限不变、arm64/RPATH/offset/755-644 通过。
+- 待真机：LCSign 自签安装后验证初始/组字/清空三态、G 与文字对齐、工具栏点击、9↔26 切换、空剪贴板失败提示恢复；诊断仍默认关闭且临时保留，真机验收后再撤接线。旧包（ccdb888/3574c24/cb5c13e/20b57f6）保留不重发，未上传原 IPA、无 PR/Release、无强推。
+
+- 历史状态（2026-11-18）：用户已授权推送/编译/出包，修复源ab5fafd54a89a68b9faf1b3ef5f8b0eea21c2826及CI-only提交ccdb888505211f1fff485e363190c8432771976b已推送main。首次macos-15分配失败；仅改macos-15-intel后run44302485661编译/伪签名/上传成功。新未签名IPA已生成且preflight/inject/final通过，独立最终验包exit0/PASS，实物哈希与回执一致，进入文件交付。139项源码/数值回归及23项验包测试通过；UIKit/真机仍needs-verification。旧3574c24包保留，不是本轮交付。
 
 ## log4 条带越行修复（本地源码阶段闭合；真机needs-verification）
 
