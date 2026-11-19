@@ -213,6 +213,8 @@ static void GXKProbeSwizzle(SEL sel, IMP hook) {
     free(classes);
 }
 
+static void GXKProbeSwizzle(SEL sel, IMP hook);
+
 static void GXKProbeInstallHooks(void) {
     if (gProbeHooksInstalled) return;
     gProbeHooksInstalled = YES;
