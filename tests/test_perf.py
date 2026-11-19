@@ -273,7 +273,11 @@ class PerfContracts(unittest.TestCase):
             self.assertIn(required, clip)
         anchor = function_body(self.layout, "static BOOL GXKToolbarImageRect(")
         self.assertIn("GXKToolbarVisibleImageRect(view, base, &measured)", anchor)
-        self.assertIn("if (!GXKToolbarIconSized(measured)) return NO;", anchor)
+        self.assertIn("if (!GXKToolbarIconSized(measured)) {", anchor)
+        # A clipped header G keeps its drawn rect as the last resort; the drawn rect is still measured.
+        self.assertIn("CGRect drawn = root ? [root.layer convertRect:gToolbarImageDrawnRoot toLayer:base.layer] : CGRectZero;", anchor)
+        self.assertIn("if (!GXKToolbarIconSized(drawn)) return NO;", anchor)
+        self.assertIn('gToolbarImageGate = @"drawn-icon-size";', anchor)
         physical = function_body(self.layout, "static BOOL GXKToolbarVisibleImageRect(")
         self.assertNotIn("GXKToolbarIconSized", physical)
         registry = function_body(self.visibility, "static BOOL GXKToolbarPrepareNativeObstacles(")
@@ -402,10 +406,13 @@ class PerfContracts(unittest.TestCase):
                         band.index("if (gToolbarBandCacheValid &&"))
         for geometry in ("CGFloat left = CGRectGetMaxX(glyph) + 4.0;",
                          "GXKToolbarContentRect(logo, root, &logoCarrierRoot)",
-                         "left = MAX(left, CGRectGetMaxX(logoCarrier))",
+                         "BOOL carrierIsRow = !CGRectIsEmpty(logoCarrier) &&",
+                         "CGRectGetWidth(logoCarrier) >= CGRectGetWidth(row.bounds) - 8.0;",
+                         "if (!CGRectIsEmpty(logoCarrier) && !carrierIsRow) left = MAX(left, CGRectGetMaxX(logoCarrier));",
                          "CGFloat barHeight = glyph.size.height;",
                          "if (barHeight < 28.0) barHeight = 28.0;",
-                         "barHeight > row.bounds.size.height",
+                         "if (barHeight > row.bounds.size.height) barHeight = row.bounds.size.height;",
+                         "if (barHeight < 18.0)",
                          "top = MAX(CGRectGetMinY(row.bounds), MIN(top, CGRectGetMaxY(row.bounds) - barHeight));",
                          "GXKToolbarNativeRightBoundary(root, logo, strip, &rightInRoot)",
                          "right - left >= 200.0", "CGRectContainsRect(row.bounds, candidate)",
@@ -425,7 +432,8 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("CGRectContainsRect(contentRect, title) ? title : CGRectZero", title)
         self.assertNotIn("titleLabel.frame =", self.source)
         geometry = function_body(self.source, "static BOOL GXKSyncToolbarGeometry(")
-        for required in ("CGRectGetMidY(gToolbarGlyphRoot) - CGRectGetMinY(hostBand)",
+        for required in ("CGFloat anchorY = CGRectGetMidY(gToolbarGlyphRoot) - CGRectGetMinY(hostBand);",
+                         "centerY = MAX(textHeight * 0.5, MIN(centerY, slot.size.height - textHeight * 0.5));",
                          "button.gxkContentCenterY = centerY;", "[button setNeedsLayout]",
                          "MAX(font.lineHeight, textSize.height)", "centerY - textHeight * 0.5 < 0.0",
                          "centerY + textHeight * 0.5 > slot.size.height", "textSize.width > slot.size.width",

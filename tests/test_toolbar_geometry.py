@@ -11,7 +11,10 @@ def hit_band(row, glyph, carrier_right, right=None):
     if not all(math.isfinite(value) for value in values) or min(w, h, gw, gh) <= 0:
         return None
     height = max(28.0, gh)
+    # A header row shorter than the ideal band shrinks the hit area to the row, never the glyph.
     if height > h:
+        height = h
+    if height < 18.0:
         return None
     left = max(gx + gw + 4.0, carrier_right)
     top = max(y, min(gy + gh / 2.0 - height / 2.0, y + h - height))
@@ -67,8 +70,12 @@ class ToolbarGeometryReplay(unittest.TestCase):
         self.assertIsNone(hit_band((0, 26, 0, 44), glyph, 56))
         self.assertIsNone(hit_band(row, (17, 26, 0, 20), 56))
 
-    def test_short_row_is_not_replaced_by_smaller_hit_target(self):
-        self.assertIsNone(hit_band((0, 0, 402, 22), (17, 0, 22, 20), 56))
+    def test_short_row_shrinks_the_band_instead_of_dropping_the_toolbar(self):
+        # 22 pt header row: the band is clipped to the row, so the 20 pt G stays inside it.
+        self.assertEqual((56, 0, 346, 22), hit_band((0, 0, 402, 22), (17, 0, 22, 20), 56))
+        self.assertTrue(title_fits(hit_band((0, 0, 402, 22), (17, 0, 22, 20), 56), 10, 19.2))
+        # Below 18 pt no title fits, so the row is still refused.
+        self.assertIsNone(hit_band((0, 0, 402, 16), (17, 0, 22, 14), 56))
 
     def test_other_native_obstacles_still_limit_width(self):
         self.assertIsNone(hit_band((0, 26, 402, 44), (17, 26, 22, 20), 56, right=200))

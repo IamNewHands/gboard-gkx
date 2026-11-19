@@ -733,16 +733,23 @@ static void GXKSyncToolbarStyle(UIView *body) {
 // Same current Band owns hit area and visual anchor; validate before every visible reuse.
 static BOOL GXKSyncToolbarGeometry(UIStackView *stack, CGRect hostBand) {
     if (!GXKToolbarFiniteRect(hostBand) || !GXKToolbarFiniteRect(gToolbarGlyphRoot) || !stack.arrangedSubviews.count) return NO;
-    CGFloat centerY = CGRectGetMidY(gToolbarGlyphRoot) - CGRectGetMinY(hostBand);
+    CGFloat anchorY = CGRectGetMidY(gToolbarGlyphRoot) - CGRectGetMinY(hostBand);
     CGRect slot = CGRectMake(0, 0, hostBand.size.width / stack.arrangedSubviews.count, hostBand.size.height);
     for (GXKToolbarButton *button in stack.arrangedSubviews) {
         if (![button isKindOfClass:[GXKToolbarButton class]]) return NO;
-        button.gxkContentCenterY = centerY;
-        [button setNeedsLayout];
         UIFont *font = button.titleLabel.font;
         if (!font) return NO;
         CGSize textSize = [button.currentTitle sizeWithAttributes:@{NSFontAttributeName:font}];
         CGFloat textHeight = MAX(font.lineHeight, textSize.height);
+        // The G center is the anchor, but a header row shorter than the icon pulls the band up:
+        // keep the title inside that band instead of dropping the whole toolbar.
+        CGFloat centerY = anchorY;
+        if (isfinite(centerY) && isfinite(textHeight) && textHeight > 0.0 &&
+            isfinite(slot.size.height) && slot.size.height >= textHeight) {
+            centerY = MAX(textHeight * 0.5, MIN(centerY, slot.size.height - textHeight * 0.5));
+        }
+        button.gxkContentCenterY = centerY;
+        [button setNeedsLayout];
         if (!isfinite(centerY) || !isfinite(textHeight) || textHeight <= 0.0 ||
             centerY - textHeight * 0.5 < 0.0 || centerY + textHeight * 0.5 > slot.size.height ||
             !isfinite(textSize.width) || textSize.width > slot.size.width ||

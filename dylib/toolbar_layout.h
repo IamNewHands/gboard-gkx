@@ -96,8 +96,17 @@ static BOOL GXKToolbarImageRect(UIView *view, UIView *base, CGRect *outRect) {
     CGRect measured = CGRectZero;
     if (!GXKToolbarVisibleImageRect(view, base, &measured)) return NO;
     gToolbarImageGate = @"visible-icon-size";
-    if (!GXKToolbarIconSized(measured)) return NO;
-    gToolbarImageGate = @"measured";
+    if (!GXKToolbarIconSized(measured)) {
+        // A container clip can leave only a sliver of a drawn G visible; the unclipped drawn rect
+        // still locates that same icon and is the only anchor the header row exposes.
+        UIView *root = gCurrentVC.view;
+        CGRect drawn = root ? [root.layer convertRect:gToolbarImageDrawnRoot toLayer:base.layer] : CGRectZero;
+        if (!GXKToolbarIconSized(drawn)) return NO;
+        measured = drawn;
+        gToolbarImageGate = @"drawn-icon-size";
+    } else {
+        gToolbarImageGate = @"measured";
+    }
     if (outRect) *outRect = measured;
     return YES;
 }
@@ -160,11 +169,20 @@ static BOOL GXKToolbarBand(UIView *row, UIView *logo, UIView *root, CGRect *outB
         gToolbarBandGate = @"band-logo-carrier-unproven"; gToolbarBandCacheValid = NO; return NO;
     }
     CGRect logoCarrier = [row convertRect:logoCarrierRoot fromView:root];
-    if (!CGRectIsEmpty(logoCarrier)) left = MAX(left, CGRectGetMaxX(logoCarrier));
+    // A full-width logo container reserves the whole row for itself; honoring it would leave no
+    // band at all, and its own G is already skipped by the +4pt offset above.
+    BOOL carrierIsRow = !CGRectIsEmpty(logoCarrier) &&
+                        CGRectGetWidth(logoCarrier) >= CGRectGetWidth(row.bounds) - 8.0;
+    if (!CGRectIsEmpty(logoCarrier) && !carrierIsRow) left = MAX(left, CGRectGetMaxX(logoCarrier));
     CGFloat right = CGRectGetMaxX(row.bounds);
     CGFloat barHeight = glyph.size.height;
     if (barHeight < 28.0) barHeight = 28.0;
-    if (!GXKToolbarFiniteRect(rowInRoot) || barHeight > row.bounds.size.height) {
+    if (!GXKToolbarFiniteRect(rowInRoot)) {
+        gToolbarBandGate = @"band-row-too-short"; gToolbarBandCacheValid = NO; return NO;
+    }
+    // A shorter header row is a valid host: the hit band shrinks to the row, never the glyph.
+    if (barHeight > row.bounds.size.height) barHeight = row.bounds.size.height;
+    if (barHeight < 18.0) {
         gToolbarBandGate = @"band-row-too-short"; gToolbarBandCacheValid = NO; return NO;
     }
     CGFloat top = CGRectGetMidY(glyph) - barHeight * 0.5;
@@ -266,43 +284,52 @@ static BOOL GXKToolbarScan(UIView *root, UIView **outRow, UIView **outLogo, UIVi
     }
 
     // 挑"落在九键体正上方、离它最近"的那个 G：工具栏必须和键位同一条竖线，不能高一行。
+    // 最近的那个 G 所在行可能已被原生候选条占满，此时按同一优先级换下一个候选，而不是整条放弃。
     CGRect bodyRect = [body convertRect:body.bounds toView:root];
-    UIView *logo = nil;
-    CGFloat bestGap = CGFLOAT_MAX;
-    CGFloat bestBottom = -CGFLOAT_MAX;
-    for (NSArray *entry in logoCandidates) {
-        UIView *candidate = entry[0];
-        CGRect glyph = [entry[1] CGRectValue];
-        CGFloat gap = CGRectGetMinY(bodyRect) - CGRectGetMaxY(glyph);
-        if (gap < -8.0) gap = -8.0; // 压进键位体里的不算更近，但也不排除。
-        BOOL better = (!logo || gap < bestGap - 0.5) ||
-                      (fabs(gap - bestGap) <= 0.5 && CGRectGetMaxY(glyph) > bestBottom);
-        if (better) {
-            logo = candidate;
-            bestGap = gap;
-            bestBottom = CGRectGetMaxY(glyph);
-        }
-    }
     gToolbarScanGate = @"logo-choice-missing";
-    if (!logo) return NO;
+    while (logoCandidates.count) {
+        UIView *logo = nil;
+        CGFloat bestGap = CGFLOAT_MAX;
+        CGFloat bestBottom = -CGFLOAT_MAX;
+        NSUInteger bestIndex = 0;
+        for (NSUInteger index = 0; index < logoCandidates.count; index++) {
+            NSArray *entry = logoCandidates[index];
+            UIView *candidate = entry[0];
+            CGRect glyph = [entry[1] CGRectValue];
+            CGFloat gap = CGRectGetMinY(bodyRect) - CGRectGetMaxY(glyph);
+            if (gap < -8.0) gap = -8.0; // 压进键位体里的不算更近，但也不排除。
+            BOOL better = (!logo || gap < bestGap - 0.5) ||
+                          (fabs(gap - bestGap) <= 0.5 && CGRectGetMaxY(glyph) > bestBottom);
+            if (better) {
+                logo = candidate;
+                bestGap = gap;
+                bestBottom = CGRectGetMaxY(glyph);
+                bestIndex = index;
+            }
+        }
+        if (!logo) return NO;
 
-    gToolbarScanGate = @"row-invisible";
-    UIView *row = logo.superview;
-    if (!row || row == root || !GXKKeyIsVisible(row, root)) return NO;
-    gToolbarScanGate = @"row-size";
-    CGSize size = row.bounds.size;
-    if (size.width < 100 || size.height < 18 || size.height > 110) return NO;
-
-    CGRect band = CGRectZero;
-    gToolbarScanGate = @"band-unavailable";
-    if (!GXKToolbarBand(row, logo, root, &band)) return NO;
-    gToolbarScanGate = @"scan-success";
-
-    if (outRow) *outRow = row;
-    if (outLogo) *outLogo = logo;
-    if (outBody) *outBody = body;
-    if (outBand) *outBand = band;
-    return YES;
+        gToolbarScanGate = @"row-invisible";
+        UIView *row = logo.superview;
+        if (row && row != root && GXKKeyIsVisible(row, root)) {
+            gToolbarScanGate = @"row-size";
+            CGSize size = row.bounds.size;
+            if (size.width >= 100 && size.height >= 18 && size.height <= 110) {
+                CGRect band = CGRectZero;
+                gToolbarScanGate = @"band-unavailable";
+                if (GXKToolbarBand(row, logo, root, &band)) {
+                    gToolbarScanGate = @"scan-success";
+                    if (outRow) *outRow = row;
+                    if (outLogo) *outLogo = logo;
+                    if (outBody) *outBody = body;
+                    if (outBand) *outBand = band;
+                    return YES;
+                }
+            }
+        }
+        [logoCandidates removeObjectAtIndex:bestIndex];
+    }
+    return NO;
 }
 
 #endif
