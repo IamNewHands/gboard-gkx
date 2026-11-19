@@ -183,7 +183,7 @@ def artifact_bytes(archive=None):
     require(struct.unpack_from("<I", data, 12)[0] == 6, "CI artifact is not MH_DYLIB")
     require(command_strings(data, 0xD) == [LOAD_PATH], "CI dylib install name mismatch")
     # Selectors only the repaired toolbar carries; diagnostic-only markers are gone by design.
-    for marker in (b"contentRectForBounds:", b"onDismissKeyboard:", b"onSelectAll:", TARGET + b"\0"):
+    for marker in (b"setTitleEdgeInsets:", b"onDismissKeyboard:", b"onSelectAll:", TARGET + b"\0"):
         require(marker in data, "Repair dylib marker missing: " + marker.decode().rstrip("\0"))
     return data
 

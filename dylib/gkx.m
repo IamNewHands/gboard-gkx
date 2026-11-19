@@ -637,28 +637,9 @@ static void GXKDetachToolbar(void) {
 @end
 
 @implementation GXKToolbarButton
-// 顶条行只有 22pt 高。UIButton 在 contentEdgeInsets 之外还会留 6pt 上下内边距，
-// 22pt 行因此只剩 10pt 内容区，16pt 标题（19.09pt 高）根本放不下，
-// titleRectForContentRect 退化成 CGRectZero，整条工具栏被判 title-does-not-fit 而永不显示。
-// 内容区直接取 bounds：标题只受这一行的真实高度约束。
-- (CGRect)contentRectForBounds:(CGRect)bounds {
-    return bounds;
-}
-- (CGRect)titleRectForContentRect:(CGRect)contentRect {
-    CGRect title = [super titleRectForContentRect:contentRect];
-    if (CGRectIsEmpty(title) && self.titleLabel.font) {
-        // 系统偶尔仍按内部内边距判定放不下；用字体度量兜底，尺寸仍是真实标题尺寸。
-        CGSize natural = [self.currentTitle sizeWithAttributes:@{NSFontAttributeName:self.titleLabel.font}];
-        title = CGRectMake(CGRectGetMinX(contentRect), 0.0, natural.width, natural.height);
-    }
-    if (CGRectIsEmpty(title) || CGRectIsEmpty(contentRect)) return CGRectZero;
-    if (title.size.height > contentRect.size.height) title.size.height = contentRect.size.height;
-    if (title.size.width > contentRect.size.width) title.size.width = contentRect.size.width;
-    title.origin.x = CGRectGetMidX(contentRect) - title.size.width * 0.5;
-    title.origin.y = self.gxkContentCenterY - title.size.height * 0.5;
-    title.origin.y = MAX(CGRectGetMinY(contentRect), MIN(title.origin.y, CGRectGetMaxY(contentRect) - title.size.height));
-    return CGRectContainsRect(contentRect, title) ? title : CGRectZero;
-}
+// 这里刻意不覆写 contentRectForBounds: / titleRectForContentRect:。
+// 覆写 UIKit 的布局矩形会在键盘扩展的布局循环里反复触发自身计算，真机上直接闪退；
+// 22pt 行放不下 16pt 标题的问题改用公开的 titleEdgeInsets 负边距解决（见 GXKMakeToolbar）。
 - (void)layoutSubviews {
     [super layoutSubviews];
     UIView *divider = self.gxkDivider;
@@ -690,6 +671,10 @@ static UIStackView *GXKMakeToolbar(UIView *row, UIColor *tint) {
         button.backgroundColor = [UIColor clearColor];
         button.adjustsImageWhenHighlighted = NO;
         button.titleLabel.adjustsFontSizeToFitWidth = NO; // Keep the native font size; unfit titles cannot authorize display.
+        // 22pt 顶条行：UIButton 默认上下各留 6pt 内边距，内容区只剩 10pt，
+        // 16pt 标题（19.09pt）被裁掉一半。负的 titleEdgeInsets 把标题矩形撑回整行高度，
+        // 这是公开 API，不需要覆写布局方法。
+        button.titleEdgeInsets = UIEdgeInsetsMake(-6.0, 0.0, -6.0, 0.0);
         button.titleLabel.font = font;
         [button setTitle:titles[i] forState:UIControlStateNormal];
         [button setTitleColor:tint forState:UIControlStateNormal];
@@ -737,24 +722,22 @@ static BOOL GXKSyncToolbarGeometry(UIStackView *stack, CGRect hostBand) {
         if (!font) return NO;
         CGSize textSize = [button.currentTitle sizeWithAttributes:@{NSFontAttributeName:font}];
         CGFloat textHeight = MAX(font.lineHeight, textSize.height);
-        // 标题实际可用的矩形就是这个按钮的内容区，判定必须和它一致，
-        // 否则 22pt 行上的 6pt 内边距会把本来放得下的标题判成放不下。
-        CGRect content = [button contentRectForBounds:slot];
+        // 负的 titleEdgeInsets 已经把标题区撑回整行高度（见 GXKMakeToolbar），
+        // 所以「放不放得下」只看这一格：22pt 行上 19.09pt 的标题刚好放得下。
+        if (!isfinite(textHeight) || textHeight <= 0.0 || !isfinite(textSize.width) ||
+            !isfinite(slot.size.width) || !isfinite(slot.size.height) ||
+            textHeight > slot.size.height || textSize.width > slot.size.width) {
+            return NO; // A title that cannot fit the row would clip: keep native.
+        }
         // The G center is the anchor, but a header row shorter than the icon pulls the band up:
         // keep the title inside that band instead of dropping the whole toolbar.
         CGFloat centerY = anchorY;
-        if (isfinite(centerY) && isfinite(textHeight) && textHeight > 0.0 &&
-            isfinite(content.size.height) && content.size.height >= textHeight) {
-            centerY = MAX(textHeight * 0.5, MIN(centerY, content.size.height - textHeight * 0.5));
+        if (isfinite(centerY)) {
+            centerY = MAX(textHeight * 0.5, MIN(centerY, slot.size.height - textHeight * 0.5));
         }
         button.gxkContentCenterY = centerY;
         [button setNeedsLayout];
-        if (!isfinite(centerY) || !isfinite(textHeight) || textHeight <= 0.0 ||
-            centerY - textHeight * 0.5 < 0.0 || centerY + textHeight * 0.5 > content.size.height ||
-            !isfinite(textSize.width) || textSize.width > content.size.width ||
-            CGRectIsEmpty([button titleRectForContentRect:content])) {
-            return NO; // A title that cannot fit its own content rect would clip: keep native.
-        }
+        if (!isfinite(centerY)) return NO;
     }
     return YES;
 }

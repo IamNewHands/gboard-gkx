@@ -419,19 +419,18 @@ class PerfContracts(unittest.TestCase):
         self.assertNotIn("gToolbarGlyphRoot", function_body(self.layout, "static BOOL GXKToolbarVisibleImageRect("))
 
     def test_title_alignment_is_absolute_bounded_and_refreshed_before_fast_return(self):
-        title = function_body(self.source, "- (CGRect)titleRectForContentRect:")
-        self.assertIn("[super titleRectForContentRect:contentRect]", title)
-        self.assertIn("self.gxkContentCenterY - title.size.height * 0.5", title)
-        self.assertIn("CGRectContainsRect(contentRect, title) ? title : CGRectZero", title)
+        # 覆写 UIKit 的布局矩形会在键盘扩展的布局循环里闪退：标题内边距只用公开 API 调。
+        self.assertNotIn("- (CGRect)contentRectForBounds:", self.source)
+        self.assertNotIn("- (CGRect)titleRectForContentRect:", self.source)
+        self.assertIn("button.titleEdgeInsets = UIEdgeInsetsMake(-6.0, 0.0, -6.0, 0.0);", self.source)
         self.assertNotIn("titleLabel.frame =", self.source)
         geometry = function_body(self.source, "static BOOL GXKSyncToolbarGeometry(")
+        self.assertNotIn("titleRectForContentRect", geometry)
         for required in ("CGFloat anchorY = CGRectGetMidY(gToolbarGlyphRoot) - CGRectGetMinY(hostBand);",
-                         "CGRect content = [button contentRectForBounds:slot];",
-                         "centerY = MAX(textHeight * 0.5, MIN(centerY, content.size.height - textHeight * 0.5));",
+                         "centerY = MAX(textHeight * 0.5, MIN(centerY, slot.size.height - textHeight * 0.5));",
                          "button.gxkContentCenterY = centerY;", "[button setNeedsLayout]",
-                         "MAX(font.lineHeight, textSize.height)", "centerY - textHeight * 0.5 < 0.0",
-                         "centerY + textHeight * 0.5 > content.size.height", "textSize.width > content.size.width",
-                         "CGRectIsEmpty([button titleRectForContentRect:content])"):
+                         "MAX(font.lineHeight, textSize.height)", "textHeight > slot.size.height",
+                         "textSize.width > slot.size.width"):
             self.assertIn(required, geometry)
         update = function_body(self.source, "static void GXKUpdateToolbar(UIViewController *vc) {")
         self.assertLess(update.index("GXKSyncToolbarGeometry(gToolbarStack, hostBand)"),
