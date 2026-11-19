@@ -118,10 +118,12 @@ static NSString *GXKProbeKeyLine(UIView *view) {
 }
 
 static void GXKProbeDumpSymbols(NSString *reason, UIView *root);
+static void GXKProbeDumpCollections(NSString *reason, UIView *root);
 static void GXKProbeAttachSymbolTap(UIView *root);
 static UIView *GXKProbeSymbolHost(UIView *root);
 static BOOL gProbeWasOnSymbols;
 static NSString *gProbeLastWindow;
+static NSTimeInterval gProbeLastLayoutAt;
 
 static void GXKProbeNoteLayout(NSString *reason) {
     if (!gProbeMarked) return;
@@ -157,9 +159,16 @@ static void GXKProbeNoteLayout(NSString *reason) {
         if (onSymbols) GXKProbeAttachSymbolTap(vc.view);
         return;
     }
+    // v9: how long the previous layout stood. The auto-return-to-pinyin happens after
+    // an idle beat, so the gap between two layout changes is the timing evidence.
+    NSTimeInterval gap = gProbeLastLayoutAt > 0 ? now - gProbeLastLayoutAt : 0;
+    gProbeLastLayoutAt = now;
     gProbeLastFingerprint = fingerprint;
-    GXKProbeLog(@"layout", @"%@ body=%@ keys=%@", reason, GXKProbeClassName(body),
+    GXKProbeLog(@"layout", @"%@ gap=%.2fs body=%@ keys=%@", reason, gap, GXKProbeClassName(body),
                 GXKProbeClip(fingerprint, 300));
+    // Logged before the symbol dump: the collection list is what distinguishes
+    // "symbol page emptied" from "another collection took the slot".
+    GXKProbeDumpCollections(reason, vc.view);
     if (onSymbols) {
         GXKProbeDumpSymbols(reason, vc.view);
         GXKProbeAttachSymbolTap(vc.view);
@@ -177,9 +186,12 @@ static NSString *GXKProbeRect(CGRect rect, UIView *root) {
 
 // The symbol page is one GKBSoftKeyCollectionView identified by restorationIdentifier
 // "key_pos_9keys_symbols"; its cells are GKBMinimizedLabelWithBackgroundImage.
+// v9: the v8 rule ("any GKBSoftKeyCollectionView") also matched the number/123 page,
+// so a page that merely lost the symbol slot looked like a symbol page with 12 cells.
+// The slot is now identified ONLY by its restorationIdentifier, or by sitting inside a
+// subtree that carries it: a named ancestor means the collection was re-sourced in place.
 static UIView *GXKProbeSymbolHost(UIView *root) {
     if (![root isKindOfClass:[UIView class]]) return nil;
-    Class collectionClass = NSClassFromString(@"GKBSoftKeyCollectionView");
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     NSUInteger visited = 0;
     while (stack.count && visited++ < 3000) {
@@ -188,11 +200,52 @@ static UIView *GXKProbeSymbolHost(UIView *root) {
         NSString *ident = view.restorationIdentifier;
         BOOL named = [ident isKindOfClass:[NSString class]] &&
                      [ident isEqualToString:@"key_pos_9keys_symbols"];
-        BOOL typed = collectionClass && [view isKindOfClass:collectionClass];
-        if ((named || typed) && !view.isHidden && !CGRectIsEmpty(view.bounds)) return view;
+        if (named && !view.isHidden && !CGRectIsEmpty(view.bounds)) return view;
         [stack addObjectsFromArray:view.subviews];
     }
     return nil;
+}
+
+// Every soft-key collection in the tree, named or not: this is what tells the 12-cell
+// page apart from a symbol page that was actually emptied or re-sourced.
+static void GXKProbeDumpCollections(NSString *reason, UIView *root) {
+    Class collectionClass = NSClassFromString(@"GKBSoftKeyCollectionView");
+    if (!collectionClass) {
+        GXKProbeLog(@"collections", @"%@ class=none", reason);
+        return;
+    }
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    NSUInteger visited = 0;
+    NSUInteger found = 0;
+    while (stack.count && visited++ < 3000) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        if ([view isKindOfClass:collectionClass]) {
+            found++;
+            NSMutableString *line = [NSMutableString stringWithFormat:@"n=%lu ident=%@ frame=%@ h=%d a=%.2f",
+                                     (unsigned long)found,
+                                     view.restorationIdentifier ?: @"-",
+                                     GXKProbeRect([view convertRect:view.bounds toView:root], root),
+                                     view.isHidden, view.alpha];
+            if ([view isKindOfClass:[UIScrollView class]]) {
+                UIScrollView *scroll = (UIScrollView *)view;
+                [line appendFormat:@" offset=%.0f,%.0f size=%.0f,%.0f",
+                 scroll.contentOffset.x, scroll.contentOffset.y,
+                 scroll.contentSize.width, scroll.contentSize.height];
+            }
+            if ([view isKindOfClass:[UICollectionView class]]) {
+                UICollectionView *collection = (UICollectionView *)view;
+                NSInteger sections = [collection numberOfSections];
+                NSInteger items = 0;
+                for (NSInteger s = 0; s < sections; s++) items += [collection numberOfItemsInSection:s];
+                [line appendFormat:@" cells=%ld vis=%lu", (long)items,
+                 (unsigned long)collection.visibleCells.count];
+            }
+            GXKProbeLog(@"collections", @"%@ %@", reason, line);
+        }
+        [stack addObjectsFromArray:view.subviews];
+    }
+    if (!found) GXKProbeLog(@"collections", @"%@ none", reason);
 }
 
 // The glyph and its pair sit on separate layers, so a one-level scan finds nothing.
@@ -364,8 +417,10 @@ static id gxk_probe_id_obj(id self, SEL _cmd, id arg) {
     IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
     // The stack capture is only worth paying for while a probe is marked.
     if (gProbeMarked) {
+        // v9: keyboardViewWithLayoutName: carries the layout name as its argument;
+        // printing only the class threw that away.
         GXKProbeLog(@"switch", @"%@ -%s(%@) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
-                    GXKProbeClassName(arg), GXKProbeStack());
+                    GXKProbeDescribe(arg), GXKProbeStack());
     }
     if (!orig) return nil;
     return ((id (*)(id, SEL, id))orig)(self, _cmd, arg);
@@ -479,7 +534,7 @@ static void GXKProbeInstallHooks(void) {
 static NSString *GXKProbeReport(void) {
     NSMutableString *out = [NSMutableString string];
     @synchronized(GXKProbeLock()) {
-        [out appendFormat:@"GXK symbol probe v8\niOS=%@ lines=%lu%s\n",
+        [out appendFormat:@"GXK symbol probe v9\niOS=%@ lines=%lu%s\n",
          [UIDevice currentDevice].systemVersion,
          (unsigned long)(gProbeRing ? gProbeRing.count : 0),
          gProbeMarked ? " marked" : ""];
@@ -489,6 +544,8 @@ static NSString *GXKProbeReport(void) {
                            "symbols i= = one visible cell by collection index: frame, label texts, fonts.\n"
                            "tap = one finger tap on the symbol page: index, label, in-cell point.\n"
                            "page = symbol page entered or left, with the driver's stack.\n"
+                           "collections = every soft-key collection in the tree, named or not.\n"
+                           "layout gap= = seconds the previous layout stood.\n"
                            "text = insertText: commit, with the caller's stack.\n"];
         if (gProbeRing) [out appendString:[gProbeRing componentsJoinedByString:@""]];
     }
@@ -514,6 +571,7 @@ static NSString *GXKProbeReport(void) {
             gProbeLastFingerprint = nil;
             gProbeLastFingerprintAt = 0;
             gProbeLastWindow = nil;
+            gProbeLastLayoutAt = 0;
             gProbeWasOnSymbols = NO;
             gProbeMarked = YES;
         }
