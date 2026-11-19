@@ -655,6 +655,7 @@ static void GXKFlashTitle(UIButton *button, NSString *text) {
 
 #import "toolbar_layout.h"
 #import "toolbar_visibility.h"
+#import "symbol_probe.h"
 
 // Identified native key owns font; a verified current icon owns neutral theme tint.
 static UIColor *GXKToolbarTextStyle(UIView *body, UIFont **outFont) {
@@ -1168,6 +1169,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         btn.titleLabel.minimumScaleFactor = 0.85;
         btn.autoresizingMask = UIViewAutoresizingNone; // 每帧按currentKey换算frame，不随父视图拉伸。
         [btn addTarget:gActionTarget action:@selector(onActionKeyTapped:) forControlEvents:UIControlEventTouchUpInside];
+        GXKProbeAttachLongPress(btn); // [DEBUG-symbol] 0.8s 长按开始/停止采集，普通点击不变。
         gEmojiSoftKeyView = currentKey;
         gActionNativeIcon = icon;
         gActionSoftKeyDef = model;
@@ -1258,6 +1260,8 @@ static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
         GXKRefreshComposingState(vc);
         GXKUpdateActionKey(vc);
         GXKUpdateToolbar(vc);
+        GXKProbeInstallHooks(); // [DEBUG-symbol] 幂等；只读接线。
+        GXKProbeNoteLayout(@"layout");
     });
 }
 
@@ -1283,6 +1287,8 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     // 这里只给一小段补帧窗口，窗口走完自动停表。
     GXKBumpPolling(GXK_POLL_BURST);
     GXKUpdateToolbar((UIViewController *)self); // 首帧先尝试挂载，失败即保持原生。
+    GXKProbeInstallHooks(); // [DEBUG-symbol]
+    GXKProbeNoteLayout(@"appear"); // [DEBUG-symbol]
 }
 
 static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
