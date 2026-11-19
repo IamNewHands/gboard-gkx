@@ -116,6 +116,9 @@ static NSString *GXKProbeKeyLine(UIView *view) {
     return [NSString stringWithFormat:@"%@:%@", ident, GXKProbeClassName(view)];
 }
 
+static void GXKProbeDumpSymbols(NSString *reason, UIView *root);
+static void GXKProbeAttachSymbolTap(UIView *root);
+
 static void GXKProbeNoteLayout(NSString *reason) {
     if (!gProbeMarked) return;
     UIViewController *vc = gCurrentVC;
@@ -141,6 +144,142 @@ static void GXKProbeNoteLayout(NSString *reason) {
     gProbeLastFingerprint = fingerprint;
     GXKProbeLog(@"layout", @"%@ body=%@ keys=%@", reason, GXKProbeClassName(body),
                 GXKProbeClip(fingerprint, 500));
+    GXKProbeDumpSymbols(reason, vc.view);
+    GXKProbeAttachSymbolTap(vc.view);
+}
+
+// ---- v4: symbol page inventory (public UIKit only) ----
+
+static NSString *GXKProbeRect(CGRect rect, UIView *root) {
+    return [NSString stringWithFormat:@"%.0f,%.0f,%.0f,%.0f",
+            rect.origin.x, rect.origin.y, rect.size.width, rect.size.height];
+}
+
+// The symbol page is one GKBSoftKeyCollectionView identified by restorationIdentifier
+// "key_pos_9keys_symbols"; its cells are GKBMinimizedLabelWithBackgroundImage.
+static UIView *GXKProbeSymbolHost(UIView *root) {
+    if (![root isKindOfClass:[UIView class]]) return nil;
+    Class collectionClass = NSClassFromString(@"GKBSoftKeyCollectionView");
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    NSUInteger visited = 0;
+    while (stack.count && visited++ < 3000) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        NSString *ident = view.restorationIdentifier;
+        BOOL named = [ident isKindOfClass:[NSString class]] &&
+                     [ident isEqualToString:@"key_pos_9keys_symbols"];
+        BOOL typed = collectionClass && [view isKindOfClass:collectionClass];
+        if ((named || typed) && !view.isHidden && !CGRectIsEmpty(view.bounds)) return view;
+        [stack addObjectsFromArray:view.subviews];
+    }
+    return nil;
+}
+
+// Every label text and frame on the symbol page, in mount order: this is what the
+// double-tap lock has to reason about, and none of it needs a private accessor.
+static void GXKProbeDumpSymbols(NSString *reason, UIView *root) {
+    UIView *host = GXKProbeSymbolHost(root);
+    if (!host) {
+        GXKProbeLog(@"symbols", @"%@ host=none", reason);
+        return;
+    }
+    NSMutableString *head = [NSMutableString stringWithFormat:@"%@ host=%@ frame=%@",
+                             reason, GXKProbeClassName(host),
+                             GXKProbeRect([host convertRect:host.bounds toView:root], root)];
+    if ([host isKindOfClass:[UIScrollView class]]) {
+        UIScrollView *scroll = (UIScrollView *)host;
+        [head appendFormat:@" offset=%@ size=%@",
+         GXKProbeRect(scroll.contentOffset, root), GXKProbeRect(scroll.contentSize, root)];
+    }
+    if ([host isKindOfClass:[UICollectionView class]]) {
+        UICollectionView *collection = (UICollectionView *)host;
+        NSInteger sections = [collection numberOfSections];
+        NSInteger items = 0;
+        for (NSInteger s = 0; s < sections; s++) items += [collection numberOfItemsInSection:s];
+        [head appendFormat:@" cells=%ld", (long)items];
+    }
+    GXKProbeLog(@"symbols", @"%@", head);
+    // Visible cells first: they carry the real on-screen geometry.
+    NSMutableArray<UIView *> *targets = [NSMutableArray array];
+    if ([host isKindOfClass:[UICollectionView class]]) {
+        for (UICollectionViewCell *cell in ((UICollectionView *)host).visibleCells) [targets addObject:cell];
+    }
+    if (!targets.count) {
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:host];
+        NSUInteger visited = 0;
+        while (stack.count && visited++ < 400 && targets.count < 40) {
+            UIView *view = stack.lastObject;
+            [stack removeLastObject];
+            [targets addObject:view];
+            [stack addObjectsFromArray:view.subviews];
+        }
+    }
+    NSUInteger emitted = 0;
+    for (UIView *view in targets) {
+        if (emitted++ >= 40) break;
+        NSMutableString *line = [NSMutableString stringWithFormat:@"cell=%@ frame=%@",
+                                 GXKProbeClassName(view),
+                                 GXKProbeRect([view convertRect:view.bounds toView:root], root)];
+        NSString *ident = view.restorationIdentifier;
+        if ([ident isKindOfClass:[NSString class]] && ident.length) [line appendFormat:@" id=%@", ident];
+        if ([view isKindOfClass:[UILabel class]]) {
+            NSString *text = ((UILabel *)view).text;
+            if ([text isKindOfClass:[NSString class]]) [line appendFormat:@" text=%@", text];
+        }
+        NSMutableArray<NSString *> *labels = [NSMutableArray array];
+        for (UIView *child in view.subviews) {
+            if (![child isKindOfClass:[UILabel class]]) continue;
+            UILabel *label = (UILabel *)child;
+            NSString *text = label.text ?: @"";
+            [labels addObject:[NSString stringWithFormat:@"%@|%@|hidden=%d|%@", text,
+                               GXKProbeRect([label convertRect:label.bounds toView:root], root),
+                               label.isHidden, label.font.fontName]];
+        }
+        if (labels.count) [line appendFormat:@" labels=[%@]", [labels componentsJoinedByString:@";"]];
+        [line appendFormat:@" sub=%lu", (unsigned long)view.subviews.count];
+        GXKProbeLog(@"symbols", @"%@", line);
+    }
+}
+
+// One tap on the symbol page: which cell, which label text, where. This is the
+// evidence the double-tap lock needs; it reads no private property.
+@interface GXKProbeSymbolTap : NSObject
+- (void)onSymbolTap:(UITapGestureRecognizer *)gesture;
+@end
+
+@implementation GXKProbeSymbolTap
+- (void)onSymbolTap:(UITapGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateEnded) return;
+    UIView *host = gesture.view;
+    if (![host isKindOfClass:[UIView class]]) return;
+    CGPoint point = [gesture locationInView:host];
+    UIView *hit = [host hitTest:point withEvent:nil];
+    NSMutableArray<NSString *> *chain = [NSMutableArray array];
+    for (UIView *view = hit; view && view != host && chain.count < 6; view = view.superview) {
+        NSString *ident = view.restorationIdentifier;
+        NSString *text = [view isKindOfClass:[UILabel class]] ? ((UILabel *)view).text : nil;
+        [chain addObject:[NSString stringWithFormat:@"%@%@%@", GXKProbeClassName(view),
+                          ident.length ? [@"#" stringByAppendingString:ident] : @"",
+                          text.length ? [@"(" stringByAppendingFormat:@"%@)", text] : @""]];
+    }
+    GXKProbeLog(@"tap", @"at=%.0f,%.0f chain=%@", point.x, point.y,
+                chain.count ? [chain componentsJoinedByString:@" < "] : @"none");
+}
+@end
+
+static GXKProbeSymbolTap *gProbeSymbolTap;
+static __weak UIView *gProbeSymbolTapHost;
+
+static void GXKProbeAttachSymbolTap(UIView *root) {
+    UIView *host = GXKProbeSymbolHost(root);
+    if (!host || host == gProbeSymbolTapHost) return;
+    gProbeSymbolTapHost = host;
+    if (!gProbeSymbolTap) gProbeSymbolTap = [[GXKProbeSymbolTap alloc] init];
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+        initWithTarget:gProbeSymbolTap action:@selector(onSymbolTap:)];
+    tap.cancelsTouchesInView = NO; // never swallow the real key tap.
+    [host addGestureRecognizer:tap];
+    GXKProbeLog(@"tap", @"attached to %@", GXKProbeClassName(host));
 }
 
 static IMP GXKProbeOrigFor(Class cls, SEL sel) {
@@ -232,13 +371,15 @@ static void GXKProbeInstallHooks(void) {
 static NSString *GXKProbeReport(void) {
     NSMutableString *out = [NSMutableString string];
     @synchronized(GXKProbeLock()) {
-        [out appendFormat:@"GXK symbol probe v3\niOS=%@ lines=%lu%s\n",
+        [out appendFormat:@"GXK symbol probe v4\niOS=%@ lines=%lu%s\n",
          [UIDevice currentDevice].systemVersion,
          (unsigned long)(gProbeRing ? gProbeRing.count : 0),
          gProbeMarked ? " marked" : ""];
         [out appendString:@"read-only: every hooked call forwards; no key property is read.\n"
-                           "switch = native layout entry point (class, selector, argument class, callers).\n"
-                           "layout = visible key identifiers of the 9-key body, in mount order.\n"];
+                           "layout = visible key identifiers of the 9-key body, in mount order.\n"
+                           "symbols host= = the symbol page container (key_pos_9keys_symbols).\n"
+                           "symbols cell= = one visible cell: frame, label texts, fonts.\n"
+                           "tap = one finger tap on the symbol page: hit chain from label up.\n"];
         if (gProbeRing) [out appendString:[gProbeRing componentsJoinedByString:@""]];
     }
     return out;
