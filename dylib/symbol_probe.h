@@ -164,23 +164,30 @@ static void GXKProbeRemember(Class cls, SEL sel, IMP imp) {
 
 static id gxk_probe_id_obj(id self, SEL _cmd, id arg) {
     IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
-    GXKProbeLog(@"switch", @"%@ -%s(%@) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
-                GXKProbeClassName(arg), GXKProbeStack());
+    // The stack capture is only worth paying for while a probe is marked.
+    if (gProbeMarked) {
+        GXKProbeLog(@"switch", @"%@ -%s(%@) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
+                    GXKProbeClassName(arg), GXKProbeStack());
+    }
     if (!orig) return nil;
     return ((id (*)(id, SEL, id))orig)(self, _cmd, arg);
 }
 
 static void gxk_probe_void_obj(id self, SEL _cmd, id arg) {
     IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
-    GXKProbeLog(@"switch", @"%@ -%s(%@) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
-                GXKProbeClassName(arg), GXKProbeStack());
+    if (gProbeMarked) {
+        GXKProbeLog(@"switch", @"%@ -%s(%@) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
+                    GXKProbeClassName(arg), GXKProbeStack());
+    }
     if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, arg);
 }
 
 static void gxk_probe_void_bool(id self, SEL _cmd, BOOL value) {
     IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
-    GXKProbeLog(@"switch", @"%@ -%s(%d) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
-                (int)value, GXKProbeStack());
+    if (gProbeMarked) {
+        GXKProbeLog(@"switch", @"%@ -%s(%d) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
+                    (int)value, GXKProbeStack());
+    }
     if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, value);
 }
 
