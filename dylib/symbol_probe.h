@@ -17,9 +17,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define GXK_PROBE_RING 200
+#define GXK_PROBE_RING 800
 #define GXK_PROBE_MAX_LINE 600
 #define GXK_PROBE_MAX_KEYS 40
+#define GXK_PROBE_MAX_CELLS 12
 #define GXK_PROBE_STACK 5
 #define GXK_PROBE_MIN_GAP 0.10
 
@@ -120,6 +121,7 @@ static void GXKProbeDumpSymbols(NSString *reason, UIView *root);
 static void GXKProbeAttachSymbolTap(UIView *root);
 static UIView *GXKProbeSymbolHost(UIView *root);
 static BOOL gProbeWasOnSymbols;
+static NSString *gProbeLastWindow;
 
 static void GXKProbeNoteLayout(NSString *reason) {
     if (!gProbeMarked) return;
@@ -245,9 +247,16 @@ static void GXKProbeDumpSymbols(NSString *reason, UIView *root) {
             return a.item < b.item ? NSOrderedAscending : NSOrderedDescending;
         }];
     }
+    // Only emit cells when the visible window changed: 14 dumps x 24 cells used to
+    // flush the ring and evict the page-transition lines.
+    NSString *window = [NSString stringWithFormat:@"%ld/%lu",
+                        (long)(indexes.count ? indexes.firstObject.item : -1),
+                        (unsigned long)indexes.count];
+    if ([window isEqualToString:gProbeLastWindow ?: @""]) return;
+    gProbeLastWindow = window;
     NSUInteger emitted = 0;
     for (NSIndexPath *path in indexes) {
-        if (emitted++ >= 24) break;
+        if (emitted++ >= GXK_PROBE_MAX_CELLS) break;
         UICollectionViewCell *cell = [((UICollectionView *)host) cellForItemAtIndexPath:path];
         if (!cell) continue;
         NSMutableString *line = [NSMutableString stringWithFormat:@"i=%ld frame=%@",
@@ -308,6 +317,16 @@ static void GXKProbeAttachSymbolTap(UIView *root) {
     GXKProbeLog(@"tap", @"attached to %@", GXKProbeClassName(host));
 }
 
+// Layout names are plain strings; printing the class alone wasted a whole probe run.
+static NSString *GXKProbeDescribe(id value) {
+    if (!value) return @"nil";
+    if ([value isKindOfClass:[NSString class]]) {
+        NSString *text = (NSString *)value;
+        return text.length <= 60 ? text : [text substringToIndex:60];
+    }
+    return GXKProbeClassName(value);
+}
+
 static IMP GXKProbeOrigFor(Class cls, SEL sel) {
     NSMutableDictionary *table = gProbeOrigs;
     if (!table) return NULL;
@@ -342,7 +361,7 @@ static void gxk_probe_void_obj(id self, SEL _cmd, id arg) {
     IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
     if (gProbeMarked) {
         GXKProbeLog(@"switch", @"%@ -%s(%@) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
-                    GXKProbeClassName(arg), GXKProbeStack());
+                    GXKProbeDescribe(arg), GXKProbeStack());
     }
     if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, arg);
 }
@@ -372,12 +391,12 @@ static BOOL GXKProbeDeclares(Class cls, SEL sel) {
 
 static id gxk_probe_id_void(id self, SEL _cmd) {
     IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
+    id result = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil;
     if (gProbeMarked) {
-        GXKProbeLog(@"switch", @"%@ -%s stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
-                    GXKProbeStack());
+        GXKProbeLog(@"switch", @"%@ -%s -> %@ stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
+                    GXKProbeDescribe(result), GXKProbeStack());
     }
-    if (!orig) return nil;
-    return ((id (*)(id, SEL))orig)(self, _cmd);
+    return result;
 }
 
 static void gxk_probe_void_bool_obj(id self, SEL _cmd, BOOL value, id arg) {
@@ -436,7 +455,7 @@ static void GXKProbeInstallHooks(void) {
 static NSString *GXKProbeReport(void) {
     NSMutableString *out = [NSMutableString string];
     @synchronized(GXKProbeLock()) {
-        [out appendFormat:@"GXK symbol probe v5\niOS=%@ lines=%lu%s\n",
+        [out appendFormat:@"GXK symbol probe v7\niOS=%@ lines=%lu%s\n",
          [UIDevice currentDevice].systemVersion,
          (unsigned long)(gProbeRing ? gProbeRing.count : 0),
          gProbeMarked ? " marked" : ""];
@@ -468,6 +487,8 @@ static NSString *GXKProbeReport(void) {
             gProbeStartedAt = GXKProbeNow();
             gProbeLastFingerprint = nil;
             gProbeLastFingerprintAt = 0;
+            gProbeLastWindow = nil;
+            gProbeWasOnSymbols = NO;
             gProbeMarked = YES;
         }
         GXKProbeLog(@"mark", @"start");
