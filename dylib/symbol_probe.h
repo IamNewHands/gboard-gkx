@@ -119,11 +119,16 @@ static NSString *GXKProbeKeyLine(UIView *view) {
 
 static void GXKProbeDumpSymbols(NSString *reason, UIView *root);
 static void GXKProbeDumpCollections(NSString *reason, UIView *root);
+static void GXKProbeDumpAllSymbols(UIView *host, UIView *root);
+static BOOL GXKProbeSymbolOnTop(UIView *host);
+static void GXKProbeCollectLabels(UIView *view, UIView *root, NSMutableArray<NSString *> *out,
+                                  NSUInteger depth);
 static void GXKProbeAttachSymbolTap(UIView *root);
 static UIView *GXKProbeSymbolHost(UIView *root);
 static BOOL gProbeWasOnSymbols;
 static NSString *gProbeLastWindow;
 static NSTimeInterval gProbeLastLayoutAt;
+static BOOL gProbeDumpedAll;
 
 static void GXKProbeNoteLayout(NSString *reason) {
     if (!gProbeMarked) return;
@@ -148,7 +153,10 @@ static void GXKProbeNoteLayout(NSString *reason) {
     // Page flips are checked BEFORE the fingerprint gate: in v7 that gate returned
     // early on every exit, so only the very first "-> symbols" was ever recorded.
     UIView *symbolHost = GXKProbeSymbolHost(vc.view);
-    BOOL onSymbols = symbolHost != nil;
+    // v9 counted the collection as "on screen" whenever it existed. It always exists:
+    // the log shows h=0 a=1.00 even while the pinyin keys are the ones being shown.
+    // What actually decides the page is which view wins the hit test over the slot.
+    BOOL onSymbols = symbolHost && GXKProbeSymbolOnTop(symbolHost);
     if (onSymbols != gProbeWasOnSymbols) {
         gProbeWasOnSymbols = onSymbols;
         GXKProbeLog(@"page", @"%@ -> %@ stack=%@", onSymbols ? @"symbols" : @"keys",
@@ -172,12 +180,53 @@ static void GXKProbeNoteLayout(NSString *reason) {
     if (onSymbols) {
         GXKProbeDumpSymbols(reason, vc.view);
         GXKProbeAttachSymbolTap(vc.view);
+        if (!gProbeDumpedAll) {
+            gProbeDumpedAll = YES;
+            GXKProbeDumpAllSymbols(symbolHost, vc.view);
+        }
     }
 }
 
 // ---- v4: symbol page inventory (public UIKit only) ----
 
 static UIView *GXKProbeSymbolHost(UIView *root);
+
+// Is the symbol slot the thing the finger would actually hit?
+static BOOL GXKProbeSymbolOnTop(UIView *host) {
+    UIView *root = host.window ?: host;
+    CGPoint center = [host convertPoint:CGPointMake(CGRectGetMidX(host.bounds),
+                                                    CGRectGetMidY(host.bounds))
+                                 toView:root];
+    UIView *hit = [root hitTest:center withEvent:nil];
+    for (UIView *view = hit; view; view = view.superview) {
+        if (view == host) return YES;
+        if (view == root) break;
+    }
+    return NO;
+}
+
+// The pair table cannot be guessed: one dump of every cell label is what makes
+// "tap （ and insert （）" possible. Emitted once per mark, not per layout.
+static void GXKProbeDumpAllSymbols(UIView *host, UIView *root) {
+    if (![host isKindOfClass:[UICollectionView class]]) return;
+    UICollectionView *collection = (UICollectionView *)host;
+    NSInteger sections = [collection numberOfSections];
+    NSUInteger emitted = 0;
+    for (NSInteger s = 0; s < sections; s++) {
+        NSInteger items = [collection numberOfItemsInSection:s];
+        for (NSInteger item = 0; item < items; item++) {
+            NSIndexPath *path = [NSIndexPath indexPathForItem:item inSection:s];
+            // Off-screen cells are recycled, so an index with no cell is expected:
+            // its row is still printed, which keeps the index-to-label map complete.
+            UICollectionViewCell *cell = [collection cellForItemAtIndexPath:path];
+            NSMutableArray<NSString *> *labels = [NSMutableArray array];
+            if (cell) GXKProbeCollectLabels(cell, root, labels, 0);
+            GXKProbeLog(@"all", @"i=%ld labels=[%@]", (long)item,
+                        [labels componentsJoinedByString:@";"]);
+            if (++emitted >= 200) return;
+        }
+    }
+}
 
 static NSString *GXKProbeRect(CGRect rect, UIView *root) {
     return [NSString stringWithFormat:@"%.0f,%.0f,%.0f,%.0f",
@@ -394,6 +443,47 @@ static NSString *GXKProbeDescribe(id value) {
     return GXKProbeClassName(value);
 }
 
+// v10: -parseLayoutName returns GPBAutocreatedArray of GKBStringMapEntry, and v9
+// printed only the class names -- which is exactly the value that decides whether the
+// keyboard lands on pinyin or on the symbol page. This walks one level in: array
+// elements, then each object's ivars, so the layout name itself becomes visible.
+static NSString *GXKProbeDeepDescribe(id value, int depth) {
+    if (!value) return @"nil";
+    if ([value isKindOfClass:[NSString class]]) return GXKProbeClip((NSString *)value, 40);
+    if ([value isKindOfClass:[NSNumber class]]) return [(NSNumber *)value stringValue];
+    if (depth >= 2) return GXKProbeClassName(value);
+    if ([value isKindOfClass:[NSArray class]]) {
+        NSArray *array = (NSArray *)value;
+        NSMutableArray<NSString *> *parts = [NSMutableArray array];
+        for (NSUInteger i = 0; i < array.count && i < 8; i++) {
+            [parts addObject:GXKProbeDeepDescribe(array[i], depth + 1)];
+        }
+        return [NSString stringWithFormat:@"%@[%lu]{%@}", GXKProbeClassName(value),
+                (unsigned long)array.count, [parts componentsJoinedByString:@","]];
+    }
+    // Plain object: the ivars are the payload (GKBStringMapEntry stores a name pair).
+    NSMutableArray<NSString *> *fields = [NSMutableArray array];
+    for (Class cursor = object_getClass(value); cursor && fields.count < 8;
+         cursor = class_getSuperclass(cursor)) {
+        if (cursor == [NSObject class]) break;
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(cursor, &count);
+        if (!ivars) continue;
+        for (unsigned int i = 0; i < count && fields.count < 8; i++) {
+            const char *type = ivar_getTypeEncoding(ivars[i]);
+            if (!type || type[0] != '@') continue;
+            id field = object_getIvar(value, ivars[i]);
+            if (!field) continue;
+            [fields addObject:[NSString stringWithFormat:@"%s=%@", ivar_getName(ivars[i]),
+                               GXKProbeDeepDescribe(field, depth + 1)]];
+        }
+        free(ivars);
+    }
+    if (!fields.count) return GXKProbeClassName(value);
+    return [NSString stringWithFormat:@"%@{%@}", GXKProbeClassName(value),
+            [fields componentsJoinedByString:@","]];
+}
+
 static IMP GXKProbeOrigFor(Class cls, SEL sel) {
     NSMutableDictionary *table = gProbeOrigs;
     if (!table) return NULL;
@@ -463,7 +553,7 @@ static id gxk_probe_id_void(id self, SEL _cmd) {
     id result = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil;
     if (gProbeMarked) {
         GXKProbeLog(@"switch", @"%@ -%s -> %@ stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
-                    GXKProbeDescribe(result), GXKProbeStack());
+                    GXKProbeDeepDescribe(result, 0), GXKProbeStack());
     }
     return result;
 }
@@ -525,6 +615,8 @@ static void GXKProbeInstallHooks(void) {
     GXKProbeSwizzle(@selector(setSoftkeyLayoutName:), (IMP)gxk_probe_void_obj);
     GXKProbeSwizzle(@selector(setLayoutName:), (IMP)gxk_probe_void_obj);
     GXKProbeSwizzle(@selector(parseLayoutName), (IMP)gxk_probe_id_void);
+    GXKProbeSwizzle(@selector(layoutName), (IMP)gxk_probe_id_void);
+    GXKProbeSwizzle(@selector(softkeyLayoutName), (IMP)gxk_probe_id_void);
     GXKProbeSwizzle(@selector(updateLayoutAnimated:), (IMP)gxk_probe_void_bool);
     GXKProbeSwizzle(@selector(updateLayoutAnimated:completion:), (IMP)gxk_probe_void_bool_obj);
     GXKProbeSwizzle(@selector(insertText:), (IMP)gxk_probe_void_text);
@@ -534,7 +626,7 @@ static void GXKProbeInstallHooks(void) {
 static NSString *GXKProbeReport(void) {
     NSMutableString *out = [NSMutableString string];
     @synchronized(GXKProbeLock()) {
-        [out appendFormat:@"GXK symbol probe v9\niOS=%@ lines=%lu%s\n",
+        [out appendFormat:@"GXK symbol probe v10\niOS=%@ lines=%lu%s\n",
          [UIDevice currentDevice].systemVersion,
          (unsigned long)(gProbeRing ? gProbeRing.count : 0),
          gProbeMarked ? " marked" : ""];
@@ -546,7 +638,10 @@ static NSString *GXKProbeReport(void) {
                            "page = symbol page entered or left, with the driver's stack.\n"
                            "collections = every soft-key collection in the tree, named or not.\n"
                            "layout gap= = seconds the previous layout stood.\n"
-                           "text = insertText: commit, with the caller's stack.\n"];
+                           "text = insertText: commit, with the caller's stack.\n"
+                           "switch ... -> = the layout name object, ivars expanded.\n"
+                           "all i= = every symbol cell label, dumped once per mark.\n"
+                           "page = decided by hitTest over the symbol slot, not by visibility.\n"];
         if (gProbeRing) [out appendString:[gProbeRing componentsJoinedByString:@""]];
     }
     return out;
@@ -572,6 +667,7 @@ static NSString *GXKProbeReport(void) {
             gProbeLastFingerprintAt = 0;
             gProbeLastWindow = nil;
             gProbeLastLayoutAt = 0;
+            gProbeDumpedAll = NO;
             gProbeWasOnSymbols = NO;
             gProbeMarked = YES;
         }
