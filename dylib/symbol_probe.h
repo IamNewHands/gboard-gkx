@@ -1,89 +1,106 @@
-// [DEBUG-symbol] Temporary, opt-in probe for the 9-key symbol page.
-// Behavior-neutral: it only records observations and forwards every original call.
-// Long press the action key (换行/重输) for 0.8 s to start, again to stop and copy.
+// [DEBUG-symbol] Read-only probe for the 9-key symbol page. v3.
+//
+// v1 crashed the keyboard extension when the long press ran. The cause was the key dump:
+// it read native properties (softKeyDef / idToViewDict / actionsArray) through unretained
+// casts and asked foreign objects for -description, which can run arbitrary native code.
+// v3 removes every such read. What remains is:
+//   - a bounded ring buffer that is always recording (200 lines), written from hooks only
+//   - three swizzled layout selectors, restricted to GKB*/UIKeyboard*/TIKeyboard* owners,
+//     each forwarding to its original IMP and logging class + selector + argument class
+//   - a layout fingerprint built only from -restorationIdentifier and class names
+//   - long press #1 marks a position (title 诊断), long press #2 copies the ring (title 已复制)
+// Nothing in the long-press handler touches keyboard internals, so it cannot crash there.
 #ifndef GXK_SYMBOL_PROBE_H
 #define GXK_SYMBOL_PROBE_H
 
 #include <stdarg.h>
 #include <stdlib.h>
+#include <string.h>
 
-#define GXK_PROBE_MAX_LINES 400
-#define GXK_PROBE_MAX_CHARS 131072
-#define GXK_PROBE_RING 120
-#define GXK_PROBE_STACK 8
-#define GXK_PROBE_MAX_KEYS 64
+#define GXK_PROBE_RING 200
+#define GXK_PROBE_MAX_LINE 600
+#define GXK_PROBE_MAX_KEYS 40
+#define GXK_PROBE_STACK 5
 #define GXK_PROBE_MIN_GAP 0.10
 
 static NSMutableArray<NSString *> *gProbeRing;
-static BOOL gProbeActive;
-static NSMutableArray<NSString *> *gProbeLines;
-static NSUInteger gProbeChars;
-static NSUInteger gProbeDropped;
+static BOOL gProbeMarked;
 static NSTimeInterval gProbeStartedAt;
 static NSString *gProbeLastFingerprint;
+static NSTimeInterval gProbeLastFingerprintAt;
 static NSMutableDictionary<NSString *, NSValue *> *gProbeOrigs;
 static BOOL gProbeHooksInstalled;
 static __weak UIButton *gProbeAttachedButton;
-static NSTimeInterval gProbeLastFingerprintAt;
+
+static NSObject *GXKProbeLock(void) {
+    static NSObject *token;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ token = [[NSObject alloc] init]; });
+    return token;
+}
 
 static NSTimeInterval GXKProbeNow(void) {
     return [NSProcessInfo processInfo].systemUptime;
 }
 
-static NSString *GXKProbeClip(id value, NSUInteger limit) {
-    NSString *text = value ? [value description] : @"nil";
+static NSString *GXKProbeClip(NSString *text, NSUInteger limit) {
+    if (![text isKindOfClass:[NSString class]]) return @"?";
     if (text.length <= limit) return text;
-    return [[text substringToIndex:limit] stringByAppendingString:@"…"];
+    return [[text substringToIndex:limit] stringByAppendingString:@"..."];
+}
+
+// Only the class name is ever read from a foreign object: -description can execute
+// arbitrary native code and is not safe on private keyboard internals.
+static NSString *GXKProbeClassName(id object) {
+    if (!object) return @"nil";
+    Class cls = object_getClass(object);
+    if (!cls) return @"nil";
+    const char *name = class_getName(cls);
+    return name ? [NSString stringWithUTF8String:name] : @"?";
 }
 
 static NSString *GXKProbeStack(void) {
     NSArray<NSString *> *frames = [NSThread callStackSymbols];
-    if (frames.count <= 2) return @"none";
+    if (![frames isKindOfClass:[NSArray class]] || frames.count <= 2) return @"none";
     NSUInteger end = MIN(frames.count, (NSUInteger)(GXK_PROBE_STACK + 2));
     NSMutableArray<NSString *> *kept = [NSMutableArray array];
-    for (NSUInteger i = 2; i < end; i++) [kept addObject:GXKProbeClip(frames[i], 120)];
+    for (NSUInteger i = 2; i < end; i++) {
+        NSString *frame = frames[i];
+        if ([frame isKindOfClass:[NSString class]]) [kept addObject:GXKProbeClip(frame, 90)];
+    }
     return [kept componentsJoinedByString:@" | "];
 }
 
-static void GXKProbeAppend(NSString *line) {
-    if (!line.length) return;
-    if (!gProbeRing) {
-        gProbeRing = [NSMutableArray array];
-        gProbeStartedAt = GXKProbeNow();
-    }
-    [gProbeRing addObject:line];
-    while (gProbeRing.count > GXK_PROBE_RING) [gProbeRing removeObjectAtIndex:0];
-    if (!gProbeActive || !gProbeLines) return;
-    if (gProbeLines.count >= GXK_PROBE_MAX_LINES || gProbeChars + line.length > GXK_PROBE_MAX_CHARS) {
-        gProbeDropped++;
-        return;
-    }
-    [gProbeLines addObject:line];
-    gProbeChars += line.length;
-}
+static void GXKProbeLog(NSString *tag, NSString *fmt, ...) NS_FORMAT_FUNCTION(2, 3);
 
-static void GXKProbeEvent(NSString *tag, NSString *fmt, ...) NS_FORMAT_FUNCTION(2, 3);
-
-static void GXKProbeEvent(NSString *tag, NSString *fmt, ...) {
+static void GXKProbeLog(NSString *tag, NSString *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     NSString *body = [[NSString alloc] initWithFormat:fmt arguments:args];
     va_end(args);
-    GXKProbeAppend([NSString stringWithFormat:@"t=%.3f [%@] %@\n",
-                    GXKProbeNow() - gProbeStartedAt, tag, body ?: @""]);
+    if (!body) return;
+    if (body.length > GXK_PROBE_MAX_LINE) body = GXKProbeClip(body, GXK_PROBE_MAX_LINE);
+    NSString *line = [NSString stringWithFormat:@"t=%.3f [%@] %@\n",
+                      GXKProbeNow() - gProbeStartedAt, tag, body];
+    // Nothing is recorded until the user marks a probe: an idle keyboard pays no cost.
+    if (!gProbeMarked) return;
+    @synchronized(GXKProbeLock()) {
+        if (!gProbeRing) gProbeRing = [NSMutableArray array];
+        [gProbeRing addObject:line];
+        while (gProbeRing.count > GXK_PROBE_RING) [gProbeRing removeObjectAtIndex:0];
+    }
 }
 
-// Visible 9-key body, identified by class only; never by nib name or coordinates.
 static UIView *GXKProbeNineKeyBody(UIView *root) {
-    if (!root) return nil;
+    if (![root isKindOfClass:[UIView class]]) return nil;
     Class nineClass = NSClassFromString(@"GKB9KeysSoftKeyboardView");
     if (!nineClass) return nil;
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     NSUInteger visited = 0;
-    while (stack.count && visited++ < 2000) {
+    while (stack.count && visited++ < 3000) {
         UIView *view = stack.lastObject;
         [stack removeLastObject];
-        if (!view.isHidden && view.alpha >= 0.05 && [view isKindOfClass:nineClass] &&
+        if ([view isKindOfClass:nineClass] && !view.isHidden && view.alpha >= 0.05 &&
             !CGRectIsEmpty(view.bounds)) {
             return view;
         }
@@ -92,150 +109,90 @@ static UIView *GXKProbeNineKeyBody(UIView *root) {
     return nil;
 }
 
-// Layout fingerprint: the sorted set of key identifiers currently mounted.
-static NSString *GXKProbeFingerprint(UIView *root) {
-    UIView *body = GXKProbeNineKeyBody(root);
-    if (!body) return @"no-nine-key-body";
-    NSMutableArray<NSString *> *ids = [NSMutableArray array];
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:body];
-    NSUInteger visited = 0;
-    while (stack.count && visited++ < 2000) {
-        UIView *view = stack.lastObject;
-        [stack removeLastObject];
-        NSString *ident = view.restorationIdentifier;
-        if (ident.length && !view.isHidden) [ids addObject:ident];
-        [stack addObjectsFromArray:view.subviews];
-    }
-    [ids sortUsingSelector:@selector(compare:)];
-    if (ids.count > GXK_PROBE_MAX_KEYS) ids = [[ids subarrayWithRange:NSMakeRange(0, GXK_PROBE_MAX_KEYS)] mutableCopy];
-    return [NSString stringWithFormat:@"%lu:%@", (unsigned long)ids.count, [ids componentsJoinedByString:@","]];
-}
-
-static void GXKProbeDumpKeys(NSString *reason) {
-    UIViewController *vc = gCurrentVC;
-    UIView *root = vc.isViewLoaded ? vc.view : nil;
-    if (!root) return;
-    UIView *body = GXKProbeNineKeyBody(root);
-    GXKProbeEvent(@"keys", @"%@ body=%@ keys=%lu", reason,
-                  body ? NSStringFromClass(body.class) : @"none",
-                  (unsigned long)(body ? body.subviews.count : 0));
-    if (!body) return;
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:body];
-    NSUInteger visited = 0, emitted = 0;
-    while (stack.count && visited++ < 2000 && emitted < GXK_PROBE_MAX_KEYS) {
-        UIView *view = stack.lastObject;
-        [stack removeLastObject];
-        NSString *ident = view.restorationIdentifier;
-        if (ident.length) {
-            emitted++;
-            NSMutableArray<NSString *> *bits = [NSMutableArray array];
-            [bits addObject:[NSString stringWithFormat:@"id=%@ cls=%@", ident, NSStringFromClass(view.class)]];
-            if ([view respondsToSelector:@selector(softKeyDef)]) {
-                id model = ((id<GXKNativeSoftKeyContent>)view).softKeyDef;
-                [bits addObject:[NSString stringWithFormat:@"model=%@", model ? NSStringFromClass([model class]) : @"nil"]];
-                if (GXKModelHasNativeActions(model)) {
-                    NSMutableArray<NSString *> *acts = [NSMutableArray array];
-                    for (id action in ((id<GXKNativeActionModel>)model).actionsArray) {
-                        [acts addObject:NSStringFromClass([action class])];
-                    }
-                    [bits addObject:[NSString stringWithFormat:@"actions=%@", [acts componentsJoinedByString:@"/"]]];
-                }
-            }
-            if ([view respondsToSelector:@selector(idToViewDict)]) {
-                NSDictionary *contents = ((id<GXKNativeSoftKeyContent>)view).idToViewDict;
-                if ([contents isKindOfClass:[NSDictionary class]]) {
-                    [bits addObject:[NSString stringWithFormat:@"contentKeys=%@",
-                                     [[contents.allKeys sortedArrayUsingSelector:@selector(compare:)]
-                                      componentsJoinedByString:@"/"]]];
-                }
-            }
-            [bits addObject:[NSString stringWithFormat:@"hidden=%d frame=%@", view.isHidden,
-                             NSStringFromCGRect(view.frame)]];
-            GXKProbeEvent(@"key", @"%@", [bits componentsJoinedByString:@" "]);
-        }
-        [stack addObjectsFromArray:view.subviews];
-    }
+// Fingerprint and key inventory read only -restorationIdentifier and class names.
+static NSString *GXKProbeKeyLine(UIView *view) {
+    NSString *ident = view.restorationIdentifier;
+    if (![ident isKindOfClass:[NSString class]] || !ident.length) return nil;
+    return [NSString stringWithFormat:@"%@:%@", ident, GXKProbeClassName(view)];
 }
 
 static void GXKProbeNoteLayout(NSString *reason) {
+    if (!gProbeMarked) return;
     UIViewController *vc = gCurrentVC;
     if (!vc || !vc.isViewLoaded) return;
     NSTimeInterval now = GXKProbeNow();
     if (now - gProbeLastFingerprintAt < GXK_PROBE_MIN_GAP) return;
     gProbeLastFingerprintAt = now;
-    NSString *fingerprint = GXKProbeFingerprint(vc.view);
+    UIView *body = GXKProbeNineKeyBody(vc.view);
+    NSMutableArray<NSString *> *keys = [NSMutableArray array];
+    if (body) {
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:body];
+        NSUInteger visited = 0;
+        while (stack.count && visited++ < 3000 && keys.count < GXK_PROBE_MAX_KEYS) {
+            UIView *view = stack.lastObject;
+            [stack removeLastObject];
+            NSString *line = view.isHidden ? nil : GXKProbeKeyLine(view);
+            if (line) [keys addObject:line];
+            [stack addObjectsFromArray:view.subviews];
+        }
+    }
+    NSString *fingerprint = body ? [keys componentsJoinedByString:@","] : @"no-nine-key-body";
     if ([fingerprint isEqualToString:gProbeLastFingerprint ?: @""]) return;
     gProbeLastFingerprint = fingerprint;
-    GXKProbeEvent(@"layout", @"%@ fp=%@", reason, GXKProbeClip(fingerprint, 400));
-    GXKProbeDumpKeys([@"after-" stringByAppendingString:reason]);
+    GXKProbeLog(@"layout", @"%@ body=%@ keys=%@", reason, GXKProbeClassName(body),
+                GXKProbeClip(fingerprint, 500));
 }
 
-// A hook may be installed on a superclass while the live instance is a subclass,
-// so the original IMP is looked up along the whole superclass chain.
 static IMP GXKProbeOrigFor(Class cls, SEL sel) {
-    if (!gProbeOrigs) return NULL;
+    NSMutableDictionary *table = gProbeOrigs;
+    if (!table) return NULL;
     for (Class cursor = cls; cursor; cursor = class_getSuperclass(cursor)) {
         NSString *key = [NSString stringWithFormat:@"%@/%s", NSStringFromClass(cursor), sel_getName(sel)];
-        NSValue *value = gProbeOrigs[key];
+        NSValue *value = table[key];
         if (value) return (IMP)value.pointerValue;
     }
     return NULL;
 }
 
 static void GXKProbeRemember(Class cls, SEL sel, IMP imp) {
-    if (!gProbeOrigs) gProbeOrigs = [NSMutableDictionary dictionary];
-    NSString *key = [NSString stringWithFormat:@"%@/%s", NSStringFromClass(cls), sel_getName(sel)];
-    gProbeOrigs[key] = [NSValue valueWithPointer:(void *)imp];
+    @synchronized(GXKProbeLock()) {
+        if (!gProbeOrigs) gProbeOrigs = [NSMutableDictionary dictionary];
+        NSString *key = [NSString stringWithFormat:@"%@/%s", NSStringFromClass(cls), sel_getName(sel)];
+        gProbeOrigs[key] = [NSValue valueWithPointer:(void *)imp];
+    }
 }
 
 static id gxk_probe_id_obj(id self, SEL _cmd, id arg) {
     IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
-    GXKProbeEvent(@"switch", @"%@ -%s(%@) stack=%@", NSStringFromClass(object_getClass(self)),
-                  sel_getName(_cmd), GXKProbeClip(arg, 80), GXKProbeStack());
+    GXKProbeLog(@"switch", @"%@ -%s(%@) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
+                GXKProbeClassName(arg), GXKProbeStack());
     if (!orig) return nil;
     return ((id (*)(id, SEL, id))orig)(self, _cmd, arg);
 }
 
 static void gxk_probe_void_obj(id self, SEL _cmd, id arg) {
     IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
-    GXKProbeEvent(@"switch", @"%@ -%s(%@) stack=%@", NSStringFromClass(object_getClass(self)),
-                  sel_getName(_cmd), GXKProbeClip(arg, 80), GXKProbeStack());
+    GXKProbeLog(@"switch", @"%@ -%s(%@) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
+                GXKProbeClassName(arg), GXKProbeStack());
     if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, arg);
-}
-
-static void gxk_probe_void_long(id self, SEL _cmd, long value) {
-    IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
-    GXKProbeEvent(@"switch", @"%@ -%s(%ld) stack=%@", NSStringFromClass(object_getClass(self)),
-                  sel_getName(_cmd), value, GXKProbeStack());
-    if (orig) ((void (*)(id, SEL, long))orig)(self, _cmd, value);
 }
 
 static void gxk_probe_void_bool(id self, SEL _cmd, BOOL value) {
     IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
-    GXKProbeEvent(@"switch", @"%@ -%s(%d) stack=%@", NSStringFromClass(object_getClass(self)),
-                  sel_getName(_cmd), (int)value, GXKProbeStack());
+    GXKProbeLog(@"switch", @"%@ -%s(%d) stack=%@", GXKProbeClassName(self), sel_getName(_cmd),
+                (int)value, GXKProbeStack());
     if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, value);
 }
 
-static void gxk_probe_insert_text(id self, SEL _cmd, id text) {
-    IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
-    NSString *string = [text isKindOfClass:[NSString class]] ? text : nil;
-    if (string.length <= 3) {
-        GXKProbeEvent(@"insert", @"%@ -insertText(%@) len=%lu stack=%@",
-                      NSStringFromClass(object_getClass(self)), GXKProbeClip(string, 24),
-                      (unsigned long)string.length, GXKProbeStack());
-    }
-    if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, text);
+// A substring match ("Key") would sweep hundreds of unrelated classes; only the
+// keyboard's own prefixes are touched.
+static BOOL GXKProbeNameAllowed(const char *name) {
+    if (!name) return NO;
+    return strncmp(name, "GKB", 3) == 0 || strncmp(name, "UIKeyboard", 10) == 0 ||
+           strncmp(name, "TIKeyboard", 10) == 0 || strncmp(name, "TUIKeyboard", 11) == 0;
 }
 
-static void gxk_probe_delete_backward(id self, SEL _cmd) {
-    IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
-    GXKProbeEvent(@"delete", @"%@ -deleteBackward", NSStringFromClass(object_getClass(self)));
-    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
-}
-
-// Swizzle only classes whose name marks them as keyboard/layout owners; everything else is left alone.
-static void GXKProbeSwizzleSelector(SEL sel, IMP hook, const char *const *filters, size_t filterCount) {
+static void GXKProbeSwizzle(SEL sel, IMP hook) {
     int count = objc_getClassList(NULL, 0);
     if (count <= 0) return;
     Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
@@ -243,14 +200,7 @@ static void GXKProbeSwizzleSelector(SEL sel, IMP hook, const char *const *filter
     count = objc_getClassList(classes, count);
     for (int i = 0; i < count; i++) {
         Class cls = classes[i];
-        if (!cls) continue;
-        const char *name = class_getName(cls);
-        if (!name) continue;
-        BOOL matches = NO;
-        for (size_t f = 0; f < filterCount && !matches; f++) {
-            if (strstr(name, filters[f])) matches = YES;
-        }
-        if (!matches) continue;
+        if (!cls || !GXKProbeNameAllowed(class_getName(cls))) continue;
         Method method = class_getInstanceMethod(cls, sel);
         if (!method) continue;
         IMP current = method_getImplementation(method);
@@ -259,88 +209,32 @@ static void GXKProbeSwizzleSelector(SEL sel, IMP hook, const char *const *filter
         if (!class_addMethod(cls, sel, hook, method_getTypeEncoding(method))) {
             method_setImplementation(method, hook);
         }
-        GXKProbeEvent(@"hook", @"%@ -%s", [NSString stringWithUTF8String:name], sel_getName(sel));
     }
     free(classes);
 }
 
 static void GXKProbeInstallHooks(void) {
     if (gProbeHooksInstalled) return;
-    if (!gCurrentVC) return;
     gProbeHooksInstalled = YES;
-    static const char *const filters[] = {"Keyboard", "Layout", "Softkey", "Key"};
-    GXKProbeSwizzleSelector(@selector(keyboardViewWithLayoutName:), (IMP)gxk_probe_id_obj, filters, 4);
-    GXKProbeSwizzleSelector(@selector(updateLayoutAnimated:), (IMP)gxk_probe_void_bool, filters, 4);
-    GXKProbeSwizzleSelector(@selector(loadLayoutForType:), (IMP)gxk_probe_void_long, filters, 4);
-    GXKProbeSwizzleSelector(@selector(configureWithKeyboardLayout:), (IMP)gxk_probe_void_obj, filters, 4);
-    GXKProbeSwizzleSelector(@selector(setSoftkeyLayoutName:), (IMP)gxk_probe_void_obj, filters, 4);
-    GXKProbeSwizzleSelector(@selector(scrollToPage:), (IMP)gxk_probe_void_long, filters, 4);
-    UIViewController *vc = gCurrentVC;
-    if ([vc isKindOfClass:[UIInputViewController class]]) {
-        id proxy = ((UIInputViewController *)vc).textDocumentProxy;
-        Class proxyClass = proxy ? object_getClass(proxy) : Nil;
-        if (proxyClass) {
-            Method insert = class_getInstanceMethod(proxyClass, @selector(insertText:));
-            if (insert && method_getImplementation(insert) != (IMP)gxk_probe_insert_text) {
-                GXKProbeRemember(proxyClass, @selector(insertText:), method_getImplementation(insert));
-                if (!class_addMethod(proxyClass, @selector(insertText:), (IMP)gxk_probe_insert_text,
-                                     method_getTypeEncoding(insert))) {
-                    method_setImplementation(insert, (IMP)gxk_probe_insert_text);
-                }
-                GXKProbeEvent(@"hook", @"%@ -insertText:", NSStringFromClass(proxyClass));
-            }
-            Method del = class_getInstanceMethod(proxyClass, @selector(deleteBackward));
-            if (del && method_getImplementation(del) != (IMP)gxk_probe_delete_backward) {
-                GXKProbeRemember(proxyClass, @selector(deleteBackward), method_getImplementation(del));
-                if (!class_addMethod(proxyClass, @selector(deleteBackward), (IMP)gxk_probe_delete_backward,
-                                     method_getTypeEncoding(del))) {
-                    method_setImplementation(del, (IMP)gxk_probe_delete_backward);
-                }
-                GXKProbeEvent(@"hook", @"%@ -deleteBackward", NSStringFromClass(proxyClass));
-            }
-        }
-    }
-    GXKProbeNoteLayout(@"install");
+    gProbeSwizzle(@selector(keyboardViewWithLayoutName:), (IMP)gxk_probe_id_obj);
+    GXKProbeSwizzle(@selector(setSoftkeyLayoutName:), (IMP)gxk_probe_void_obj);
+    GXKProbeSwizzle(@selector(updateLayoutAnimated:), (IMP)gxk_probe_void_bool);
+    GXKProbeLog(@"hook", @"installed");
 }
 
 static NSString *GXKProbeReport(void) {
     NSMutableString *out = [NSMutableString string];
-    [out appendFormat:@"GXK symbol probe v1\niOS=%@ lines=%lu dropped=%lu limit=%d/%d\n",
-     [UIDevice currentDevice].systemVersion, (unsigned long)(gProbeLines ? gProbeLines.count : 0),
-     (unsigned long)gProbeDropped, GXK_PROBE_MAX_LINES, GXK_PROBE_MAX_CHARS];
-    [out appendString:@"Read-only: no input is inserted, deleted or re-routed; every hooked call forwards.\n"
-                       "t = seconds since probe start. fp = sorted key identifiers of the visible 9-key body.\n"
-                       "switch = a native layout-switch entry point was called (class, selector, argument, caller frames).\n"
-                       "insert = text document proxy received insertText: (length <= 3 only).\n"
-                       "Long press the action key for 0.8 s to start, again to stop and copy.\n"];
-    if (gProbeLines) [out appendString:[gProbeLines componentsJoinedByString:@""]];
-    return out;
-}
-
-static void GXKProbeStart(UIButton *button) {
-    gProbeLines = [NSMutableArray array];
-    gProbeChars = 0;
-    gProbeDropped = 0;
-    gProbeActive = YES;
-    gProbeStartedAt = GXKProbeNow();
-    gProbeLastFingerprint = nil;
-    GXKProbeEvent(@"start", @"begin");
-    if (gProbeRing.count) {
-        GXKProbeEvent(@"preroll", @"%lu recent lines", (unsigned long)gProbeRing.count);
-        for (NSString *line in gProbeRing) GXKProbeAppend(line);
+    @synchronized(GXKProbeLock()) {
+        [out appendFormat:@"GXK symbol probe v3\niOS=%@ lines=%lu%s\n",
+         [UIDevice currentDevice].systemVersion,
+         (unsigned long)(gProbeRing ? gProbeRing.count : 0),
+         gProbeMarked ? " marked" : ""];
+        [out appendString:@"read-only: every hooked call forwards; no key property is read.\n"
+                           "switch = native layout entry point (class, selector, argument class, callers).\n"
+                           "layout = visible key identifiers of the 9-key body, in mount order.\n"];
+        if (gProbeRing) [out appendString:[gProbeRing componentsJoinedByString:@""]];
     }
-    GXKProbeDumpKeys(@"start");
-    if (button) GXKFlashTitle(button, @"诊断");
-}
-
-static void GXKProbeStop(UIButton *button) {
-    GXKProbeEvent(@"stop", @"manual");
-    NSString *report = GXKProbeReport();
-    [UIPasteboard generalPasteboard].string = report;
-    gProbeActive = NO;
-    gProbeLines = nil;
-    gProbeChars = 0;
-    if (button) GXKFlashTitle(button, @"已复制");
+    return out;
 }
 
 @interface GXKProbeTarget : NSObject
@@ -351,11 +245,28 @@ static void GXKProbeStop(UIButton *button) {
 - (void)onProbeLongPress:(UILongPressGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateBegan) return;
     UIButton *button = [gesture.view isKindOfClass:[UIButton class]] ? (UIButton *)gesture.view : nil;
-    if (gProbeActive) {
-        GXKProbeStop(button);
-    } else {
-        GXKProbeStart(button);
+    // Hooks are installed here, not at launch: until the user asks for a probe the
+    // keyboard runs completely unmodified.
+    GXKProbeInstallHooks();
+    // Mark first, copy second: neither step walks the view tree, so this path stays cheap.
+    if (!gProbeMarked) {
+        @synchronized(GXKProbeLock()) {
+            gProbeRing = [NSMutableArray array];
+            gProbeStartedAt = GXKProbeNow();
+            gProbeLastFingerprint = nil;
+            gProbeLastFingerprintAt = 0;
+            gProbeMarked = YES;
+        }
+        GXKProbeLog(@"mark", @"start");
+        if (button) GXKFlashTitle(button, @"诊断");
+        return;
     }
+    NSString *report = GXKProbeReport();
+    @synchronized(GXKProbeLock()) {
+        gProbeMarked = NO;
+    }
+    if (report.length) [UIPasteboard generalPasteboard].string = report;
+    if (button) GXKFlashTitle(button, @"已复制");
 }
 @end
 

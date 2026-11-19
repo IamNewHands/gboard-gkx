@@ -1260,8 +1260,7 @@ static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
         GXKRefreshComposingState(vc);
         GXKUpdateActionKey(vc);
         GXKUpdateToolbar(vc);
-        GXKProbeInstallHooks(); // [DEBUG-symbol] 幂等；只读接线。
-        GXKProbeNoteLayout(@"layout");
+        GXKProbeNoteLayout(@"layout"); // [DEBUG-symbol] 只在长按开启探针后记录。
     });
 }
 
@@ -1287,7 +1286,6 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     // 这里只给一小段补帧窗口，窗口走完自动停表。
     GXKBumpPolling(GXK_POLL_BURST);
     GXKUpdateToolbar((UIViewController *)self); // 首帧先尝试挂载，失败即保持原生。
-    GXKProbeInstallHooks(); // [DEBUG-symbol]
     GXKProbeNoteLayout(@"appear"); // [DEBUG-symbol]
 }
 
