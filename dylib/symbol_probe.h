@@ -143,12 +143,8 @@ static void GXKProbeNoteLayout(NSString *reason) {
             [stack addObjectsFromArray:view.subviews];
         }
     }
-    NSString *fingerprint = body ? [keys componentsJoinedByString:@","] : @"no-nine-key-body";
-    if ([fingerprint isEqualToString:gProbeLastFingerprint ?: @""]) return;
-    gProbeLastFingerprint = fingerprint;
-    GXKProbeLog(@"layout", @"%@ body=%@ keys=%@", reason, GXKProbeClassName(body),
-                GXKProbeClip(fingerprint, 300));
-    // A page flip is the interesting event: record who drove it, once per flip.
+    // Page flips are checked BEFORE the fingerprint gate: in v7 that gate returned
+    // early on every exit, so only the very first "-> symbols" was ever recorded.
     UIView *symbolHost = GXKProbeSymbolHost(vc.view);
     BOOL onSymbols = symbolHost != nil;
     if (onSymbols != gProbeWasOnSymbols) {
@@ -156,6 +152,14 @@ static void GXKProbeNoteLayout(NSString *reason) {
         GXKProbeLog(@"page", @"%@ -> %@ stack=%@", onSymbols ? @"symbols" : @"keys",
                     reason, GXKProbeStack());
     }
+    NSString *fingerprint = body ? [keys componentsJoinedByString:@","] : @"no-nine-key-body";
+    if ([fingerprint isEqualToString:gProbeLastFingerprint ?: @""]) {
+        if (onSymbols) GXKProbeAttachSymbolTap(vc.view);
+        return;
+    }
+    gProbeLastFingerprint = fingerprint;
+    GXKProbeLog(@"layout", @"%@ body=%@ keys=%@", reason, GXKProbeClassName(body),
+                GXKProbeClip(fingerprint, 300));
     if (onSymbols) {
         GXKProbeDumpSymbols(reason, vc.view);
         GXKProbeAttachSymbolTap(vc.view);
@@ -324,6 +328,16 @@ static NSString *GXKProbeDescribe(id value) {
         NSString *text = (NSString *)value;
         return text.length <= 60 ? text : [text substringToIndex:60];
     }
+    if ([value isKindOfClass:[NSArray class]]) {
+        NSArray *array = (NSArray *)value;
+        NSMutableArray<NSString *> *parts = [NSMutableArray array];
+        for (id item in array) {
+            if (parts.count >= 6) break;
+            [parts addObject:[item isKindOfClass:[NSString class]] ? item : GXKProbeClassName(item)];
+        }
+        return [NSString stringWithFormat:@"%@[%lu]{%@}", GXKProbeClassName(value),
+                (unsigned long)array.count, [parts componentsJoinedByString:@","]];
+    }
     return GXKProbeClassName(value);
 }
 
@@ -418,6 +432,15 @@ static id gxk_probe_id_obj_obj(id self, SEL _cmd, id a, id b) {
     return ((id (*)(id, SEL, id, id))orig)(self, _cmd, a, b);
 }
 
+static void gxk_probe_void_text(id self, SEL _cmd, NSString *text) {
+    IMP orig = GXKProbeOrigFor(object_getClass(self), _cmd);
+    if (gProbeMarked) {
+        GXKProbeLog(@"text", @"%@ insert='%@' stack=%@", GXKProbeClassName(self),
+                    GXKProbeClip(text ?: @"", 40), GXKProbeStack());
+    }
+    if (orig) ((void (*)(id, SEL, NSString *))orig)(self, _cmd, text);
+}
+
 static void GXKProbeSwizzle(SEL sel, IMP hook) {
     int count = objc_getClassList(NULL, 0);
     if (count <= 0) return;
@@ -449,13 +472,14 @@ static void GXKProbeInstallHooks(void) {
     GXKProbeSwizzle(@selector(parseLayoutName), (IMP)gxk_probe_id_void);
     GXKProbeSwizzle(@selector(updateLayoutAnimated:), (IMP)gxk_probe_void_bool);
     GXKProbeSwizzle(@selector(updateLayoutAnimated:completion:), (IMP)gxk_probe_void_bool_obj);
+    GXKProbeSwizzle(@selector(insertText:), (IMP)gxk_probe_void_text);
     GXKProbeLog(@"hook", @"installed");
 }
 
 static NSString *GXKProbeReport(void) {
     NSMutableString *out = [NSMutableString string];
     @synchronized(GXKProbeLock()) {
-        [out appendFormat:@"GXK symbol probe v7\niOS=%@ lines=%lu%s\n",
+        [out appendFormat:@"GXK symbol probe v8\niOS=%@ lines=%lu%s\n",
          [UIDevice currentDevice].systemVersion,
          (unsigned long)(gProbeRing ? gProbeRing.count : 0),
          gProbeMarked ? " marked" : ""];
@@ -463,7 +487,9 @@ static NSString *GXKProbeReport(void) {
                            "layout = visible key identifiers of the 9-key body, in mount order.\n"
                            "symbols host= = the symbol page container (key_pos_9keys_symbols).\n"
                            "symbols i= = one visible cell by collection index: frame, label texts, fonts.\n"
-                           "tap = one finger tap on the symbol page: hit chain from label up.\n"];
+                           "tap = one finger tap on the symbol page: index, label, in-cell point.\n"
+                           "page = symbol page entered or left, with the driver's stack.\n"
+                           "text = insertText: commit, with the caller's stack.\n"];
         if (gProbeRing) [out appendString:[gProbeRing componentsJoinedByString:@""]];
     }
     return out;
