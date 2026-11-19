@@ -61,7 +61,8 @@ class PerfContracts(unittest.TestCase):
 
     def test_update_has_cheap_path_before_full_scan(self):
         update = function_body(self.source, "static void GXKUpdateActionKey(UIViewController *vc) {")
-        cheap = update.index("GXKComposingStateCached")
+        # 廉价路径只问标题（内部走 O(1) 组字缓存），不定位候选也不扫全树。
+        cheap = update.index("GXKActionTitle(vc)")
         full = update.index("GXKFindNineKeyEmojiKey(root)")
         self.assertLess(cheap, full, "cheap path must run before the full tree scan")
         head = update[:full]
@@ -141,6 +142,9 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("GXKViewKind(v)", scan)
         self.assertNotIn("NSStringFromClass", scan, "scan must not format class names per node")
         self.assertNotIn("containsString:@\"Composing\"", scan)
+        # 候选子树判定完立即剪枝，不把成百上千个 cell 压进栈。
+        self.assertIn("continue", scan)
+        self.assertLess(scan.index("GXKViewKindCandidates"), scan.index("[stack addObjectsFromArray:v.subviews]"))
 
     def test_composing_scan_is_throttled_with_trailing_pass(self):
         """全树扫描必须节流，且被跳过的那次要有尾随扫描兜住状态。"""
@@ -156,8 +160,10 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("dispatch_after", trailing)
         self.assertIn("gComposingScanScheduled", trailing)
         self.assertIn("GXKComposingFullScan(vc)", trailing)
-        # 状态没翻转时不得触发界面刷新。
-        self.assertIn("if (composing == gComposingActive) return;", trailing)
+        # 状态没翻转时不得触发界面刷新；联想态与组字态同趟产出，任一变化都要刷新。
+        self.assertIn("BOOL wasSuggesting = gSuggestingActive;", trailing)
+        self.assertIn("if (composing == gComposingActive && gSuggestingActive == wasSuggesting) return;", trailing)
+        self.assertLess(trailing.index("BOOL wasSuggesting"), trailing.index("GXKComposingFullScan(vc)"))
 
     def test_plain_typing_uses_short_settle_window(self):
         """普通打字只补两帧；只有组字状态翻转才拉起完整补帧窗口。"""

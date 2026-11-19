@@ -63,6 +63,32 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("softKeyDef", tap)
         self.assertIn("gActionSoftKeyDef", tap)
 
+    def test_tap_three_states_clear_newline_dismiss(self):
+        """组字「重输」、联想「收起」、其余「换行」；收起走公开 dismissKeyboard。"""
+        tap = function_body(self.source, "- (void)onActionKeyTapped:(UIButton *)sender {")
+        self.assertIn("GXKRefreshComposingState(vc)", tap)
+        self.assertIn("gComposingActive", tap)
+        self.assertIn("gSuggestingActive", tap)
+        self.assertIn("GXKPerformClearComposing(vc)", tap)
+        self.assertIn("[ivc dismissKeyboard]", tap)
+        self.assertIn('[proxy insertText:@"\\n"]', tap)
+        # 顺序必须是 重输 > 收起 > 换行，联想分支不能吃掉组字分支。
+        self.assertLess(tap.index("GXKPerformClearComposing(vc)"), tap.index("dismissKeyboard"))
+        self.assertLess(tap.index("dismissKeyboard"), tap.index('[proxy insertText:@"\\n"]'))
+
+    def test_candidate_state_is_scanned_once_and_invalidated(self):
+        """候选态与组字态同一趟扫描产出，组字成立即作废，生命周期退出清空。"""
+        scan = function_body(self.source, "static BOOL GXKComposingFullScan(UIViewController *vc) {")
+        self.assertIn("GXKViewKindCandidates", scan)
+        self.assertIn("GXKCandidateViewHasContent(v)", scan)
+        self.assertIn("gSuggestingActive = YES", scan)
+        self.assertIn("gSuggestingActive = NO", scan)
+        self.assertNotIn("NSStringFromClass", scan)
+        cached = function_body(self.source, "static BOOL GXKComposingStateCached(UIViewController *vc) {")
+        self.assertIn("gSuggestingActive = NO", cached)
+        gone = function_body(self.source, "static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated)")
+        self.assertIn("gSuggestingActive = NO", gone)
+
     def test_native_keycap_is_not_hidden_or_repainted(self):
         action = self.source[self.source.index("#pragma mark - 动作键目标与更新"):]
         for retired in ("GXKRestoreKeySubviews", "sub.hidden = YES", "sub.hidden = NO", "cornerRadius", "colorWithWhite:0.35", "colorWithRed:0.82", "userInterfaceStyle"):
@@ -240,9 +266,16 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("GXKNativeActionFont(currentKey, root)", full)
         self.assertIn("btn.titleLabel.font = font", full)
         for body, variable in ((fast, "cheapTitle"), (full, "title")):
-            self.assertIn('GXKComposingStateCached(vc) ? @"重输" : @"换行"', body)
+            self.assertIn(f"NSString *{variable} = GXKActionTitle(vc);", body)
             self.assertIn(f"setTitle:{variable} forState:UIControlStateNormal", body)
             self.assertIn(f"setTitle:{variable} forState:UIControlStateHighlighted", body)
+        # 标题三态必须集中在一个函数里，两个更新路径不得各自复制判定逻辑。
+        title = function_body(self.source, "static NSString *GXKActionTitle(UIViewController *vc) {")
+        self.assertIn('return @"重输";', title)
+        self.assertIn('return @"收起";', title)
+        self.assertIn('return @"换行";', title)
+        # 组字优先于联想：正在打的拼音不能被「收起」抢走。
+        self.assertLess(title.index('return @"重输";'), title.index('gSuggestingActive'))
         sync = function_body(self.source, "static void GXKSyncToolbarStyle(")
         self.assertIn("GXKToolbarTextStyle(body, &font)", sync)
         self.assertIn("button.titleLabel.font = font", sync)

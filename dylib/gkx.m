@@ -57,6 +57,8 @@ static NSInteger gPollTicks;
 
 // 组字状态缓存：全树扫描只在布局/文本事件里跑，0.2s轮询只读缓存。
 static BOOL gComposingActive;
+// 联想候选缓存：与组字状态同一趟扫描写入，轮询只读；有可见候选文字才为 YES。
+static BOOL gSuggestingActive;
 // 词库部署一次性：本进程内成功比对/拷贝后不再重复访问磁盘。
 static BOOL gDictDeploySettled;
 // 触觉复用：避免每次点击分配generator并丢失prepare预热。
@@ -156,7 +158,7 @@ static BOOL GXKComposingFromProxy(UIViewController *vc) {
 
 // 类名判定缓存：九键键盘树里同类视图成百上千，每个节点都做一次 NSStringFromClass +
 // 两次 containsString，是整趟扫描里最贵的固定开销。按类指针只算一次。
-enum { GXKViewKindPlain = 0, GXKViewKindComposing = 1, GXKViewKindSoftKey = 2 };
+enum { GXKViewKindPlain = 0, GXKViewKindComposing = 1, GXKViewKindSoftKey = 2, GXKViewKindCandidates = 3 };
 static NSMutableDictionary *gViewKindCache;
 
 static NSInteger GXKViewKind(UIView *view) {
@@ -171,14 +173,49 @@ static NSInteger GXKViewKind(UIView *view) {
         kind = GXKViewKindSoftKey;
     } else if ([name containsString:@"Composing"] || [name containsString:@"Preedit"]) {
         kind = GXKViewKindComposing;
+    } else if ([name containsString:@"Candidate"]) {
+        // GKBCandidatesCollectionView / GKBFixedNumberCandidatesView 都是候选承载视图。
+        kind = GXKViewKindCandidates;
     }
     gViewKindCache[key] = @(kind);
     return kind;
 }
 
+// 候选文字判定：只看真正显示出来的文字，空候选条带不算联想。
+static BOOL GXKCandidateTextVisible(UIView *view, NSUInteger depth) {
+    if (!view || view.isHidden || view.alpha < 0.05 || depth > 8) return NO;
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)view;
+        return label.text.length > 0 || label.attributedText.length > 0;
+    }
+    for (UIView *sub in view.subviews) {
+        if (GXKCandidateTextVisible(sub, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+static BOOL GXKCandidateViewHasContent(UIView *view) {
+    if (!view || view.isHidden || view.alpha < 0.05 || view.window == nil) return NO;
+    if ([view isKindOfClass:[UICollectionView class]]) {
+        UICollectionView *collection = (UICollectionView *)view;
+        for (UICollectionViewCell *cell in collection.visibleCells) {
+            if (GXKCandidateTextVisible(cell, 0)) return YES;
+        }
+        return NO;
+    }
+    return GXKCandidateTextVisible(view, 0);
+}
+
+// 组字成立时标题一定是「重输」，候选状态不再参与判定，直接作废避免读到上一轮的联想。
+static BOOL GXKComposingScanResult(BOOL composing) {
+    if (composing) gSuggestingActive = NO;
+    return composing;
+}
+
 static BOOL GXKComposingFullScan(UIViewController *vc) {
     if (!vc || !vc.view) return NO;
     UIView *root = vc.view;
+    gSuggestingActive = NO; // 每趟扫描重新判定，宁可退回「换行」也不留陈旧联想态。
 
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     int guard = 0;
@@ -194,18 +231,25 @@ static BOOL GXKComposingFullScan(UIViewController *vc) {
         if (kind == GXKViewKindComposing) {
             if ([v respondsToSelector:@selector(text)]) {
                 NSString *t = [v valueForKey:@"text"];
-                if (t.length > 0) return YES;
+                if (t.length > 0) return GXKComposingScanResult(YES);
             }
             if ([v respondsToSelector:@selector(attributedText)]) {
                 NSAttributedString *at = [v valueForKey:@"attributedText"];
-                if (at.string.length > 0) return YES;
+                if (at.string.length > 0) return GXKComposingScanResult(YES);
             }
             for (UIView *sub in v.subviews) {
                 if ([sub respondsToSelector:@selector(text)]) {
                     NSString *t = [sub valueForKey:@"text"];
-                    if (t.length > 0) return YES;
+                    if (t.length > 0) return GXKComposingScanResult(YES);
                 }
             }
+        }
+
+        // 判定 3: 联想候选条里有文字 = 用户此刻正在挑词，可以一键收起。
+        // 候选视图内部是成百上千个 cell，判定完就不再往下走，省掉整棵子树。
+        if (kind == GXKViewKindCandidates) {
+            if (GXKCandidateViewHasContent(v)) gSuggestingActive = YES;
+            continue;
         }
 
         // 判定 2: 九键右下角回车键在拼音输入中会变为「确认」
@@ -216,7 +260,7 @@ static BOOL GXKComposingFullScan(UIViewController *vc) {
                     if ([sub isKindOfClass:[UILabel class]]) {
                         NSString *txt = ((UILabel *)sub).text;
                         if ([txt isEqualToString:@"确认"] || [txt containsString:@"确"]) {
-                            return YES;
+                            return GXKComposingScanResult(YES);
                         }
                     }
                 }
@@ -225,7 +269,7 @@ static BOOL GXKComposingFullScan(UIViewController *vc) {
 
         [stack addObjectsFromArray:v.subviews];
     }
-    return NO;
+    return GXKComposingScanResult(NO);
 }
 
 // 全树扫描节流：布局事件一秒可能来几十次，最多 0.25 秒扫一次；
@@ -240,8 +284,12 @@ static void GXKScheduleComposingScan(void);
 
 // 事件驱动的状态刷新：代理有mark就是YES（O(1)）；否则跑一次全树（受节流约束）。
 static void GXKRefreshComposingState(UIViewController *vc) {
-    if (!vc) { gComposingActive = NO; return; }
-    if (GXKComposingFromProxy(vc)) { gComposingActive = YES; return; }
+    if (!vc) { gComposingActive = NO; gSuggestingActive = NO; return; }
+    if (GXKComposingFromProxy(vc)) {
+        gComposingActive = YES;
+        gSuggestingActive = NO; // 组字中标题固定「重输」，联想态作废。
+        return;
+    }
     CFTimeInterval now = CFAbsoluteTimeGetCurrent();
     if (gComposingScanAt > 0.0 && now - gComposingScanAt < GXK_COMPOSING_SCAN_MIN_INTERVAL) {
         GXKScheduleComposingScan();
@@ -261,10 +309,17 @@ static void GXKScheduleComposingScan(void) {
         gComposingScanScheduled = NO;
         UIViewController *vc = gCurrentVC;
         if (!vc || !vc.isViewLoaded) return;
-        if (GXKComposingFromProxy(vc)) { gComposingActive = YES; return; }
+        if (GXKComposingFromProxy(vc)) {
+            gComposingActive = YES;
+            gSuggestingActive = NO;
+            GXKUpdateActionKey(vc);
+            return;
+        }
         gComposingScanAt = CFAbsoluteTimeGetCurrent();
+        BOOL wasSuggesting = gSuggestingActive;
         BOOL composing = GXKComposingFullScan(vc);
-        if (composing == gComposingActive) return;
+        // 组字或联想任一翻转都要重画标题，否则「收起」会留在已经清空的候选条上。
+        if (composing == gComposingActive && gSuggestingActive == wasSuggesting) return;
         gComposingActive = composing;
         GXKUpdateActionKey(vc);
         GXKUpdateToolbar(vc);
@@ -274,8 +329,20 @@ static void GXKScheduleComposingScan(void) {
 // 轮询与刷新用：优先读缓存，代理层已明确有mark时立即纠正缓存。
 static BOOL GXKComposingStateCached(UIViewController *vc) {
     if (!vc) return NO;
-    if (GXKComposingFromProxy(vc)) { gComposingActive = YES; return YES; }
+    if (GXKComposingFromProxy(vc)) {
+        gComposingActive = YES;
+        gSuggestingActive = NO;
+        return YES;
+    }
     return gComposingActive;
+}
+
+// 覆盖按钮标题三态：组字中「重输」> 有可见联想候选「收起」> 其余「换行」。
+// 组字优先级最高：拼音没上屏时收起键盘会丢掉正在打的字。
+static NSString *GXKActionTitle(UIViewController *vc) {
+    if (GXKComposingStateCached(vc)) return @"重输";
+    if (gSuggestingActive) return @"收起";
+    return @"换行";
 }
 
 #pragma mark - 清空拼音 (重输)
@@ -977,9 +1044,14 @@ static void GXKUpdateActionKey(UIViewController *vc);
     // 点击是低频事件：这里取一次真实状态，避免用轮询缓存的陈旧值决定重输/换行。
     GXKRefreshComposingState(vc);
     BOOL composing = gComposingActive;
+    // 联想态复用同一个按键：候选已经给出整句时，最省事的一步是收起键盘看结果。
+    BOOL suggesting = !composing && gSuggestingActive;
     if (composing) {
         GXKPerformClearComposing(vc); // 保留原有「重输」能力。
         GXKImpact(UIImpactFeedbackStyleMedium);
+    } else if (suggesting) {
+        [ivc dismissKeyboard];
+        GXKImpact(UIImpactFeedbackStyleLight);
     } else {
         if (proxy) [proxy insertText:@"\n"];
         GXKImpact(UIImpactFeedbackStyleLight);
@@ -1033,7 +1105,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         }
         UIFont *cheapFont = GXKNativeActionFont(gEmojiSoftKeyView, root);
         if (![cheapBtn.titleLabel.font isEqual:cheapFont]) cheapBtn.titleLabel.font = cheapFont;
-        NSString *cheapTitle = GXKComposingStateCached(vc) ? @"重输" : @"换行";
+        NSString *cheapTitle = GXKActionTitle(vc);
         if (![[cheapBtn titleForState:UIControlStateNormal] isEqualToString:cheapTitle]) {
             [cheapBtn setTitle:cheapTitle forState:UIControlStateNormal];
             [cheapBtn setTitle:cheapTitle forState:UIControlStateHighlighted];
@@ -1127,7 +1199,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         [btn setTitleColor:color forState:UIControlStateNormal];
         [btn setTitleColor:color forState:UIControlStateHighlighted];
     }
-    NSString *title = GXKComposingStateCached(vc) ? @"重输" : @"换行";
+    NSString *title = GXKActionTitle(vc);
     if (![[btn titleForState:UIControlStateNormal] isEqualToString:title]) {
         [btn setTitle:title forState:UIControlStateNormal];
         [btn setTitle:title forState:UIControlStateHighlighted];
@@ -1223,6 +1295,7 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
         gToolbarObstacleComplete = NO;
         gCurrentVC = nil;
         gComposingActive = NO; // 扩展隐藏后组字缓存作废，下次出现重新采样。
+        gSuggestingActive = NO; // 联想缓存同样作废，避免下次出现误显示「收起」。
         GXKStopPolling();
         GXKDetachActionKey();
         GXKDetachToolbar(); // 扩展隐藏后工具条随宿主一起撤走，下次出现重新定位。
