@@ -440,6 +440,21 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("adjustsFontSizeToFitWidth = NO", self.source)
         self.assertNotIn("minimumScaleFactor = 0.75", self.source)
 
+    def test_no_uikit_layout_rect_override_anywhere_in_the_dylib(self):
+        """覆写 UIKit 的布局矩形会让键盘扩展在布局循环里闪退：整个 dylib 都不许有。"""
+        banned = re.compile(
+            r"-\s*\(\s*(?:CGRect|CGSize)\s*\)\s*"
+            r"(?:contentRectForBounds|titleRectForContentRect|titleRectForBounds|"
+            r"backgroundRectForBounds|imageRectForContentRect|intrinsicContentSize)\b")
+        for path in sorted((ROOT / "dylib").glob("*")):
+            if path.suffix not in (".m", ".h"):
+                continue
+            text = path.read_text(encoding="utf-8")
+            found = banned.findall(text)
+            self.assertEqual([], found, f"{path.name} overrides a UIKit layout rect: {found}")
+        # 标题偏移只能用公开的内边距属性，不能用布局矩形回调。
+        self.assertIn("button.titleEdgeInsets = UIEdgeInsetsMake(-6.0, 0.0, -6.0, 0.0);", self.source)
+
     def test_image_measurement_requires_identified_original_foreground_layer(self):
         image = function_body(self.layout, "static BOOL GXKToolbarVisibleImageRect(")
         for required in ('NSClassFromString(@"GKBImageLayer")', "isKindOfClass:imageLayerClass",

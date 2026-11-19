@@ -69,3 +69,15 @@
 - 校验：preflight+注入+final exit0/PASS；2050条ZIP无重名/路径穿越/CRC错误，仅新增确切dylib与词库、移除3签名文件；两个exe各一个加载命令且原段/RPATH不移动；共享框架8个group槽为group.zunbengege.top。除允许的三个二进制改写（176/28/27bytes）外，2045个原生文件字节和权限不变。保留原包与词库、dist/pack-cb5c13e-diagnostic-v2和预存CON/probe目录。
 - 真机步骤：LCSign自签新IPA→九键长按自有「换行」0.8秒见「诊断」→等2秒后输入拼音并清空→再次长按「换行／重输」0.8秒见「已复制」→粘贴报告给Agent。报告首行应为GXK toolbar diagnostic v2；60秒超时只停止采样并保留内存，仍须显式长按才写剪贴板。
 - 交付仅闭合诊断可达性/可靠性、编译与包验证；未覆盖iPhone17Pro的UIKit手势/字体/G/触摸/三态/9↔26真实行为，不接受为显示根因修复。P3visited计数可多1但truncated有效。诊断临时保留且默认关闭，不采集输入/上传/写磁盘、不放宽显示门禁；根因修复且真机验收后移除诊断接线/helper/测试。
+
+## 顶条行修复交付（2026-11-19；真机确认工具栏正常）
+
+- 任务起点：main / d290bfe（47c08a3 包真机闪退）。用户要求：工具栏必须真正显示；修不了就回退到 3c7bb2d 的布局但保留既有优化；诊断接线必须去掉。
+- 根因（三条独立叠加，全部来自真机日志而非推测）：① 顶条 22pt 行的 G 被 26pt 高、`masksToBounds=1` 祖先裁成 22x2pt，`GXKToolbarIconSized` 的 8pt 下限把它判成"没有可测量的 G"（28 个采样全是 no-measurable-logo）；② `GXKToolbarContentRect(logo)` 返回 402pt 全宽行容器，其右沿把 band 左界抬到右界，band 宽 0（band-width）；③ 九键候选行的 G 在布局动画期宽度归零时，单候选选择直接放弃整条 toolbar。
+- 修复（d0398c0）：`GXKToolbarImageRect` 增加未裁剪绘制矩形兜底（仍过 8..64pt）；Band 的 logoCarrier 在宽度 ≥ 行宽 −8pt 时视为整行、不抬左界；barHeight 允许压到行高（下限 18pt）；Scan 改为候选循环，失败换下一个。
+- 闪退回归（47c08a3）：为绕开 UIButton 默认上下各 6pt 内边距，覆写了 `contentRectForBounds:` 与 `titleRectForContentRect:`，键盘扩展布局循环里反复自算 → 真机切过去直接闪退。定位方式：d0398c0 与 47c08a3 逐 hunk diff，唯一功能性新增就是这两个覆写。
+- 最终修复（54734ad）：删除两个覆写，改用公开 API `button.titleEdgeInsets = UIEdgeInsetsMake(-6.0, 0.0, -6.0, 0.0);`；`GXKSyncToolbarGeometry` 的放不下判定改为纯算术（currentTitle sizeWithAttributes + slot），刷新路径不再调用任何 UIKit 布局矩形。诊断接线（gkx.m 20 处、toolbar_layout.h 13 处、toolbar_visibility.h 8 处、toolbar_diagnostics.h 与 test_toolbar_diagnostics.py 整文件）全部移除。
+- 验证：本地 114 项 Python 契约 OK（新增 1 项全 dylib 扫描，禁止任何 CGRect/CGSize 布局矩形覆写）；CI run 44459850140 success，artifact 14499926011，dylib SHA256 9527637c93bc1e97813a4f5c96fb3c190cf7c6c2820409ed19dc4432123e509b。
+- 产物：dist/gboard-gkx-54734ad-toolbar-space-repair-unsigned.ipa，35960162 bytes，SHA256 a86bf2b49fcb6ab17f13a3f6a3eb8ac045752920e7eb8b7c6edb8fa86f8d3e42；验包 PASS 回执 dist/gboard-gkx-54734ad-toolbar-space-repair-verification.json（2050 条 ZIP、3 个旧签名文件移除、仅 176/28/27 bytes 三处二进制差异、2045 原生文件字节与权限不变）。
+- 真机结论（用户 2026-11-19 确认"正常了"）：键盘不再闪退，工具栏在 22pt 顶条行正常显示。这是本项目工具栏从"整行消失"到"稳定显示"的闭合点。
+- 经验已固化：agent.md 新增避坑 9（严禁覆写 UIKit 布局计算回调）与避坑 10（G 图标与 band 的测量契约），README 中／英双版删除临时诊断章节、修正 28pt 条高与"行高不足即不显示"的过时描述。

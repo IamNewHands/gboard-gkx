@@ -16,7 +16,7 @@
   6. **常用语分页**：G 图标内与搜索／翻译／地图同级，叠加层展示已维护的短语，点击即上屏；钉子固定后连续输入，未固定点一条即关；维护入口两处——键盘面板右上角「编辑」（保底，不依赖主 App），以及主 App「设置 → Gboard」主菜单里的一行「常用语」（hook `mainMenuPageDescriptor` 复制原生行）。**键盘扩展进程里绝不能出现输入框**（alert 带输入框或内联 `UITextField`）：那会去要系统键盘，而系统键盘就是这个扩展自己，真机必闪退；键盘侧新增/修改一律走剪贴板；键盘侧也不要 present 任何提示框（扩展里 present 会再拉呈现上下文，同样闪退），提示只改导航标题。
    7. **打字流畅度**：轮询按需补帧（普通打字 2 拍 / 组字翻转 5 拍，空闲停表）且只挂默认 runloop 模式（绝不加 `NSRunLoopCommonModes`，否则动画/滚动期间继续抢主线程）、全树扫描按类指针缓存类名并 0.25s 节流 + 尾随补扫、`textDidChange` 与 `viewDidLayoutSubviews` 用序号合并成每帧最后一次、扫描热路径的类指针一次解析长期复用、工具条同宿主行复用 stack 与按钮且约束先撤后加、`GXKToolbarBand` 按邻居签名复用结果（挂载/撤走时 `gToolbarBandEpoch++` 失效）、触觉引擎闲置 2 秒释放、词库只随包带一份（主 App 的 `Frameworks/`）。详见 README 第 7 节与 `tests/test_perf.py`。
 - **已移除**：地图分页的定位跳转（键盘接管、`prefs:` 级联、主 App 中转 alert）在真机上达不到目的，已整体删除，详见避坑 7。
-- **极简原则**：工具栏仅叠加透明五格到根视图，以真实 G 图片图层可见区域定位，不增加键盘高度、不移动原生容器、不修改原生 alpha／hidden。候选、按键与独立 26 键体优先；无可靠几何证据或空位不足则不显示。字体唯一来源为九键回车键 label，禁止任意 UILabel／候选字号兜底。布局与诊断共享测量 owner；临时诊断等修复包真机验证后再移除。
+- **极简原则**：工具栏仅叠加透明五格到根视图，以真实 G 图片图层可见区域定位，不增加键盘高度、不移动原生容器、不修改原生 alpha／hidden。候选、按键与独立 26 键体优先；无可靠几何证据或空位不足则不显示。字体唯一来源为九键回车键 label，禁止任意 UILabel／候选字号兜底。顶条 22pt 行是合法宿主：条高可压到行高（下限 18pt），标题偏移只用公开的 `titleEdgeInsets`，禁止覆写 UIKit 布局矩形回调（见避坑 9／10）。诊断接线已随 54734ad 全部移除。
 - **技术载体**：Objective-C 动态库注入（`libgkx.dylib`），在扩展初始化时进行最小必要生命周期 Hook。
 - **目标环境**：iOS 12.0 ~ iOS 18+，arm64 设备，支持 LCSign、SideStore、SideInstaller 等免越狱自签工具。
 
@@ -104,6 +104,28 @@ gboard-gkx/
 ### 🚫 避坑 8：卡顿不是内存问题，别去删二进制或资源包
 * **历史教训（2026-11-17）**：用户反馈打字卡顿、动画掉帧。实测内存大头是 dyld 按需 mmap 的代码段（appex 24.2 MB、`gboard_framework` 15.5 MB、主 App 4.1 MB），删不掉也不该删；`Assets.car` 与各 `.bundle` 删了直接缺图缺字符串。真正的成本在每键触发的刷新循环：3 秒 × 5Hz 定时器 + 每拍 1500／800 节点全树扫描，连续打字时主线程每秒被吃掉 15~40 ms。
 * **开发准则**：性能问题先量「每帧做了多少工作」，再谈内存。全树扫描必须 (a) 有常数级快路径，(b) 有最小间隔节流，(c) 被跳过的那次要能尾随补上。任何在 `layoutSubviews`／`textDidChange:` 路径上重建视图树的代码都要先问「能不能复用」。
+
+### 🚫 避坑 9：严禁覆写 UIKit 的布局计算回调（键盘扩展闪退第一杀手）
+
+* **历史教训（2026-11-19，47c08a3 包）**：工具栏要落在 22pt 顶条行上。UIButton 默认 `contentEdgeInsets` 上下各 6pt，把 22pt 行压成 10pt 内容区；16pt 标题行高 19.09pt 放不下，`titleRectForContentRect:` 返回 `CGRectZero`，整条被判「标题放不下」永不显示。为绕开它覆写了 `- (CGRect)contentRectForBounds:`（直接 return bounds）与 `- (CGRect)titleRectForContentRect:`（自己算矩形），结果真机**切到键盘直接闪退**。
+* **根因**：键盘扩展的布局由系统布局循环反复求值，覆写里又回头读自身尺寸与标题，形成布局反馈循环，进程被系统杀掉；用户不接 Console.app，没有可用崩溃栈。
+* **开发准则**：
+  1. **禁止**覆写 `contentRectForBounds:`／`titleRectForContentRect:`／`titleRectForBounds:`／`backgroundRectForBounds:`／`intrinsicContentSize`／`sizeThatFits:` 这类由 UIKit 自己求值的布局回调。要偏移标题就用公开属性：`button.titleEdgeInsets = UIEdgeInsetsMake(-6.0, 0.0, -6.0, 0.0);`（负边距把 22pt 行的可用高度撑回整行）。
+  2. 判定「放不放得下」只用纯算术：`[button.currentTitle sizeWithAttributes:@{NSFontAttributeName:font}]` 与 slot 尺寸比较；刷新路径里**不要**调用任何 UIKit 布局矩形方法。
+  3. 闪退定位顺序：先做**两包逐 hunk diff**，找「唯一功能性新增」。d0398c0（能开、工具栏不显示）与 47c08a3（闪退）之间只多这两个覆写，删掉即恢复——有 diff 时不要靠推理猜。
+  4. 任何让工具栏「整条静默不显示」的失败分支（标题放不下、band 不足 200pt、band 出根）都必须在真机可见处留信号；日志不是验收通道。
+
+### 🚫 避坑 10：G 图标与 band 的测量契约（可见矩形 ≠ 绘制矩形）
+
+* **历史教训（2026-11-18~19，d0398c0 前连续三包都不显示）**：真机日志显示 28 个采样全是 `scanGate=no-measurable-logo`，从未出现 `scan-success`。三个独立错误叠加：
+  1. **可见矩形被祖先裁掉**：顶条行 logo 的 G 绘制矩形是 22x22，但被 402x26、`masksToBounds=1` 的祖先裁成 22x**2**，可见高度 2pt < 8pt 下限，于是「没有可测量的 G」。正解是保留未裁剪的**绘制矩形**作为兜底（`gToolbarImageDrawnRoot` 转 root 坐标后仍要过 8..64pt 校验），不能因为可见尺寸不合格就判定没有 G。
+  2. **全宽容器不能当内容边界**：`GXKToolbarContentRect(logo)` 返回的是 402pt 宽的整行容器，拿它的右沿抬高 band 左界，left 直接顶到 right，band 宽 0 → `band-width`。正解：载体宽度 ≥ 行宽 − 8pt 时视为「就是这一行」，不参与抬高左界。
+  3. **单候选失败即整条放弃**：九键候选行里的 G 会随布局短暂宽度归零，此时唯一可测候选消失，整条 toolbar 被 detach。正解是候选循环——失败就换下一个候选，而不是 return NO。
+* **开发准则**：
+  1. 测量分两层：**可见矩形**（祖先裁切+动画+透明度后的真实可见区）用于判「能不能点」，**绘制矩形**用于判「是不是那个图标」。两者不能互相替代。
+  2. 22pt 顶条行是合法宿主：band 高度必须允许压到行高（`barHeight = MIN(max(glyph.height,28), row.bounds.size.height)`，下限 18pt），不能因为 28pt > 22pt 就整条拒绝。
+  3. 任何「找到唯一候选」的路径都要能降级成「遍历候选、逐个尝试」；键盘布局在动画期会短暂改变尺寸，单点采样不足以判定不存在。
+  4. 回归测试要覆盖真机实测数值：22pt 行 + 22x20 glyph + 56 载体 → band (56,0,346,22)，见 `tests/test_toolbar_geometry.py`。
 
 ---
 

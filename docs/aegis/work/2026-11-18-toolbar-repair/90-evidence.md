@@ -63,3 +63,15 @@
 - 本地源码契约与审查不能替代 CI 或真机验收。新 IPA 尚未产生。
 - 最终协调者再次执行118项回归：Ran 118 tests in 0.033s，OK，exit 0；提交前复跑 Ran 118 tests in 0.035s，OK，exit 0，暂存 diff --check exit 0。
 - 现有仓库使用轻量 work Markdown，没有完整 helper workspace。helper check exit 1：缺 docs/aegis/adr、baseline、specs、plans 与 README.md、INDEX.md、BASELINE-GOVERNANCE.md；helper bundle 不适用缺 JSON sidecar 的记录。未为通过结构检查而扩大本次修复范围或初始化整套治理。此检查不影响源码测试，也不证明编译/验收。
+
+## 2026-11-19 顶条行修复真机闭合（54734ad）
+
+- 真机证据链：用户提供两份日志。第一份（28 samples，d0398c0 包）全部 scanGate=no-measurable-logo，证明 G 测量是唯一阻断；第二份（23 samples，d0398c0 包）band 已算出 {{43,0},{359,22}}、freshGlyph measured=1，唯一阻断变成 spaceGate=title-does-not-fit，且 22pt 行上 UIButton 的 contentRect 只有 10pt 高（contentInsets 上下各 6pt），16pt 标题 19.09pt 放不下 → titleRect=CGRectZero。两份日志把根因从"测量不到 G"推进到"按钮内边距"，不靠推理。
+- 闪退归因证据：`git diff d0398c0 47c08a3 -- dylib/gkx.m` 逐 hunk 核对，功能性新增只有 `- (CGRect)contentRectForBounds:` 与 `- (CGRect)titleRectForContentRect:` 两个覆写；两包 dylib 的 load commands、rpath、依赖库、未定义符号集（47c08a3 少 9 个诊断专用符号、无新增）全部正常，排除注入/链接问题。
+- 最终改动仅 3 文件：dylib/gkx.m（删两个覆写 + titleEdgeInsets + 纯算术几何判定）、tests/test_perf.py（同步断言 + 新增全 dylib 覆写扫描）、dist/verify-toolbar-space-repair.py（二进制标记改 setTitleEdgeInsets:）。
+- 测试：`python -m unittest discover -s tests` → Ran 114 tests in 0.034s，OK，exit 0。新增契约 `test_no_uikit_layout_rect_override_anywhere_in_the_dylib` 用正则扫描 dylib 下全部 .m/.h，禁止 contentRectForBounds／titleRectForContentRect／titleRectForBounds／backgroundRectForBounds／imageRectForContentRect／intrinsicContentSize 的 CGRect/CGSize 覆写。
+- CI 与产物：run 44459850140 success（head_sha 54734adc39d5391bfd48d88214c9ae7bc605d7fa，workflow .github/workflows/build-dylib.yml，macos-15-intel arm64/iOS12+，编译无 warning/error）；artifact 14499926011 libgkx，archive SHA256 bc681d68b0890ced4a44759ddac156f293f13bd39d6209516661fbda70b5c68b，未过期，身份经 API 精确绑定。dylib 193856 bytes，SHA256 9527637c93bc1e97813a4f5c96fb3c190cf7c6c2820409ed19dc4432123e509b；strings 检查 diagnostic／logoSurvey／onActionKeyDiagnostic:／contentRectForBounds:／titleRectForContentRect: 全部 0 命中，setTitleEdgeInsets: 2 命中。
+- 新 IPA：dist/gboard-gkx-54734ad-toolbar-space-repair-unsigned.ipa，35960162 bytes，SHA256 a86bf2b49fcb6ab17f13a3f6a3eb8ac045752920e7eb8b7c6edb8fa86f8d3e42；preflight exit0 + 注入 exit0 + final exit0/PASS，回执 dist/gboard-gkx-54734ad-toolbar-space-repair-verification.json。2050 条 ZIP、移除 3 个旧签名文件、8 个 group 槽为 group.zunbengege.top、仅 176/28/27 bytes 三处允许差异、其余 2045 原生文件逐字节与权限不变、arm64 段/section/linkedit 边界与 RPATH 通过。
+- 真机验收：用户 2026-11-19 反馈"正常了"——键盘不再闪退，工具栏在 22pt 顶条行显示。此前连续三包（3574c24／ccdb888／d0398c0）都是"键盘能用但工具栏不显示"，47c08a3 是"闪退"，54734ad 是首个真机确认可用的包。
+- 经验固化：agent.md 新增避坑 9／10（覆写 UIKit 布局回调导致扩展闪退；可见矩形与绘制矩形、全宽容器、单候选放弃三个测量陷阱），并在第 1 节极简原则补上 22pt 行合法宿主与禁止覆写的红线；README.md 与 README.en.md 删除已失效的临时诊断章节，修正"条高至少 28pt"与"行高不足即不显示"为"默认 28pt、行高不足压到行高（下限 18pt）"。
+- 未覆盖：本轮不验证字体随主题切换的视觉细节、9↔26 切换后的重复显示、横屏/其他机型；这些不属于本次根因范围，且用户已确认主路径正常。
