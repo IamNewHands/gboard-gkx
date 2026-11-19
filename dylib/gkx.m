@@ -1245,8 +1245,9 @@ static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
     });
 }
 
-// symbol_doubletap.h 在下方引入（它依赖 GXKSwizzleOrSkip），这里先声明布局回调要用到的失效函数。
+// symbol_doubletap.h 在下方引入（它依赖 GXKSwizzleOrSkip），这里先声明上面两处回调要用到的函数。
 static void GXKSymbolInvalidatePageCache(void);
+static void GXKSymbolInstallHooks(void);
 
 static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
     if (gOrigViewDidLayoutSubviews) gOrigViewDidLayoutSubviews(self, _cmd);
