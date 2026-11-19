@@ -213,12 +213,10 @@ static void GXKProbeSwizzle(SEL sel, IMP hook) {
     free(classes);
 }
 
-static void GXKProbeSwizzle(SEL sel, IMP hook);
-
 static void GXKProbeInstallHooks(void) {
     if (gProbeHooksInstalled) return;
     gProbeHooksInstalled = YES;
-    gProbeSwizzle(@selector(keyboardViewWithLayoutName:), (IMP)gxk_probe_id_obj);
+    GXKProbeSwizzle(@selector(keyboardViewWithLayoutName:), (IMP)gxk_probe_id_obj);
     GXKProbeSwizzle(@selector(setSoftkeyLayoutName:), (IMP)gxk_probe_void_obj);
     GXKProbeSwizzle(@selector(updateLayoutAnimated:), (IMP)gxk_probe_void_bool);
     GXKProbeLog(@"hook", @"installed");
