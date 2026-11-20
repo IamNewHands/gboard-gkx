@@ -1,4 +1,4 @@
-// [FEATURE-symbol] 九键符号页：双击上屏一次并停留、单击延时回拼音、成对符号自动补全。
+// [FEATURE-symbol] 九键符号页：双击锁定常驻、单击延时回拼音、成对符号自动补全。
 //
 // 为什么不能「加个双击手势，其余交给原生」：
 //   原生单击符号键 = 上屏一次 + 立刻切回拼音页。等手势识别出第二击时，页面早已回到
@@ -14,6 +14,10 @@
 //
 // 性能：判定「是否在符号页」走两条路——fire 里从被按的键往上找祖先标识（O(深度)），
 // 其余场合用按布局失效的缓存（每次布局至多一次全树 BFS），不在打字热路径上做全树扫描。
+//
+// 锁定（gSymbolLocked）：双击一次 = 常驻符号页，此后每次单击只上屏、不再回拼音；
+// 再双击同一格解除，或切到拼音/数字/表情等任何别的页面也自动解除（见 GXKSymbolNoteLayout）。
+// 触感一律走 gkx.m 的全局 GXKImpact：锁定时 Medium、解除时 Light，不再自建 generator。
 #ifndef GXK_SYMBOL_DOUBLETAP_H
 #define GXK_SYMBOL_DOUBLETAP_H
 
@@ -30,21 +34,52 @@ static BOOL gSymbolPageCacheValid;
 static __weak UIView *gSymbolLastFireView;
 static NSTimeInterval gSymbolLastFireAt;
 static dispatch_block_t gSymbolReturnWork;
+static BOOL gSymbolLocked; // 双击锁定：YES 时符号页常驻，单击不回拼音。
 
-// 只有「开括号」才补全：闭括号后面再补一个开括号不是用户要的。
-static NSString *GXKSymbolCloserForChar(NSString *ch) {
-    static NSDictionary<NSString *, NSString *> *pairs;
+// 开符号 -> 闭符号。符号页上屏的是布局里定义的全角变体（｛［＜｢），
+// 所以全角、半角、日文半角、制表四套都要列全：漏一个，就有一个符号永远不成对。
+static NSDictionary<NSString *, NSString *> *GXKSymbolPairTable(void) {
+    static NSDictionary<NSString *, NSString *> *table;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        pairs = @{
-            @"（": @"）", @"「": @"」", @"『": @"』", @"【": @"】",
-            @"《": @"》", @"〈": @"〉", @"〔": @"〕", @"〖": @"〗",
+        table = @{
+            // 圆括号
+            @"（": @"）", @"(": @")",
+            // 方括号：全角、半角、六角
+            @"【": @"】", @"［": @"］", @"[": @"]", @"〔": @"〕",
+            // 花括号：全角、半角
+            @"｛": @"｝", @"{": @"}",
+            // 尖括号：书名、单书名、全角、半角
+            @"《": @"》", @"〈": @"〉", @"＜": @"＞", @"<": @">",
+            // 引号类：直角、双直角、日文半角、制表
+            @"「": @"」", @"『": @"』", @"｢": @"｣", @"〘": @"〙", @"〚": @"〛",
             @"“": @"”", @"‘": @"’",
-            @"(": @")", @"[": @"]", @"{": @"}", @"<": @">",
+            // 开闭同形的双引号：先查表命中，再由上下文配平否决
+            @"\"": @"\"", @"＂": @"＂",
         };
     });
-    if (![ch isKindOfClass:[NSString class]]) return nil;
-    return pairs[ch];
+    return table;
+}
+
+// 开闭同形的字符：查表永远命中，必须靠上下文决定这一击是开还是收。
+static BOOL GXKSymbolIsAmbiguous(NSString *ch) {
+    return [ch isEqualToString:@"\""] || [ch isEqualToString:@"＂"];
+}
+
+static NSString *GXKSymbolCloserForChar(NSString *ch) {
+    if (![ch isKindOfClass:[NSString class]] || !ch.length) return nil;
+    return GXKSymbolPairTable()[ch];
+}
+
+// before 是刚上屏之后的光标前文本（末字符就是这一击）：含这一击数到奇数次 = 开。
+static BOOL GXKSymbolAmbiguousOpens(NSString *ch, NSString *before) {
+    if (!ch.length || ![before isKindOfClass:[NSString class]]) return YES;
+    unichar target = [ch characterAtIndex:0];
+    NSUInteger count = 0;
+    for (NSUInteger i = 0; i < before.length; i++) {
+        if ([before characterAtIndex:i] == target) count++;
+    }
+    return (count % 2) == 1;
 }
 
 static id<UITextDocumentProxy> GXKSymbolProxy(void) {
@@ -109,9 +144,11 @@ static void GXKSymbolSwitchToPrime(void) {
     GXKSymbolInvalidatePageCache();
 }
 
-// 单击后延时回拼音；这段时间内的第二次 fire 会把它取消，于是连点一直停在符号页。
+// 单击后延时回拼音；这段时间内的第二次 fire 会把它取消。
+// 已锁定则不排程：常驻期间每一击都只上屏。
 static void GXKSymbolScheduleReturn(void) {
     GXKSymbolCancelReturn();
+    if (gSymbolLocked) return;
     dispatch_block_t work = dispatch_block_create(0, ^{
         gSymbolReturnWork = nil;
         if (GXKSymbolPageActive()) GXKSymbolSwitchToPrime(); // 已经离开就不重复切
@@ -127,8 +164,11 @@ static void GXKSymbolPairIfNeeded(void) {
     if (!proxy) return;
     NSString *before = proxy.documentContextBeforeInput;
     if (![before isKindOfClass:[NSString class]] || !before.length) return;
-    NSString *closer = GXKSymbolCloserForChar([before substringFromIndex:before.length - 1]);
+    NSString *typed = [before substringFromIndex:before.length - 1];
+    NSString *closer = GXKSymbolCloserForChar(typed);
     if (!closer.length) return;
+    // 双引号开闭同形：前面已经有一个没配对的，这一击就是收尾，不再补第二个。
+    if (GXKSymbolIsAmbiguous(typed) && !GXKSymbolAmbiguousOpens(typed, before)) return;
     [proxy insertText:closer];
     SEL moveSel = NSSelectorFromString(@"adjustTextPositionByCharacterOffset:");
     if ([proxy respondsToSelector:moveSel]) {
@@ -146,14 +186,14 @@ static void GXKSymbolFireEvent(id self, SEL _cmd, id bundle, id event) {
                    now - gSymbolLastFireAt < GXK_SYMBOL_TAP_WINDOW;
 
     if (sameKey) {
-        // 双击的第二击：不再上屏，取消回拼音 => 结果恰好是「上屏一次 + 停留」。
+        // 双击的第二击：不上屏，只翻转锁定。
+        // 锁定 -> 常驻（取消已排的回拼音）；解除 -> 留在本页，下一击恢复「上屏后回拼音」。
         GXKSymbolCancelReturn();
+        gSymbolLocked = !gSymbolLocked;
         gSymbolLastFireView = nil;
         gSymbolLastFireAt = 0;
-        UIImpactFeedbackGenerator *gen =
-            [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-        [gen prepare];
-        [gen impactOccurred];
+        // 触感复用 gkx.m 的全局 generator：锁定时 Medium（更重，表示「按住了」），解除时 Light。
+        GXKImpact(gSymbolLocked ? UIImpactFeedbackStyleMedium : UIImpactFeedbackStyleLight);
         return;
     }
 
@@ -161,6 +201,8 @@ static void GXKSymbolFireEvent(id self, SEL _cmd, id bundle, id event) {
         gSymbolLastFireView = view;
         gSymbolLastFireAt = now;
     } else {
+        // 这一击不在符号页：锁定就地解除，不等布局回调（切页后立刻打字也能复位）。
+        gSymbolLocked = NO;
         gSymbolLastFireView = nil;
         gSymbolLastFireAt = 0;
         GXKSymbolCancelReturn();
@@ -178,9 +220,20 @@ static void GXKSymbolFireEvent(id self, SEL _cmd, id bundle, id event) {
     }
 }
 
+// 布局变化后校正锁定：离开符号页（切拼音/数字/表情）就自动解除。
+// 由 gkx_viewDidLayoutSubviews 调用，本身不做任何扫描，只读布局阶段已经算好的缓存。
+static void GXKSymbolNoteLayout(void) {
+    if (!gSymbolLocked) return;
+    if (GXKSymbolPageActive()) return;
+    gSymbolLocked = NO;
+    GXKSymbolCancelReturn();
+}
+
 static BOOL GXKSymbolShouldReturnToPrime(id self, SEL _cmd, id key) {
     // 九键符号页不自动切走；其它页面（26 键符号页等）保持原生行为。
     if (GXKSymbolPageActive()) return NO;
+    // 不在这页了：锁定和残留状态一起清掉，下次进来从「单击」重新开始。
+    gSymbolLocked = NO;
     gSymbolLastFireView = nil;
     gSymbolLastFireAt = 0;
     GXKSymbolCancelReturn();

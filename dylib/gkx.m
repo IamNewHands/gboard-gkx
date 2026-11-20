@@ -1248,6 +1248,7 @@ static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
 // symbol_doubletap.h 在下方引入（它依赖 GXKSwizzleOrSkip），这里先声明上面两处回调要用到的函数。
 static void GXKSymbolInvalidatePageCache(void);
 static void GXKSymbolInstallHooks(void);
+static void GXKSymbolNoteLayout(void);
 
 static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
     if (gOrigViewDidLayoutSubviews) gOrigViewDidLayoutSubviews(self, _cmd);
@@ -1266,6 +1267,9 @@ static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
         GXKRefreshComposingState(vc);
         GXKUpdateActionKey(vc);
         GXKUpdateToolbar(vc);
+        // 锁定只在这一拍校正：本帧布局已定稿，判定才准；且每帧至多一次，
+        // 不在上面那几十次同步回调里做全树扫描。
+        GXKSymbolNoteLayout();
         GXKProbeNoteLayout(@"layout"); // [DEBUG-symbol] 只在长按开启探针后记录。
     });
 }
