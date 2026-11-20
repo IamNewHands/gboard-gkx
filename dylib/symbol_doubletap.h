@@ -35,6 +35,7 @@ static __weak UIView *gSymbolLastFireView;
 static NSTimeInterval gSymbolLastFireAt;
 static dispatch_block_t gSymbolReturnWork;
 static BOOL gSymbolLocked; // 双击锁定：YES 时符号页常驻，单击不回拼音。
+static NSUInteger gSymbolPairToken; // 补全重试的序号：新的一击作废旧的重试。
 
 // 开符号 -> 闭符号。符号页上屏的是布局里定义的全角变体（｛［＜｢），
 // 所以全角、半角、日文半角、制表四套都要列全：漏一个，就有一个符号永远不成对。
@@ -158,22 +159,60 @@ static void GXKSymbolScheduleReturn(void) {
                    dispatch_get_main_queue(), work);
 }
 
-// 成对补全：此时原生已把符号写进宿主文本，再补右括号并把光标放回中间。
-static void GXKSymbolPairIfNeeded(void) {
+// 真正补右半边：光标前文本里必须已经含有这一击，配平判断才准。
+static void GXKSymbolInsertPair(NSString *typed) {
     id<UITextDocumentProxy> proxy = GXKSymbolProxy();
-    if (!proxy) return;
-    NSString *before = proxy.documentContextBeforeInput;
-    if (![before isKindOfClass:[NSString class]] || !before.length) return;
-    NSString *typed = [before substringFromIndex:before.length - 1];
+    if (!proxy || !typed.length) return;
     NSString *closer = GXKSymbolCloserForChar(typed);
     if (!closer.length) return;
+    NSString *before = proxy.documentContextBeforeInput;
     // 双引号开闭同形：前面已经有一个没配对的，这一击就是收尾，不再补第二个。
-    if (GXKSymbolIsAmbiguous(typed) && !GXKSymbolAmbiguousOpens(typed, before)) return;
+    if (GXKSymbolIsAmbiguous(typed) && [before isKindOfClass:[NSString class]] &&
+        !GXKSymbolAmbiguousOpens(typed, before)) return;
     [proxy insertText:closer];
     SEL moveSel = NSSelectorFromString(@"adjustTextPositionByCharacterOffset:");
     if ([proxy respondsToSelector:moveSel]) {
         ((void (*)(id, SEL, NSInteger))objc_msgSend)(proxy, moveSel, (NSInteger)-1);
     }
+}
+
+// 等这一击真正落进宿主文本再补：宿主同步写入时第一次就命中，异步写入时最多重试 8 次（约 120ms）。
+// 每次 fire 带一个 token，新的一击会作废旧的重试，所以既不会补两次，也不会补到下一格。
+static void GXKSymbolPairAttempt(NSString *preText, UIView *anchor,
+                                NSUInteger token, int attempt) {
+    if (token != gSymbolPairToken) return;
+    // 用按下那一刻的键视图当锚点复查是否还在符号页：这条判定就是 fire 里判 YES 的同一条，
+    // 不依赖会被布局回调作废的 BFS 缓存——换页后键视图的祖先链会隐藏或脱离，这里立刻为 NO，
+    // 于是绝不会把右半边补到拼音页的文本里。
+    if (anchor && !GXKSymbolViewIsOnSymbolPage(anchor)) return;
+    id<UITextDocumentProxy> proxy = GXKSymbolProxy();
+    if (!proxy) return;
+    NSString *before = proxy.documentContextBeforeInput;
+    if (![before isKindOfClass:[NSString class]]) before = @"";
+    NSString *last = before.length > 0 ? [before substringFromIndex:before.length - 1] : nil;
+    // 「这一击已经落进宿主」只认一种形态：末尾恰好追加了一个字符。
+    //   · 用整串比对而不是比长度：选中一段后按键替换，长度可以不变；
+    //   · 必须是「追加」而不是「变短」：退格后留下的末字符也是成对符号，
+    //     只看末字符会把右半边补到退格之后，凭空多出一个符号。
+    // documentContextBeforeInput 有长度上限：超长时窗口整体右移一格，长度不变、只丢首字符，
+    // 所以两种形态都要认，否则长文本下补全会悄悄失效。
+    BOOL appended = (before.length == preText.length + 1 && [before hasPrefix:preText]) ||
+                    (before.length == preText.length && preText.length > 0 &&
+                     [before hasPrefix:[preText substringFromIndex:1]]);
+    if (appended) {
+        // 以宿主真正落下的末字符为准，不看键面画的是什么：键面画全角、布局里发的可能是半角。
+        if (last.length > 0 && GXKSymbolCloserForChar(last)) {
+            gSymbolPairToken++; // 一次 fire 只补一次
+            GXKSymbolInsertPair(last);
+        }
+        return; // 追加了：要么补完，要么这一击本就不是成对符号
+    }
+    if (![before isEqualToString:preText]) return; // 变了但不是追加（删除/替换/多字插入）：不补
+    if (attempt >= 8) return; // 宿主还没写进来就放弃：宁可不补，也不猜错位置
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.015 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        GXKSymbolPairAttempt(preText, anchor, token, attempt + 1);
+    });
 }
 
 static void GXKSymbolFireEvent(id self, SEL _cmd, id bundle, id event) {
@@ -202,21 +241,35 @@ static void GXKSymbolFireEvent(id self, SEL _cmd, id bundle, id event) {
         gSymbolLastFireAt = now;
     } else {
         // 这一击不在符号页：锁定就地解除，不等布局回调（切页后立刻打字也能复位）。
+        // 同时作废还没落地的补全重试，免得它把右半边补进这一击所在的页面。
+        gSymbolPairToken++;
         gSymbolLocked = NO;
         gSymbolLastFireView = nil;
         gSymbolLastFireAt = 0;
         GXKSymbolCancelReturn();
     }
 
+    // 转发之前先存一份光标前文本：宿主是同步写还是异步写，靠「内容变了没有」判定。
+    NSString *preText = @"";
+    if (onSymbolPage) {
+        id<UITextDocumentProxy> probe = GXKSymbolProxy();
+        NSString *pre = probe ? probe.documentContextBeforeInput : nil;
+        if ([pre isKindOfClass:[NSString class]]) preText = pre;
+    }
+
     if (gOrigSymbolFireEvent) gOrigSymbolFireEvent(self, _cmd, bundle, event); // 其余一律原样转发
 
     if (onSymbolPage) {
         // 文本由原生同步写入宿主，补全与回拼音都排在下一拍，避免和这一次提交抢光标。
+        // 这里不再复查「是否还在符号页」：布局回调会在提交与补全之间让页面缓存失效，
+        // 一旦复查落空，补全就被静默跳过——那正是「有时只补半边」的来源之一。
+        // 是否在符号页改由重试里的键视图锚点判定，那条判定不吃这个缓存。
+        NSUInteger token = ++gSymbolPairToken;
+        UIView *anchor = view; // 只在这一击的重试窗口内强引用，最多 120ms
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!GXKSymbolPageActive()) return;
-            GXKSymbolPairIfNeeded();
-            GXKSymbolScheduleReturn();
+            GXKSymbolPairAttempt(preText, anchor, token, 0);
         });
+        GXKSymbolScheduleReturn();
     }
 }
 
