@@ -74,3 +74,51 @@ jobs:
           git add -f builds
           git commit -m "build ${SHORT}"
           git push -f origin HEAD:builds
+
+  # 出包 = 换 dylib + 发 Release。仓库里没有 Google 二进制，所以 CI 不从原始 IPA
+  # 重新 inject，而是在 Release 上那份已注入成品里替换 Frameworks/libgkx.dylib：
+  # app group、词库、加载命令都已经是改好的，只有 dylib 需要换。
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: libgkx
+          path: new
+
+      - name: Show new dylib
+        run: |
+          set -euo pipefail
+          ls -l new/libgkx.dylib
+          sha256sum new/libgkx.dylib
+
+      - name: Download current release IPA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download v1.0 --repo "${GITHUB_REPOSITORY}" \
+            --pattern gboard-ntr-1.0-unsigned.ipa --dir base
+
+      - name: Swap dylib into the packed IPA
+        run: |
+          set -euo pipefail
+          python3 tools/swap_dylib.py \
+            --ipa base/gboard-ntr-1.0-unsigned.ipa \
+            --dylib new/libgkx.dylib \
+            --out dist/gboard-ntr-1.0-unsigned.ipa
+
+      - name: Publish to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 tools/publish_release.py \
+            --asset dist/gboard-ntr-1.0-unsigned.ipa \
+            --repo "${GITHUB_REPOSITORY}" \
+            --refresh-sha
