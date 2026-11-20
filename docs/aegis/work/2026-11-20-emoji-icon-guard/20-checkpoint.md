@@ -11,3 +11,13 @@
 - 产物：`dist/gboard-ntr-1.0-unsigned.ipa` 35980293 bytes，SHA256 `09c3976561e5435c1c4ae739842c1cce9e09cad871e824832a97b0702de053a8`；输入原包 SHA256 `c011730153df537f226052e766bbbf71834b5afcfeb13cba12f365d049719731`。
 - 验包：ZIP CRC OK；2050 条目，仅新增 dylib 与词库、移除 3 个旧 CodeResources；2045 个原生文件逐字节未变；允许差异仅共享框架／主 exe／appex 三个二进制；两个可执行文件各 1 条 `@rpath/libgkx.dylib`，rpath 未移动；框架 8 处 app group 改写为 `group.zunbengege.top`。
 - 待真机：LCSign 自签安装后验证九键拼音↔符号页切换时换行键不再闪圆圈，以及三态切换、9↔26 切换、滑行输入无回归。
+
+## 切键盘闪退修复（2026-11-20，同批次）
+
+- 现象：装 09c39765 包后切到 Gboard 键盘即闪退。
+- 根因：守卫按 `id` 接管 `-[GKBSoftKeyView updateView]`，但该方法类型编码是 `v16@0:8`（void）。ARC 下 `id` 返回值会对返回寄存器做 `objc_retainAutoreleasedReturnValue`，void 方法没有赋值该寄存器，首次布局调用即崩。
+- 修复提交 `5b6bd55`：`static void (*gOrigKeyUpdateView)(id, SEL);`、`static void gxk_key_updateView(...)` 不再读返回寄存器；安装前用 `method_getTypeEncoding` 校验首字符为 `v`，不符则不挂；方法若继承自父类用 `class_addMethod` 新增。
+- CI：run 44735557750 success；dylib 239232 bytes，SHA256 `df495d715023fc05273fe736cb9d3ffe71cee186607d4f0a04a16a7d67a20e9c`。
+- 产物：`dist/gboard-ntr-1.0-unsigned.ipa` 35980290 bytes，SHA256 `11df7f9fa60bee2a0057c590381f0cec164a9bc9c624c7d60196591cb1118ccc`；验包 CRC OK、2050 条目、新增 dylib 与词库（1688094 bytes）、移除 3 个 CodeResources、包内 dylib 与 CI 产物同哈希。
+- 教训：从二进制方法表解类型编码，不要凭「取不到编码串」推断签名；包装未知签名方法一律先校验。
+
