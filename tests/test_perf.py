@@ -581,6 +581,19 @@ class PerfContracts(unittest.TestCase):
         self.assertIn("gToolbarBandEpoch++;", detach)
         self.assertIn("gToolbarBandCacheValid = NO;", detach)
 
+    def test_own_overlay_views_never_register_as_native_obstacles(self):
+        """诊断 HUD 与标点弹层压在同一条 G 行上：当成遮挡会把 band 宽度压成 0，工具条整条消失。"""
+        self.assertIn("static NSHashTable<UIView *> *gToolbarOwnViews;", self.visibility)
+        register = function_body(self.visibility, "static void GXKToolbarOwnViewRegister(UIView *view) {")
+        for required in ("[gToolbarOwnViews addObject:view]", "gToolbarContentEpoch++"):
+            self.assertIn(required, register)
+        registry = function_body(self.visibility, "static BOOL GXKToolbarPrepareNativeObstacles(")
+        self.assertIn("[gToolbarOwnViews containsObject:view]", registry)
+        diag = (ROOT / "dylib/punct_diag.h").read_text(encoding="utf-8")
+        self.assertIn("GXKToolbarOwnViewRegister(label)", diag)
+        popup = (ROOT / "dylib/punct_popup.h").read_text(encoding="utf-8")
+        self.assertIn("GXKToolbarOwnViewRegister(panel)", popup)
+
     def test_fast_toolbar_reuse_rechecks_style_band_and_native_content(self):
         update = function_body(self.source, "static void GXKUpdateToolbar(UIViewController *vc) {")
         fast = update[:update.index("UIView *row = nil")]

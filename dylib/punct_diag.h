@@ -135,6 +135,7 @@ static void GXKPunctDiagAttachHud(UIView *root) {
         hold.minimumPressDuration = 0.5;
         [label addGestureRecognizer:hold];
         gDiagLabel = label;
+        GXKToolbarOwnViewRegister(label); // HUD 压在 G 行上，不能算原生遮挡。
         gDiagLastHud = nil;
     }
     if (gDiagLabel.superview != root) [root addSubview:gDiagLabel];

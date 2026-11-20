@@ -8,6 +8,17 @@ static NSHashTable<UIView *> *gToolbarKeyboardBodies;
 static NSUInteger gToolbarContentEpoch;
 static NSUInteger gToolbarObstacleEpoch;
 static BOOL gToolbarObstacleComplete;
+// 自家视图（诊断 HUD、标点弹层）不是原生内容。它们一旦被当成遮挡物，
+// band 的右边界会被压到左边界，宽度判成 0，整条工具条静默消失。
+// 用弱表按指针精确排除：tag 会和 gkx.m 里的 0x47584B5x 常量冲突。
+static NSHashTable<UIView *> *gToolbarOwnViews;
+static void GXKToolbarOwnViewRegister(UIView *view) {
+    if (!view) return;
+    if (!gToolbarOwnViews) gToolbarOwnViews = [NSHashTable weakObjectsHashTable];
+    [gToolbarOwnViews addObject:view];
+    // 已建好的遮挡表可能已经收录了这个视图，代次自增让下一次测量重建。
+    gToolbarContentEpoch++;
+}
 
 // A successful empty rect means no visible content; NO means unproven geometry.
 static BOOL GXKToolbarClippedViewRect(UIView *view, UIView *root, BOOL overflow, CGRect *outRect) {
@@ -112,7 +123,8 @@ static BOOL GXKToolbarPrepareNativeObstacles(UIView *root, UIView *logo) {
         while (pending.count && visited++ < 800) {
             UIView *view = pending.lastObject;
             [pending removeLastObject];
-            if (view == logo || view == gToolbarStack || view == gActionKeyButton) continue;
+            if (view == logo || view == gToolbarStack || view == gActionKeyButton ||
+                [gToolbarOwnViews containsObject:view]) continue; // 自家视图不是原生遮挡。
             // Hidden keyboard owners are registered too: a 9→26 switch can reuse both objects.
             if ([view isKindOfClass:nineClass] || [view isKindOfClass:qwertyClass])
                 [gToolbarKeyboardBodies addObject:view];

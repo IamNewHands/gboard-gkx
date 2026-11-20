@@ -121,6 +121,7 @@ static void GXKPunctBuildPanelIfNeeded(void) {
         [cells addObject:cell];
     }
     gPunctPanel = panel;
+    GXKToolbarOwnViewRegister(panel); // 弹层连同它的格子都不进遮挡表。
     gPunctCells = cells;
     gPunctIndex = -1;
 }
