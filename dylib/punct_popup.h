@@ -50,18 +50,40 @@ static UIView *GXKPunctFindKey(UIView *root) {
     UIView *candidate = nil;
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     NSUInteger visited = 0;
+    // [DIAG-punct] 记录九键体里所有 GKBSoftKeyView 的 ident：判定是「ident 不存在」还是四连判定之一失败。
+    NSMutableArray<NSString *> *seenIdents = [NSMutableArray array];
+    NSUInteger seenKeys = 0, hiddenSkip = 0, bodyFail = 0, visibleFail = 0, dupes = 0;
     while (stack.count && visited++ < 1500) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
-        if (v.isHidden || v.alpha < 0.05 || v.window != root.window) continue;
-        if ([v isKindOfClass:keyClass] &&
-            [v.restorationIdentifier isEqualToString:GXK_PUNCT_KEY_IDENT] &&
-            GXKNineKeyBodyForKey(v, root) && GXKKeyIsVisible(v, root)) {
-            if (candidate && candidate != v) return nil; // 布局不确定：不动原生
-            candidate = v;
+        if (v.isHidden || v.alpha < 0.05 || v.window != root.window) { hiddenSkip++; continue; }
+        if ([v isKindOfClass:keyClass]) {
+            seenKeys++;
+            NSString *ident = v.restorationIdentifier;
+            if (ident.length && ![seenIdents containsObject:ident]) [seenIdents addObject:ident];
+            if ([ident isEqualToString:GXK_PUNCT_KEY_IDENT]) {
+                BOOL inBody = GXKNineKeyBodyForKey(v, root) != nil;
+                BOOL visible = inBody && GXKKeyIsVisible(v, root);
+                if (!inBody) bodyFail++;
+                if (inBody && !visible) visibleFail++;
+                if (inBody && visible) {
+                    if (candidate && candidate != v) dupes++;
+                    candidate = v;
+                }
+            }
         }
         [stack addObjectsFromArray:v.subviews];
     }
+    gDiagFindMiss++;
+    GXKPunctDiagLog(@"find keys=%lu visit=%lu hid=%lu bodyFail=%lu visFail=%lu dup=%lu cand=%d tail=%lu ids=%@",
+                    (unsigned long)seenKeys, (unsigned long)visited, (unsigned long)hiddenSkip,
+                    (unsigned long)bodyFail, (unsigned long)visibleFail, (unsigned long)dupes,
+                    candidate != nil, (unsigned long)stack.count,
+                    [seenIdents count] > 24
+                        ? [NSString stringWithFormat:@"%@…(+%lu)", [seenIdents subarrayWithRange:NSMakeRange(0, 24)],
+                                                     (unsigned long)(seenIdents.count - 24)]
+                        : [seenIdents componentsJoinedByString:@","]);
+    if (dupes) return nil; // 布局不确定：不动原生
     return stack.count ? nil : candidate;
 }
 
@@ -160,6 +182,9 @@ static void GXKPunctCommit(NSInteger index) {
     }
     [proxy insertText:ch];
     GXKImpact(UIImpactFeedbackStyleLight);
+    // [DIAG-punct] 上屏结果：pre/now 长度能区分「原生先提交了一次」与「文本没动」。
+    GXKPunctDiagLog(@"cmt idx=%ld ch=%@ pre=%ld now=%ld", (long)index, ch,
+                    (long)(gPunctPreText ? gPunctPreText.length : -1), (long)now.length);
 }
 
 @interface GXKPunctGestureTarget : NSObject
@@ -169,6 +194,8 @@ static void GXKPunctCommit(NSInteger index) {
 @implementation GXKPunctGestureTarget
 - (void)onPunctLongPress:(UILongPressGestureRecognizer *)gr {
     UIView *root = gPunctRoot;
+    // [DIAG-punct] 状态迁移就是「完全无反应」的分水岭：一条 Began 都没有 = 手势从未识别。
+    GXKPunctDiagLog(@"lp state=%ld root=%d", (long)gr.state, root != nil);
     if (!root) { GXKPunctHidePanel(); return; }
     if (gr.state == UIGestureRecognizerStateBegan) {
         GXKPunctBuildPanelIfNeeded();
@@ -205,6 +232,7 @@ static void GXKPunctCommit(NSInteger index) {
 static GXKPunctGestureTarget *gPunctTarget;
 
 static void GXKPunctDetach(void) {
+    if (gPunctKey) { gDiagDetach++; } // [DIAG-punct]
     GXKPunctHidePanel();
     if (gPunctGesture) {
         [gPunctGesture.view removeGestureRecognizer:gPunctGesture];
@@ -232,12 +260,22 @@ static void GXKPunctAttach(UIView *key, UIView *root) {
     gPunctGesture = gr;
     gPunctKey = key;
     gPunctRoot = root;
+    // [DIAG-punct] 手势真的挂上了没有：UI 交互开关、已有手势数、可见性、九键体。
+    gDiagAttach++;
+    CGRect r = [key convertRect:key.bounds toView:root];
+    GXKPunctDiagLog(@"att ident=%@ cls=%@ f=(%.0f,%.0f,%.0f,%.0f) uie=%d ges=%lu inBody=%d vis=%d",
+                    key.restorationIdentifier, NSStringFromClass(key.class),
+                    r.origin.x, r.origin.y, r.size.width, r.size.height,
+                    (int)key.userInteractionEnabled, (unsigned long)key.gestureRecognizers.count,
+                    GXKNineKeyBodyForKey(key, root) != nil, (int)GXKKeyIsVisible(key, root));
 }
 
 // 布局拍里调用：至多一次全树定位，键没变时只做一次指针比较。
 static void GXKPunctPopupUpdate(UIViewController *vc) {
     if (!vc || vc != gCurrentVC || !vc.isViewLoaded) return;
     UIView *root = vc.view;
+    GXKPunctDiagAttachHud(root); // [DIAG-punct] HUD 常驻，每拍校准一次
+    GXKPunctDiagHud();
     // 常数级快路径：上一帧的键仍然在同一次布局里、仍然可见、手势还在，就不扫全树。
     UIView *key = gPunctKey;
     if (key && gPunctRoot == root && key.window == root.window && !key.isHidden && key.alpha > 0.05 &&
@@ -250,10 +288,17 @@ static void GXKPunctPopupUpdate(UIViewController *vc) {
             GXKPunctLayoutPanel();
             [root bringSubviewToFront:gPunctPanel];
         }
+        gDiagFast++; // [DIAG-punct] 快路径仍指向同一个键：手势应当仍在
         return;
     }
     UIView *found = GXKPunctFindKey(root);
-    if (!found) { GXKPunctDetach(); return; }
+    if (!found) {
+        // [DIAG-punct] 只记状态变化，避免每帧刷屏。
+        if (gPunctKey) GXKPunctDiagLog(@"det no-key (was %@)", gPunctKey.restorationIdentifier ?: @"nil");
+        GXKPunctDetach();
+        return;
+    }
+    if (gPunctKey != found) GXKPunctDiagLog(@"hit new key %@", found.restorationIdentifier ?: @"nil");
     GXKPunctDetach();
     GXKPunctAttach(found, root);
     if (gPunctPanel && gPunctPanel.superview != root) [root addSubview:gPunctPanel];

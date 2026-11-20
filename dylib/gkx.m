@@ -1458,6 +1458,7 @@ static void GXKSwizzleOrSkip(NSString *className, NSString *selName, IMP imp, vo
 }
 
 // 九键符号页：双击上屏并停留（依赖上面的 GXKSwizzleOrSkip）。
+#import "punct_diag.h" // [DIAG-punct] 必须在两个埋点文件之前
 #import "symbol_doubletap.h"
 #import "punct_popup.h"
 

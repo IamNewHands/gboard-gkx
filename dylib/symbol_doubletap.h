@@ -180,11 +180,15 @@ static void GXKSymbolInsertPair(NSString *typed) {
 // 每次 fire 带一个 token，新的一击会作废旧的重试，所以既不会补两次，也不会补到下一格。
 static void GXKSymbolPairAttempt(NSString *preText, UIView *anchor,
                                 NSUInteger token, int attempt) {
-    if (token != gSymbolPairToken) return;
+    if (token != gSymbolPairToken) { gDiagPairGiveUp++; return; } // [DIAG-punct]
     // 用按下那一刻的键视图当锚点复查是否还在符号页：这条判定就是 fire 里判 YES 的同一条，
     // 不依赖会被布局回调作废的 BFS 缓存——换页后键视图的祖先链会隐藏或脱离，这里立刻为 NO，
     // 于是绝不会把右半边补到拼音页的文本里。
-    if (anchor && !GXKSymbolViewIsOnSymbolPage(anchor)) return;
+    if (anchor && !GXKSymbolViewIsOnSymbolPage(anchor)) {
+        gDiagPairOffPage++; // [DIAG-punct] anchor 判定离页：补全被静默丢弃的头号嫌疑
+        GXKPunctDiagLog(@"pair offPage a=%d pre=%ld", attempt, (long)preText.length);
+        return;
+    }
     id<UITextDocumentProxy> proxy = GXKSymbolProxy();
     if (!proxy) return;
     NSString *before = proxy.documentContextBeforeInput;
@@ -201,14 +205,29 @@ static void GXKSymbolPairAttempt(NSString *preText, UIView *anchor,
                      [before hasPrefix:[preText substringFromIndex:1]]);
     if (appended) {
         // 以宿主真正落下的末字符为准，不看键面画的是什么：键面画全角、布局里发的可能是半角。
-        if (last.length > 0 && GXKSymbolCloserForChar(last)) {
+        BOOL closer = last.length > 0 && GXKSymbolCloserForChar(last) != nil;
+        GXKPunctDiagLog(@"pair ok a=%d before=%ld pre=%ld last=%@ closer=%d",
+                        attempt, (long)before.length, (long)preText.length, last ?: @"nil", (int)closer);
+        if (closer) {
             gSymbolPairToken++; // 一次 fire 只补一次
+            gDiagPairOk++;
             GXKSymbolInsertPair(last);
         }
         return; // 追加了：要么补完，要么这一击本就不是成对符号
     }
-    if (![before isEqualToString:preText]) return; // 变了但不是追加（删除/替换/多字插入）：不补
-    if (attempt >= 8) return; // 宿主还没写进来就放弃：宁可不补，也不猜错位置
+    if (![before isEqualToString:preText]) {
+        // [DIAG-punct] 变了但不是追加：窗口右移超过 1 字符、或宿主改写了别的内容。
+        gDiagPairGiveUp++;
+        GXKPunctDiagLog(@"pair changed a=%d before=%ld pre=%ld", attempt,
+                        (long)before.length, (long)preText.length);
+        return; // 变了但不是追加（删除/替换/多字插入）：不补
+    }
+    if (attempt >= 8) {
+        gDiagPairTimeout++;
+        GXKPunctDiagLog(@"pair timeout before=%ld pre=%ld same=%d", (long)before.length,
+                        (long)preText.length, (int)[before isEqualToString:preText]);
+        return; // 宿主还没写进来就放弃：宁可不补，也不猜错位置
+    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.015 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         GXKSymbolPairAttempt(preText, anchor, token, attempt + 1);
@@ -260,6 +279,11 @@ static void GXKSymbolFireEvent(id self, SEL _cmd, id bundle, id event) {
     if (gOrigSymbolFireEvent) gOrigSymbolFireEvent(self, _cmd, bundle, event); // 其余一律原样转发
 
     if (onSymbolPage) {
+        // [DIAG-punct] 这一击的入口证据：锚点是否判在符号页、光标前文本多长。
+        gDiagFire++;
+        GXKPunctDiagLog(@"fire ident=%@ pre=%ld locked=%d view=%d",
+                        view.restorationIdentifier ?: @"nil", (long)preText.length,
+                        (int)gSymbolLocked, view != nil);
         // 文本由原生同步写入宿主，补全与回拼音都排在下一拍，避免和这一次提交抢光标。
         // 这里不再复查「是否还在符号页」：布局回调会在提交与补全之间让页面缓存失效，
         // 一旦复查落空，补全就被静默跳过——那正是「有时只补半边」的来源之一。
