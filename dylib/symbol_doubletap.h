@@ -200,6 +200,44 @@ static void GXKSymbolPairAttempt(NSString *preText, UIView *anchor,
     //     只看末字符会把右半边补到退格之后，凭空多出一个符号。
     // documentContextBeforeInput 有长度上限：超长时窗口整体右移一格，长度不变、只丢首字符，
     // 所以两种形态都要认，否则长文本下补全会悄悄失效。
+    //
+    // 但「变短 1」和「窗口右移」在长度上不可区分：空输入框里打第一个符号时 preText=@""，
+    // 宿主把空串补成 1 个字符，于是 before.length(1) == preText.length+1 成立、preText 又是
+    // 任何串的前缀——追加判定会把「从空到有」误判成追加，可它根本不是这一击造成的（这一击
+    // 还在异步路上）。下面的 last 是空串时 last=nil，closer=0，于是静默 return，补全永久丢失。
+    // 真机日志：pre=0 的 6 次全部 pair changed，pre>=1 的 2 次全部 pair ok。
+    // 所以这一击必须真的让文本变长：preText 为空时只认「有内容」这一条，
+    // 且必须等到宿主写出非空内容才算落地，不能把「仍是空」当成已落地。
+    if (preText.length == 0) {
+        // 空输入框：宿主写没写进来，只能看「有没有内容」。空 = 还没写，继续等。
+        if (before.length == 0) {
+            if (attempt >= 8) {
+                gDiagPairTimeout++;
+                GXKPunctDiagLog(@"pair timeout empty attempt=%d", attempt);
+                return;
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.015 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                GXKSymbolPairAttempt(preText, anchor, token, attempt + 1);
+            });
+            return;
+        }
+        if (before.length == 1) {
+            NSString *ch = before;
+            BOOL closer0 = GXKSymbolCloserForChar(ch) != nil;
+            GXKPunctDiagLog(@"pair ok a=%d before=1 pre=0 last=%@ closer=%d",
+                            attempt, ch, (int)closer0);
+            if (closer0) {
+                gSymbolPairToken++;
+                gDiagPairOk++;
+                GXKSymbolInsertPair(ch);
+            }
+            return;
+        }
+        gDiagPairGiveUp++;
+        GXKPunctDiagLog(@"pair changed a=%d before=%ld pre=0", attempt, (long)before.length);
+        return; // 一次落了不止一个字符：不是这一击，不补
+    }
     BOOL appended = (before.length == preText.length + 1 && [before hasPrefix:preText]) ||
                     (before.length == preText.length && preText.length > 0 &&
                      [before hasPrefix:[preText substringFromIndex:1]]);

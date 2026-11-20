@@ -144,7 +144,7 @@ static void GXKPunctDiagAttachHud(UIView *root) {
 
 static NSString *GXKPunctDiagReport(void) {
     NSMutableString *out = [NSMutableString string];
-    [out appendFormat:@"GXK punct diag v1\niOS=%@ ring=%lu\n",
+    [out appendFormat:@"GXK punct diag v2\niOS=%@ ring=%lu\n",
      [UIDevice currentDevice].systemVersion, (unsigned long)gDiagRing.count];
     [out appendFormat:@"counters attach=%lu detach=%lu fast=%lu findHit=%lu findMiss=%lu\n",
      (unsigned long)gDiagAttach, (unsigned long)gDiagDetach, (unsigned long)gDiagFast,
