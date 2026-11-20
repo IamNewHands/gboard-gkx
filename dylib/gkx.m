@@ -518,28 +518,27 @@ static BOOL GXKModelHasNativeActions(id model) {
 // 这里在原生写完的同一轮立刻把前景搬走，帧提交前图层已经是空的：
 // 不改 alpha/hidden/背景，不碰键帽样式，也不碰其它键。
 static BOOL gxk_icon_guard_hooked = NO;
-// 原实现的返回类型没有可查的签名：按 id 接管并原样回传。原方法若返回 void，
-// 调用方本来就不读这个寄存器；若返回对象，回传的就是原实现自己的值。
-static id (*gOrigKeyUpdateView)(id, SEL);
+// 原方法在二进制里的类型编码是 v16@0:8 —— 返回 void。包装函数必须同样是 void：
+// 按 id 接管会让 ARC 去 retain 一个根本没被赋值的返回寄存器，切键盘当场闪退。
+static void (*gOrigKeyUpdateView)(id, SEL);
 
-static id gxk_key_updateView(id self, SEL _cmd) {
-    id result = gOrigKeyUpdateView ? gOrigKeyUpdateView(self, _cmd) : nil;
+static void gxk_key_updateView(id self, SEL _cmd) {
+    if (gOrigKeyUpdateView) gOrigKeyUpdateView(self, _cmd);
     // 没有绑定中的覆盖按钮就完全交给原生：26键、绑定失败、撤键之后一律不拦。
-    if (!gActionKeyButton || !gCurrentVC || !gCurrentVC.isViewLoaded) return result;
+    if (!gActionKeyButton || !gCurrentVC || !gCurrentVC.isViewLoaded) return;
     UIView *key = (UIView *)self;
     // 只处理已绑定的那一个键：未绑定的键保留原生前景，否则新布局会因缺前景绑不上。
-    if (key != gEmojiSoftKeyView || ![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return result;
-    if (key.window != gCurrentVC.view.window) return result;
+    if (key != gEmojiSoftKeyView || ![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return;
+    if (key.window != gCurrentVC.view.window) return;
     UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(key);
-    if (!icon || icon != gActionNativeIcon) return result;
-    if (!GXKModelHasNativeActions(((id<GXKNativeSoftKeyContent>)key).softKeyDef)) return result;
+    if (!icon || icon != gActionNativeIcon) return;
+    if (!GXKModelHasNativeActions(((id<GXKNativeSoftKeyContent>)key).softKeyDef)) return;
     // 原生这一轮重画的图先存档再清：撤键时仍能按原样还原。
     if (icon.image) gActionNormalImage = icon.image;
     if (icon.highlightedImage) gActionHighlightedImage = icon.highlightedImage;
     // 只清前景两态，背景层与原生键帽保持原样。
     if (icon.image) icon.image = nil;
     if (icon.highlightedImage) icon.highlightedImage = nil;
-    return result;
 }
 
 // 类可能晚于构造阶段加载：viewWillAppear 里补挂一次，挂上即置位，不重复接管。
@@ -549,8 +548,14 @@ static void GXKInstallIconWriteGuard(void) {
     if (!cls) return;
     Method m = class_getInstanceMethod(cls, @selector(updateView));
     if (!m) return;
-    gOrigKeyUpdateView = (id (*)(id, SEL))method_getImplementation(m);
-    method_setImplementation(m, (IMP)gxk_key_updateView);
+    // 只接无返回值的 updateView：签名一变就不挂，宁可闪一帧也不能崩键盘。
+    const char *types = method_getTypeEncoding(m);
+    if (!types || types[0] != 'v') return;
+    gOrigKeyUpdateView = (void (*)(id, SEL))method_getImplementation(m);
+    // 方法若来自父类则在子类新增，避免改写父类波及其它键。
+    if (!class_addMethod(cls, @selector(updateView), (IMP)gxk_key_updateView, types)) {
+        method_setImplementation(m, (IMP)gxk_key_updateView);
+    }
     gxk_icon_guard_hooked = YES;
 }
 

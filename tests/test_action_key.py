@@ -222,10 +222,12 @@ class ActionKeySourceContracts(unittest.TestCase):
 
     def test_native_icon_write_guard_clears_only_the_bound_key_in_the_same_pass(self):
         """原生 updateView 写完的同一轮清前景，否则下一拍清除前会闪一帧圆圈。"""
-        guard = function_body(self.source, "static id gxk_key_updateView(id self, SEL _cmd) {")
-        # 先透传原实现并原样回传它的返回值，不改变原生语义。
-        self.assertIn("id result = gOrigKeyUpdateView ? gOrigKeyUpdateView(self, _cmd) : nil;", guard)
-        self.assertGreaterEqual(guard.count("return result;"), 6, "every early exit must forward the native result")
+        guard = function_body(self.source, "static void gxk_key_updateView(id self, SEL _cmd) {")
+        # 原方法是 void（v16@0:8）。包装必须同签名：按 id 接管会让 ARC retain 一个
+        # 从未被赋值的返回寄存器，切键盘当场闪退。
+        self.assertIn("static void (*gOrigKeyUpdateView)(id, SEL);", self.source)
+        self.assertNotIn("return result;", guard)
+        self.assertIn("if (gOrigKeyUpdateView) gOrigKeyUpdateView(self, _cmd);", guard)
         # 只处理已绑定的那一个键；未绑定的键必须保留原生前景，否则新布局绑不上。
         self.assertIn("key != gEmojiSoftKeyView", guard)
         self.assertIn("icon != gActionNativeIcon", guard)
@@ -241,8 +243,13 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("if (gxk_icon_guard_hooked) return;", install)
         self.assertIn('NSClassFromString(@"GKBSoftKeyView")', install)
         self.assertIn("class_getInstanceMethod(cls, @selector(updateView))", install)
+        # 签名不符就不挂：宁可闪一帧，也不能让键盘崩。
+        self.assertIn("const char *types = method_getTypeEncoding(m);", install)
+        self.assertIn("if (!types || types[0] != 'v') return;", install)
         self.assertIn("method_getImplementation(m)", install)
-        self.assertIn("method_setImplementation(m, (IMP)gxk_key_updateView)", install)
+        # 方法来自父类时用 class_addMethod，别改写父类波及其它键。
+        self.assertIn("if (!class_addMethod(cls, @selector(updateView), (IMP)gxk_key_updateView, types)) {", install)
+        self.assertIn("method_setImplementation(m, (IMP)gxk_key_updateView);", install)
         self.assertIn("gxk_icon_guard_hooked = YES;", install)
 
         # 构造期先挂，类晚加载时 viewWillAppear 补挂。
