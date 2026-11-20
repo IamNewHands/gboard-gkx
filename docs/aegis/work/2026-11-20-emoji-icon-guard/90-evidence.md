@@ -34,4 +34,17 @@
 - 根因：流程缺步，不是操作失误。README 第 3 步止于「本地注入打包」，agent.md 速查止于「校验产物」，两处都没有「上传 Release」。
 - 补做：新增 `tools/publish_release.py`（`gh release upload --clobber` → 置草稿再发布重置 `published_at` → 读回校验 size → 打印固定下载地址与远端 digest）；README 增「4. 发布到 GitHub Release」，agent.md 速查增第 6 步并新增避坑 11。
 - 结果：`v1.0` 资产 35980398 bytes，远端 digest `sha256:0c330dc44d51cdc89e5185b720839ece35f63fd9b7722da19c1c61a5012cd0ee`，`published_at=2026-11-20T12:55:56Z`（原 11:04:15Z），正文 SHA-256 已同步。
-- 注意：`--clobber` 会把旧资产先删再传，网络中断会留下空资产列表（本次即遇到一次，重跑即恢复）；`publish_release.py` 因此带了读回校验。
+- 注意：`--clobber` 会把旧资产先删再传，网络中断会留下空资产列表（本次即遇到一次，重跑即恢复）；`publish_release.py` 因此带了读回校验与 3 次重试。
+
+## 2026-11-20 发布接入 CI（提交 5980876）
+
+- 需求：让 push 之后自动发版，不再依赖人记得跑最后一步。
+- 约束：仓库不含 Google 二进制（免责声明写明），CI 拿不到原始 `Gboard_2.3.19.ipa`，无法从头 `inject.py`。
+- 解法：Release 上那份 IPA 已经是注入完成的成品（app group 已改写、词库已内嵌、`LC_LOAD_DYLIB` 已写入），重建只改变 `Payload/Gboard.app/Frameworks/libgkx.dylib` 一个文件。新增 `tools/swap_dylib.py` 只换这一个文件，并复用 `inject.py` 的 `unpack`/`repack`/`strip_signatures`，保证 CI 产物与本地手工产物在权限（0o755）与时间戳上一致。
+- 工作流：`build` 之后新增 `publish`（ubuntu-latest、`contents: write`）：下载 artifact → `gh release download v1.0 --pattern gboard-ntr-1.0-unsigned.ipa` 取当前成品 → swap → `publish_release.py --refresh-sha`。
+- `publish_release.py` 增强：上传 3 次重试（`--clobber` 先删后传，断线会留空资产列表，本次手工发版时真实遇到一次）；`--refresh-sha` 用正则改写正文的体积与 64 位 SHA-256；`--skip-upload` 供只刷新元数据时用。
+- 本地验证 swap：用同一 dylib 换 → 包内 2050 条目、无增删、无字节变化（CRC OK）；换一个不同内容的 dylib → 只有 `Payload/Gboard.app/Frameworks/libgkx.dylib` 变化，条目数不变，CRC OK。
+- 契约测试：新增 `tests/test_release.py` 12 项（swap 只换 dylib、保留 0o755、换后校验字节、拒绝无 dylib 的包；publish 上传重试、先 `--draft` 后 `--draft=false`、大小不符即失败；workflow 的 publish job `needs: build`、有 `contents: write`、调用两个工具）。
+- 全量回归：11 个测试文件逐个 `python -B <file>` 全 OK。
+- CI 验证：run 44740644479 success（build + publish 两个 job），publish 日志显示 `包内 libgkx.dylib 校验通过 (1 处)`、`published_at=2026-11-20T13:02:08Z`、资产 35980398 bytes。
+- 未覆盖：本次 dylib 内容与上一版相同（仅工作流与脚本变化），因此产物哈希未变；真正「换 dylib 后 Release 自动更新」的验证要等下一次改 `dylib/` 的提交。仍未真机验收。

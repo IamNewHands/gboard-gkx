@@ -28,4 +28,5 @@
 - 修复：新增 `static __weak UIView *gGuardKey` 作归属；绑定建立时赋值，撤键时先清空再调还原用的原生 `updateView`；守卫改判「归属键 + emoji id + 九键 body + 同 window + 有原生 action」，图标每次现取。
 - 回归：tests 10 文件全 OK；test_action_key 26 项，新增断言锁定「判据不得引用按钮/图标同一性」「图标先现取再清空」「gGuardKey = nil 先于原生 updateView」。
 - 发布（补做）：本次三包（c86e7cb / 5b6bd55 / 61b8d32）都只重打了 `dist/`，Release 资产一直是旧的，用户两次追问「为什么又没发布 release」。已补 `tools/publish_release.py` 并把「第 6 步 发布」写进 README 与 agent.md 速查。最终 Release：tag `v1.0`，资产 `gboard-ntr-1.0-unsigned.ipa` 35980398 bytes，远端 digest `sha256:0c330dc4…cd0ee`，`published_at` 刷新为 2026-11-20T12:55:56Z，正文 SHA-256 已同步。
+- 发布自动化（提交 `5980876`）：CI 新增 `publish` job（needs: build，contents: write）。仓库不含 Google 二进制，CI 不从原始包重新 inject，而是下载 Release 上那份成品 IPA，用新增的 `tools/swap_dylib.py` 替换 `Frameworks/libgkx.dylib`（复用 inject.py 的 unpack/repack/权限逻辑），再调 `tools/publish_release.py --refresh-sha` 覆盖上传并改正文哈希。`publish_release.py` 同时加了上传重试（`--clobber` 先删后传，断线会留空资产列表）。新增 `tests/test_release.py` 12 项锁定契约。验证 run 44740644479 全绿（build + publish），Release `published_at` 刷新为 2026-11-20T13:02:08Z，资产 35980398 bytes、digest 不变（本次 dylib 未变）。
 

@@ -131,7 +131,7 @@ gboard-ntr/
 
 * **历史教训（2026-11-20）**：当天连出三包（c86e7cb / 5b6bd55 / 61b8d32），每次都重打了 `dist/gboard-ntr-1.0-unsigned.ipa`、都跑了 CI、都做了逐文件验包，但 Release 页面上的资产一直是上一版的（正文 SHA 与实际包不符），用户第二次问「为什么又没发布 release」。根因不是漏操作，是流程里根本没有这一步：`README` 的第 3 步止于「本地注入打包」，`agent.md` 的速查止于「校验产物」，两个文档都没有写「上传 Release」。
 * **开发准则**：
-  1. **打包的最后一步是发布。** 每次 `dist/` 里的 IPA 变了，就必须跑 `python tools/publish_release.py --asset dist/gboard-ntr-1.0-unsigned.ipa --repo IamNewHands/gboard-ntr`，否则这次改动对外不存在。
+  1. **打包的最后一步是发布，现在由 CI 强制。** push 动了 `dylib/` 就会触发 `build` → `publish`：CI 下载 Release 上的成品 IPA，用 `tools/swap_dylib.py` 换掉 `Frameworks/libgkx.dylib`，再调 `tools/publish_release.py` 覆盖上传。**必须确认 `publish` job 绿了**；只看到 `build` 绿不等于发出去。
   2. **只维护一条 release。** tag 固定 `v1.0`，资产名固定 `gboard-ntr-1.0-unsigned.ipa`，就地 `--clobber` 覆盖；下载地址 `releases/latest/download/gboard-ntr-1.0-unsigned.ipa` 因此长期有效。不要新建 tag、不要堆积多个 release。
   3. **`--clobber` 不会刷新 `published_at`。** 它只换文件，页面时间仍停在 tag 首次发布那天，看起来像没更新。`publish_release.py` 用「置草稿 → 立刻发布」把时间重置成本次出包时间（约 1 秒下载链接 404 窗口，已接受）。
   4. **发布后必须读回校验三项**：`publishedAt` 是刚才的时间、资产 size 与 `dist/` 一致、正文 SHA-256 等于本包哈希。三项任一不符就是没发成。
@@ -167,11 +167,13 @@ python tools/inject.py `
 # 5. 校验产物 Mach-O 与权限
 python tools/inspect_signed.py "dist/gboard-ntr-1.0-unsigned.ipa"
 
-# 6. 发布到 GitHub Release（必做，漏了等于没发）
-python tools/publish_release.py --asset dist/gboard-ntr-1.0-unsigned.ipa --repo IamNewHands/gboard-ntr
-#    脚本会覆盖资产、重置 published_at、读回校验大小、打印固定下载地址与远端 SHA-256
+# 6. 发布到 GitHub Release —— 已由 CI 自动完成（push dylib/ 后 publish job 接管）
+#    本地手工兜底时才需要跑：
+python tools/publish_release.py --asset dist/gboard-ntr-1.0-unsigned.ipa --repo IamNewHands/gboard-ntr --refresh-sha
+#    CI 用的换 dylib 工具（在成品包上替换 Frameworks/libgkx.dylib）：
+python tools/swap_dylib.py --ipa <成品.ipa> --dylib <新.dylib> --out <新成品.ipa>
 ```
 
-> **第 6 步不是可选项。** 本地 `dist/` 出包只完成一半，Release 资产没换就等于没发布。
+> **发布不是可选项。** push 后必须确认 `publish` job 绿了；Release 资产没换就等于没发布。
 > 验收：`gh release view v1.0 --json publishedAt,assets` 的 `publishedAt` 是刚才的时间、
-> 资产 size 与 `dist/` 一致、正文 SHA-256 等于本包哈希。
+> 资产 size 与产物一致、正文 SHA-256 等于本包哈希。

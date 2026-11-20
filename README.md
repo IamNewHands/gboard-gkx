@@ -149,7 +149,8 @@ gboard-ntr/
 │   ├── inject.py                  # 纯 Python Mach-O 注入、App Group 原地改写与 Unix 权限打包
 │   ├── dict_converter.py          # 词库转换器：清洗万象 YAML/文本，精选 6 万词生成紧凑 Protobuf
 │   ├── inspect_signed.py          # 只读元数据自检工具：校验 Mach-O、依赖链与权限
-│   └── publish_release.py         # 发布到 GitHub Release：覆盖资产、刷新 published_at、读回校验
+│   ├── swap_dylib.py              # 在已注入成品里替换 Frameworks/libgkx.dylib（CI 用）
+│   └── publish_release.py         # 发布到 GitHub Release：覆盖资产、刷新 published_at 与正文哈希
 ├── tests/                         # 源码契约测试（python -m unittest discover -s tests）
 ├── dist/                          # 构建产物与词库生成目录
 │   ├── user_dictionary.db         # 转换生成的紧凑万象词库 (1.61 MB)
@@ -218,13 +219,15 @@ python tools/inject.py `
 https://github.com/IamNewHands/gboard-ntr/releases/latest/download/gboard-ntr-1.0-unsigned.ipa
 ```
 
-每次出包都是**就地覆盖**这条 release 的资产，不新建 tag、不新建 release：
+**这一步现在由 CI 自动完成**：只要 push 动了 `dylib/`，`build-dylib` 编出新的 `libgkx.dylib` 后会接着跑 `publish` job——把 Release 上那份成品 IPA 下载下来，用 `tools/swap_dylib.py` 换掉 `Frameworks/libgkx.dylib`，再调 `tools/publish_release.py` 覆盖上传并刷新正文哈希。仓库里不含 Google 二进制，所以 CI 不从原始包重新注入；它换的是已经注入好的成品。
+
+本地手工发版（CI 不可用、或改了词库/注入逻辑需要整包重打时）：
 
 ```powershell
-python tools/publish_release.py --asset dist/gboard-ntr-1.0-unsigned.ipa --repo IamNewHands/gboard-ntr
+python tools/publish_release.py --asset dist/gboard-ntr-1.0-unsigned.ipa --repo IamNewHands/gboard-ntr --refresh-sha
 ```
 
-脚本做四件事：`gh release upload --clobber` 覆盖资产 → 置草稿再发布（把 `published_at` 刷新成这次出包时间，否则页面一直显示 tag 首次发布那天）→ 读回校验资产大小 → 打印固定下载地址与远端 SHA-256。
+脚本做四件事：`gh release upload --clobber` 覆盖资产（带重试，因为 `--clobber` 是先删后传）→ 置草稿再发布（把 `published_at` 刷新成这次出包时间，否则页面一直显示 tag 首次发布那天）→ 读回校验资产大小 → 打印固定下载地址与远端 SHA-256。加 `--refresh-sha` 会把正文里的体积与 SHA-256 改成本次产物。
 
 **验收口径**：`gh release view v1.0 --json publishedAt,assets` 的 `publishedAt` 是刚才的时间，资产 size 与 `dist/` 里的一致，正文里的 SHA-256 是本包哈希。三者任一不符就是没发成。
 
