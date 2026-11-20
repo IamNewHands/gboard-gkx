@@ -1249,6 +1249,9 @@ static void gkx_textDidChange(id self, SEL _cmd, id textInput) {
 static void GXKSymbolInvalidatePageCache(void);
 static void GXKSymbolInstallHooks(void);
 static void GXKSymbolNoteLayout(void);
+// punct_popup.h 同理：标点键长按弹层在布局拍里定位，隐藏时随键盘一起撤走。
+static void GXKPunctPopupUpdate(UIViewController *vc);
+static void GXKPunctPopupTeardown(void);
 
 static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
     if (gOrigViewDidLayoutSubviews) gOrigViewDidLayoutSubviews(self, _cmd);
@@ -1270,6 +1273,8 @@ static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
         // 锁定只在这一拍校正：本帧布局已定稿，判定才准；且每帧至多一次，
         // 不在上面那几十次同步回调里做全树扫描。
         GXKSymbolNoteLayout();
+        // 标点键长按弹层：本帧布局已定稿，键位置才是最终值；每帧至多一次全树定位。
+        GXKPunctPopupUpdate(vc);
         GXKProbeNoteLayout(@"layout"); // [DEBUG-symbol] 只在长按开启探针后记录。
     });
 }
@@ -1315,6 +1320,7 @@ static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
         GXKDetachActionKey();
         GXKDetachToolbar(); // 扩展隐藏后工具条随宿主一起撤走，下次出现重新定位。
         GXKDetachPhrasesPanel(); // 常用语面板随扩展隐藏一起撤走。
+        GXKPunctPopupTeardown(); // 标点长按弹层与手势一并撤销，下次出现重新挂。
         GXKReleaseHaptics(); // 扩展隐藏后不常驻触觉引擎。
     }
     if (gOrigViewWillDisappear) gOrigViewWillDisappear(self, _cmd, animated);
@@ -1453,6 +1459,7 @@ static void GXKSwizzleOrSkip(NSString *className, NSString *selName, IMP imp, vo
 
 // 九键符号页：双击上屏并停留（依赖上面的 GXKSwizzleOrSkip）。
 #import "symbol_doubletap.h"
+#import "punct_popup.h"
 
 static void GXKInstallMiniAppHooks(void) {
     if (gxk_mini_app_hooked) return;
