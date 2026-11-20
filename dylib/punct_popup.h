@@ -21,6 +21,9 @@
 #define GXK_PUNCT_CELL_MAX     44.0   // 单格最大宽度，超出则整排按可用宽度均分
 #define GXK_PUNCT_PANEL_HEIGHT 42.0
 #define GXK_PUNCT_ASSOC_KEY    "gxk.punct.gesture"
+#define GXK_PUNCT_SYMBOLS_KEY  @"GXKPunctSymbols" // App Group：用户自定义的符号表
+#define GXK_PUNCT_COUNT_KEY    @"GXKPunctCount"   // App Group：弹层显示前几个
+#define GXK_PUNCT_MAX_SYMBOLS  10                 // 上限沿用原版 10 格：375pt 宽键盘单格仍有 37pt
 
 // 视图引用一律 __weak：键盘根视图与键体由原生持有，这里绝不延长它们的生命周期（Jetsam 红线）。
 static __weak UIView *gPunctKey;
@@ -31,15 +34,112 @@ static CGFloat gPunctCellWidth;
 static NSInteger gPunctIndex;
 static NSString *gPunctPreText;
 static UILongPressGestureRecognizer *gPunctGesture;
+static NSArray<NSString *> *gPunctSymbolsInUse; // 当前这排格子对应的符号表（指针比较即可判断变没变）
+static UIColor *gPunctSkinColor;                // 键盘底色，换肤后重算
+static UIColor *gPunctNativeTextColor;          // 键盘原生文字色
+static BOOL gPunctDark;                         // 弹层当前是深色还是浅色
 
-// 候选顺序按中文输入的实际频次排：前几位最常用，滑到即中。
-static NSArray<NSString *> *GXKPunctCandidates(void) {
+// 深浅配色与皮肤采样都实现在 gkx.m 里（本文件在 gkx.m 中途引入，函数体在后面）。
+// 这里只前置声明，签名必须与定义逐字一致。
+static UIColor *GXKPhraseSkinColor(UIView *body);
+static BOOL GXKPhrasePrefersDark(UIView *body, UIColor *skin, UITraitCollection *traits);
+static UIColor *GXKPhraseBackgroundColor(UIColor *skin, BOOL dark);
+static UIColor *GXKPhrasePrimaryTextColor(UIColor *native, BOOL dark);
+static UIColor *GXKPhraseSeparatorColor(UIColor *native, BOOL dark);
+
+// 默认符号表：按中文输入的实际频次排，前几位最常用，滑到即中。
+// 用户没改过设置时弹层就是这张表的前 GXK_PUNCT_MAX_SYMBOLS 项，与旧版本完全一致。
+static NSArray<NSString *> *GXKPunctDefaultSymbols(void) {
     static NSArray<NSString *> *list;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         list = @[@"，", @"。", @"？", @"！", @"、", @"；", @"：", @"…", @"“", @"”"];
     });
     return list;
+}
+
+// 设置存 App Group：主 App 写、键盘扩展读，跨进程立刻生效（和常用语、诊断开关同一条路）。
+static NSUserDefaults *GXKPunctDefaults(void) {
+    static NSUserDefaults *defaults = nil;
+    static BOOL tried = NO;
+    if (!tried) {
+        tried = YES;
+        defaults = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+        if (!defaults) defaults = [NSUserDefaults standardUserDefaults];
+    }
+    return defaults;
+}
+
+// 用户符号表：只收非空字符串，超上限截断；空表退回默认表，保证弹层永远有东西可点。
+static NSArray<NSString *> *GXKPunctSymbols(void) {
+    id raw = [GXKPunctDefaults() objectForKey:GXK_PUNCT_SYMBOLS_KEY];
+    if (![raw isKindOfClass:[NSArray class]]) return GXKPunctDefaultSymbols();
+    NSMutableArray<NSString *> *list = [NSMutableArray array];
+    for (id item in (NSArray *)raw) {
+        if ([item isKindOfClass:[NSString class]] && ((NSString *)item).length > 0) {
+            [list addObject:(NSString *)item];
+        }
+        if (list.count >= GXK_PUNCT_MAX_SYMBOLS) break;
+    }
+    return list.count ? list : GXKPunctDefaultSymbols();
+}
+
+// 显示个数：没设过 = 全显示（旧行为）；越界一律夹回 1..上限。
+static NSInteger GXKPunctSymbolCount(void) {
+    NSInteger n = [GXKPunctDefaults() integerForKey:GXK_PUNCT_COUNT_KEY];
+    if (n <= 0) n = GXK_PUNCT_MAX_SYMBOLS;
+    if (n > GXK_PUNCT_MAX_SYMBOLS) n = GXK_PUNCT_MAX_SYMBOLS;
+    return n;
+}
+
+static void GXKPunctSaveSettings(NSArray<NSString *> *symbols, NSInteger count) {
+    NSUserDefaults *defaults = GXKPunctDefaults();
+    if (!defaults) return;
+    NSMutableArray<NSString *> *clean = [NSMutableArray array];
+    for (id item in symbols) {
+        if ([item isKindOfClass:[NSString class]] && ((NSString *)item).length > 0) {
+            [clean addObject:(NSString *)item];
+        }
+        if (clean.count >= GXK_PUNCT_MAX_SYMBOLS) break;
+    }
+    if (count < 1) count = 1;
+    if (count > (NSInteger)clean.count) count = (NSInteger)clean.count;
+    if (clean.count) {
+        [defaults setObject:clean forKey:GXK_PUNCT_SYMBOLS_KEY];
+        [defaults setInteger:count forKey:GXK_PUNCT_COUNT_KEY];
+    } else {
+        [defaults removeObjectForKey:GXK_PUNCT_SYMBOLS_KEY];
+        [defaults removeObjectForKey:GXK_PUNCT_COUNT_KEY];
+    }
+    [defaults synchronize]; // 跨进程，键盘那边要立刻看见。
+}
+
+// 恢复默认：两个键都删掉，回到「没设置过」的状态，键盘侧 0.5 秒内自己退回默认表。
+static void GXKPunctResetSettings(void) {
+    NSUserDefaults *defaults = GXKPunctDefaults();
+    if (!defaults) return;
+    [defaults removeObjectForKey:GXK_PUNCT_SYMBOLS_KEY];
+    [defaults removeObjectForKey:GXK_PUNCT_COUNT_KEY];
+    [defaults synchronize];
+}
+
+// 弹层真正显示的那几个：符号表的前 count 项。
+// 0.5 秒缓存一次，且只在内容真的变了才换新对象——调用方靠指针比较就知道要不要重建格子。
+static NSArray<NSString *> *GXKPunctCandidates(void) {
+    static NSArray<NSString *> *cached;
+    static NSTimeInterval cachedAt;
+    static BOOL primed;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (primed && now - cachedAt < 0.5) return cached;
+    NSArray<NSString *> *all = GXKPunctSymbols();
+    NSInteger n = GXKPunctSymbolCount();
+    if (n < 1) n = 1;
+    if ((NSUInteger)n > all.count) n = (NSInteger)all.count;
+    NSArray<NSString *> *next = [all subarrayWithRange:NSMakeRange(0, (NSUInteger)n)];
+    cachedAt = now;
+    if (!primed || ![next isEqualToArray:cached]) cached = next;
+    primed = YES;
+    return cached;
 }
 
 // 只认 key_pos_9keys_4_1 且必须挂在可见九键体上；出现两个可见同 id 就放弃，保持原生不猜。
@@ -97,37 +197,88 @@ static void GXKPunctHidePanel(void) {
     if (gPunctPanel) gPunctPanel.hidden = YES;
 }
 
-// 弹层只建一次：10 个 UILabel 常驻，显示/隐藏靠 hidden，避免每次长按都重建视图树。
-static void GXKPunctBuildPanelIfNeeded(void) {
-    if (gPunctPanel) return;
-    NSArray<NSString *> *items = GXKPunctCandidates();
-    UIView *panel = [[UIView alloc] initWithFrame:CGRectZero];
-    panel.backgroundColor = [UIColor colorWithWhite:0.99 alpha:1.0];
-    panel.layer.cornerRadius = 9.0;
-    panel.layer.borderWidth = 1.0 / UIScreen.mainScreen.scale;
-    panel.layer.borderColor = [UIColor colorWithWhite:0.0 alpha:0.12].CGColor;
-    panel.layer.shadowColor = [UIColor blackColor].CGColor;
-    panel.layer.shadowOpacity = 0.16f;
-    panel.layer.shadowRadius = 6.0;
-    panel.layer.shadowOffset = CGSizeMake(0, 2);
-    panel.clipsToBounds = NO;
-    panel.hidden = YES;
+// 配色：皮肤与深浅都跟键盘本体走，和常用语面板同一套采样函数，不读系统外观开关——
+// Gboard 皮肤可以和系统深浅模式不一致，读系统开关会出现「深色皮肤配白底弹层」。
+static void GXKPunctRefreshTheme(void) {
+    UIView *body = (gToolbarNineBody && gToolbarNineBody.window) ? gToolbarNineBody : nil;
+    UIColor *skin = GXKPhraseSkinColor(body);
+    UIColor *native = body ? GXKToolbarTextStyle(body, NULL) : nil;
+    if (![native isKindOfClass:[UIColor class]]) native = nil;
+    BOOL dark = GXKPhrasePrefersDark(body, skin, nil);
+    gPunctSkinColor = skin;
+    gPunctNativeTextColor = native;
+    gPunctDark = dark;
+}
+
+static UIColor *GXKPunctPanelColor(void) {
+    return GXKPhraseBackgroundColor(gPunctSkinColor, gPunctDark);
+}
+
+static UIColor *GXKPunctTextColor(void) {
+    return GXKPhrasePrimaryTextColor(gPunctNativeTextColor, gPunctDark);
+}
+
+// 高亮块：深色皮肤上用白、浅色皮肤上用黑，透明度固定，两种底色下都读得清。
+static UIColor *GXKPunctHighlightColor(void) {
+    return [UIColor colorWithWhite:(gPunctDark ? 1.0 : 0.0) alpha:0.14];
+}
+
+static void GXKPunctApplyTheme(void) {
+    if (!gPunctPanel) return;
+    gPunctPanel.backgroundColor = GXKPunctPanelColor();
+    gPunctPanel.layer.borderColor = GXKPhraseSeparatorColor(gPunctNativeTextColor, gPunctDark).CGColor;
+    gPunctPanel.layer.shadowOpacity = gPunctDark ? 0.45f : 0.16f;
+    for (NSUInteger i = 0; i < gPunctCells.count; i++) {
+        BOOL on = ((NSInteger)i == gPunctIndex);
+        gPunctCells[i].textColor = GXKPunctTextColor();
+        gPunctCells[i].backgroundColor = on ? GXKPunctHighlightColor() : [UIColor clearColor];
+    }
+}
+
+// 符号表或个数变了才重建格子：旧格子在弹层里就地删掉，弹层本身与遮挡登记都不重建。
+static void GXKPunctSyncCells(NSArray<NSString *> *items) {
+    if (!gPunctPanel || items == gPunctSymbolsInUse) return;
+    for (UILabel *cell in gPunctCells) [cell removeFromSuperview];
     NSMutableArray<UILabel *> *cells = [NSMutableArray arrayWithCapacity:items.count];
     for (NSString *ch in items) {
         UILabel *cell = [[UILabel alloc] initWithFrame:CGRectZero];
         cell.text = ch;
         cell.font = [UIFont systemFontOfSize:20.0];
-        cell.textColor = [UIColor darkTextColor];
+        cell.textColor = GXKPunctTextColor();
         cell.textAlignment = NSTextAlignmentCenter;
         cell.layer.cornerRadius = 6.0;
         cell.clipsToBounds = YES;
-        [panel addSubview:cell];
+        [gPunctPanel addSubview:cell];
         [cells addObject:cell];
     }
+    gPunctCells = cells;
+    gPunctSymbolsInUse = items;
+    gPunctIndex = -1;
+}
+
+// 弹层只建一次：格子常驻，显示/隐藏靠 hidden，避免每次长按都重建视图树。
+static void GXKPunctBuildPanelIfNeeded(void) {
+    GXKPunctRefreshTheme();
+    if (gPunctPanel) {
+        GXKPunctSyncCells(GXKPunctCandidates());
+        GXKPunctApplyTheme();
+        return;
+    }
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectZero];
+    panel.layer.cornerRadius = 9.0;
+    panel.layer.borderWidth = 1.0 / UIScreen.mainScreen.scale;
+    panel.layer.shadowColor = [UIColor blackColor].CGColor;
+    panel.layer.shadowRadius = 6.0;
+    panel.layer.shadowOffset = CGSizeMake(0, 2);
+    panel.clipsToBounds = NO;
+    panel.hidden = YES;
     gPunctPanel = panel;
     GXKToolbarOwnViewRegister(panel); // 弹层连同它的格子都不进遮挡表。
-    gPunctCells = cells;
+    gPunctCells = @[];
+    gPunctSymbolsInUse = nil;
     gPunctIndex = -1;
+    GXKPunctSyncCells(GXKPunctCandidates());
+    GXKPunctApplyTheme();
 }
 
 static void GXKPunctHighlight(NSInteger index) {
@@ -135,8 +286,8 @@ static void GXKPunctHighlight(NSInteger index) {
     gPunctIndex = index;
     for (NSUInteger i = 0; i < gPunctCells.count; i++) {
         BOOL on = ((NSInteger)i == index);
-        gPunctCells[i].backgroundColor = on ? [UIColor colorWithWhite:0.0 alpha:0.08] : [UIColor clearColor];
-        gPunctCells[i].textColor = on ? [UIColor blackColor] : [UIColor darkTextColor];
+        gPunctCells[i].backgroundColor = on ? GXKPunctHighlightColor() : [UIColor clearColor];
+        gPunctCells[i].textColor = GXKPunctTextColor();
     }
 }
 

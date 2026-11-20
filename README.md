@@ -88,6 +88,15 @@
 * **换行键上不再有任何诊断**：早先挂在动作键（换行/重输）上的 0.8 秒长按探针整份删除（`dylib/symbol_probe.h` 已移除），普通点击与长按行为完全回到原生。符号页识别本身是生产逻辑（`shouldReturnToPrimeOnKey:` 靠它判断当前在不在符号页），已迁到 `dylib/symbol_doubletap.h` 的 `GXKSymbolFindHost`，只读 `restorationIdentifier` 与可见性，不碰任何键盘内部属性。
 * **回归护栏**：`tests/test_diag.py` 锁住「探针文件不存在且全源无 `GXKProbe`」「符号页判定仍在 `symbol_doubletap.h`」「三处 HUD 入口都先问开关且建视图晚于开关判定」「设置开关走 App Group 且 `synchronize`」。
 
+### 9. 标点长按弹层：跟随键盘配色，符号表可在主 App 里改
+* **是什么**：九键的「，。？！」键长按 0.32 秒（`GXK_PUNCT_HOLD_DELAY`，比原生 0.5s 跟手）弹出一排符号，按住滑到目标松开即上屏，滑出弹层或抬手取消。
+* **配色不再写死**：早先弹层是固定白底黑字，深色皮肤上像贴了一张纸。现在复用常用语面板那套采样——取键盘本体面积最大的不透明底色当面板色、取原生标签文字色当文字色，再按底色亮度定深浅（`GXKPunctRefreshTheme` → `GXKPunctPanelColor`／`GXKPunctTextColor`／`GXKPunctHighlightColor`）。高亮块深色皮肤用白 14%、浅色皮肤用黑 14%，两种底色下都读得清。不读系统外观开关：Gboard 皮肤可以和系统深浅模式不一致。
+* **符号表与个数都能改**：主 App「设置 → Gboard → 标点长按弹层（N 个）」进入编辑器，两个分区——「显示个数」用 `UIStepper` 调 1..10，「符号」逐条增删（`+` 新增、点行改、左滑删），右上角「复位」一键回默认表。默认表是 `，。？！、；：…“”` 十项，未改过设置时弹层与旧版完全一致。
+* **改完立刻生效**：数据存 App Group 的 `GXKPunctSymbols`（字符串数组）与 `GXKPunctCount`（整数），写盘后 `synchronize`。键盘侧 `GXKPunctCandidates()` 按 0.5 秒缓存读取，且**只有内容真的变了才换新对象**——调用方拿指针比较就知道要不要重建格子，不必每帧逐项比对字符串。
+* **格子按需重建**：`GXKPunctBuildPanelIfNeeded` 先刷配色，弹层已存在就只 `GXKPunctSyncCells`（符号表指针没变直接 return）＋ `GXKPunctApplyTheme`；弹层本身、手势与遮挡登记都不重建。弹层连同格子登记进 `GXKToolbarOwnViewRegister`，不会被工具条当成原生遮挡物。
+* **上限 10 格的理由**：375pt 宽键盘按 10 格均分后单格仍有 37pt，再往上单格窄于 34pt 就会开始误触。
+* **回归护栏**：`tests/test_punct_settings.py` 锁住「默认表十项且顺序不变」「非正数回退全显示、超过上限截到上限」「读的是 App Group 且写盘 `synchronize`」「符号表没变不重建格子」「编辑器走全屏 modal 不 push」「设置行按 key 认、不被常用语行吞掉」「弹层配色取自键盘皮肤而非系统外观」。
+
 ---
 
 ## 📐 开发规范与架构红线 (Development Standards)
@@ -126,15 +135,20 @@
 ```
 gboard-ntr/
 ├── dylib/
-│   ├── gkx.m                      # 核心注入源码：万象词库部署 + 九键重输/换行按键管理
+│   ├── gkx.m                      # 核心注入源码：词库部署、按键管理、工具栏、常用语与标点设置入口
+│   ├── native_key_style.h         # 原生按键字体与文字色采样
 │   ├── punct_diag.h               # 标点诊断 HUD（默认关，主 App 设置里开）
-│   └── symbol_doubletap.h         # 符号页双击/停留判定
+│   ├── punct_popup.h              # 标点长按弹层：符号表、配色与布局
+│   ├── symbol_doubletap.h         # 符号页双击/停留判定
+│   ├── toolbar_layout.h           # 工具栏几何：G 图标锚点、条带高度与对齐
+│   └── toolbar_visibility.h       # 工具栏显隐与遮挡登记（含自家视图豁免）
 ├── .github/workflows/
 │   └── build-dylib.yml            # CI 编译流：macOS-15 runner，原生 clang arm64 + ldid 伪签名
 ├── tools/
 │   ├── inject.py                  # 纯 Python Mach-O 注入、App Group 原地改写与 Unix 权限打包
 │   ├── dict_converter.py          # 词库转换器：清洗万象 YAML/文本，精选 6 万词生成紧凑 Protobuf
 │   └── inspect_signed.py          # 只读元数据自检工具：校验 Mach-O、依赖链与权限
+├── tests/                         # 源码契约测试（python -m unittest discover -s tests）
 ├── dist/                          # 构建产物与词库生成目录
 │   ├── user_dictionary.db         # 转换生成的紧凑万象词库 (1.61 MB)
 │   ├── libgkx.dylib               # CI 编译产物

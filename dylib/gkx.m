@@ -1863,6 +1863,7 @@ static void GXKInsertPhraseText(NSString *text) {
 
 // 编辑入口：键盘面板右上角「编辑」与主 App 设置主菜单里的「常用语」共用这一个函数。
 static void GXKPresentPhrasesEditor(UIViewController *from);
+static void GXKPresentPunctEditor(UIViewController *from, id collectionView, id indexPath);
 
 @interface GXKPhrasesPanel : UIView <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *table;
@@ -2240,6 +2241,7 @@ static void GXKInstallPhrasesHooks(void) {
 // 复制一行原生条目（沿用它的 type / settingID，渲染与原生完全一致），只换标题与 key。
 static NSString *const GXKPhrasesRowKey = @"GXKPhrasesRow";
 static NSString *const GXKDiagRowKey = @"GXKDiagRow";
+static NSString *const GXKPunctRowKey = @"GXKPunctRow";
 static NSString *const GXKDiagLogKey = @"GXKDiagLogEnabled";
 
 // 这些类在 dylib 里没有头文件，一律用 objc_msgSend 显式取，避免编译器按静态类型挑方法。
@@ -2288,10 +2290,11 @@ static id GXKPhrasesRowTemplate(NSArray *sections, id *outSection) {
     return fallback;
 }
 
-// 我们自己的行：常用语与诊断日志。两者共用同一套复制原生行的注入方式。
+// 我们自己的行：常用语、诊断日志、标点弹层。三者共用同一套复制原生行的注入方式。
 static BOOL GXKKeyIsOurs(NSString *key) {
     if (!key) return NO;
-    return [key isEqualToString:GXKPhrasesRowKey] || [key isEqualToString:GXKDiagRowKey];
+    return [key isEqualToString:GXKPhrasesRowKey] || [key isEqualToString:GXKDiagRowKey] ||
+           [key isEqualToString:GXKPunctRowKey];
 }
 
 static BOOL GXKSettingsRowIsOurs(id row) {
@@ -2328,6 +2331,27 @@ static NSString *GXKDiagRowTitle(void) {
     return GXKDiagLogOn() ? @"诊断日志（开）" : @"诊断日志（关）";
 }
 
+// 标题带状态：不点进去也能看出弹层现在几格。
+static NSString *GXKPunctRowTitle(void) {
+    return [NSString stringWithFormat:@"标点长按弹层（%lu 个）", (unsigned long)GXKPunctCandidates().count];
+}
+
+static id GXKPunctSettingsRow(id template) {
+    Class itemClass = NSClassFromString(@"GKBSettingsItem");
+    if (!itemClass || !template) return nil;
+    long long type = 0;
+    long long settingID = 0;
+    if ([template respondsToSelector:@selector(type)]) {
+        type = ((long long (*)(id, SEL))objc_msgSend)(template, @selector(type));
+    }
+    if ([template respondsToSelector:@selector(settingID)]) {
+        settingID = ((long long (*)(id, SEL))objc_msgSend)(template, @selector(settingID));
+    }
+    return ((id (*)(id, SEL, long long, long long, id, id, id))objc_msgSend)(
+        [itemClass alloc], @selector(initWithType:settingID:title:accessibilityIdentifier:key:),
+        type, settingID, GXKPunctRowTitle(), @"gxk_punct_row", GXKPunctRowKey);
+}
+
 // 幂等：descriptor 每次打开设置都会重新生成，所以每次调用都检查一遍。
 static id GXKDiagSettingsRow(id template) {
     Class itemClass = NSClassFromString(@"GKBSettingsItem");
@@ -2356,36 +2380,42 @@ static void GXKInjectPhrasesRow(id descriptor) {
     }
     NSArray *rows = GXKRowsOf(targetSection);
     if (!rows) return;
-    NSMutableArray *newRows = [NSMutableArray arrayWithCapacity:rows.count + 2];
+    NSMutableArray *newRows = [NSMutableArray arrayWithCapacity:rows.count + 3];
     NSUInteger insertAt = rows.count;
     BOOL hasPhrases = NO;
     BOOL hasDiag = NO;
+    BOOL hasPunct = NO;
     for (NSUInteger i = 0; i < rows.count; i++) {
         id row = rows[i];
         NSString *key = GXKKeyOf(row);
         if (GXKSettingsRowIsOurs(row)) {
             if ([key isEqualToString:GXKPhrasesRowKey]) hasPhrases = YES;
             if ([key isEqualToString:GXKDiagRowKey]) hasDiag = YES;
+            if ([key isEqualToString:GXKPunctRowKey]) hasPunct = YES;
         }
         [newRows addObject:row];
         if (row == template) insertAt = i + 1;
     }
-    NSMutableArray *ours = [NSMutableArray arrayWithCapacity:2];
+    NSMutableArray *ours = [NSMutableArray arrayWithCapacity:3];
     if (!hasPhrases) {
         id row = GXKPhrasesSettingsRow(template);
+        if (row) [ours addObject:row];
+    }
+    if (!hasPunct) {
+        id row = GXKPunctSettingsRow(template);
         if (row) [ours addObject:row];
     }
     if (!hasDiag) {
         id row = GXKDiagSettingsRow(template);
         if (row) [ours addObject:row];
     }
-    if (ours.count == 0) return; // 两行都在，不用改 descriptor。
+    if (ours.count == 0) return; // 三行都在，不用改 descriptor。
     if (insertAt > newRows.count) insertAt = newRows.count;
     [newRows insertObjects:ours atIndexes:[NSIndexSet indexSetWithIndexesInRange:
         NSMakeRange(insertAt, ours.count)]];
     if (![targetSection respondsToSelector:@selector(setRows:)]) return;
     ((void (*)(id, SEL, id))objc_msgSend)(targetSection, @selector(setRows:), newRows);
-    GXK_LOG(@"[*] 设置主菜单已插入 %lu 行（常用语/诊断日志）", (unsigned long)ours.count);
+    GXK_LOG(@"[*] 设置主菜单已插入 %lu 行（常用语/标点弹层/诊断日志）", (unsigned long)ours.count);
 }
 
 static id gxk_settingsMainMenu(id self, SEL _cmd) {
@@ -2464,19 +2494,18 @@ static BOOL GXKIsDiagRowSelected(id self, id collectionView, id indexPath) {
 // 内部结构，因为上屏的 descriptor 可能是 mainMenuPageDescriptor 的副本。
 static BOOL GXKIsPhrasesRowSelected(id self, id collectionView, id indexPath) {
     if (![indexPath isKindOfClass:[NSIndexPath class]]) return NO;
-    if ([self respondsToSelector:@selector(pageDescriptor)]) {
-        id descriptor = ((id (*)(id, SEL))objc_msgSend)(self, @selector(pageDescriptor));
-        NSArray *sections = GXKSectionsOf(descriptor);
-        NSInteger section = ((NSInteger (*)(id, SEL))objc_msgSend)(indexPath, @selector(section));
-        NSInteger row = ((NSInteger (*)(id, SEL))objc_msgSend)(indexPath, @selector(row));
-        if (sections && section >= 0 && (NSUInteger)section < sections.count) {
-            NSArray *rows = GXKRowsOf(sections[(NSUInteger)section]);
-            if (rows && row >= 0 && (NSUInteger)row < rows.count) {
-                if (GXKSettingsRowIsOurs(rows[(NSUInteger)row])) return YES;
-            }
-        }
-    }
+    id row = GXKDescriptorRowAt(self, indexPath);
+    NSString *key = GXKKeyOf(row);
+    // 只认「常用语」这一行：GXKSettingsRowIsOurs 把诊断日志、标点弹层也算作自家行，
+    // 直接拿它判会把那两行一起吞进常用语编辑器。
+    if (GXKSettingsRowIsOurs(row) && [key isEqualToString:GXKPhrasesRowKey]) return YES;
+    if (key) return NO; // 行对象认得出来但不是我们这一行，不必再看文字。
     return GXKCellShowsPhrasesTitle(collectionView, indexPath);
+}
+
+// 「标点长按弹层」那一行：只按 key 认，没有文字兜底（标题里带数字，逐字比对不划算）。
+static BOOL GXKIsPunctRowSelected(id self, id collectionView, id indexPath) {
+    return [GXKKeyOf(GXKDescriptorRowAt(self, indexPath)) isEqualToString:GXKPunctRowKey];
 }
 
 static void gxk_settingsPageDidSelect(id self, SEL _cmd, id collectionView, id indexPath) {
@@ -2487,6 +2516,16 @@ static void gxk_settingsPageDidSelect(id self, SEL _cmd, id collectionView, id i
         }
         if ([self isKindOfClass:[UIViewController class]]) {
             GXKPresentPhrasesEditor((UIViewController *)self);
+        }
+        return;
+    }
+    if (GXKIsPunctRowSelected(self, collectionView, indexPath)) {
+        if ([collectionView respondsToSelector:@selector(deselectItemAtIndexPath:animated:)]) {
+            ((void (*)(id, SEL, id, BOOL))objc_msgSend)(
+                collectionView, @selector(deselectItemAtIndexPath:animated:), indexPath, NO);
+        }
+        if ([self isKindOfClass:[UIViewController class]]) {
+            GXKPresentPunctEditor((UIViewController *)self, collectionView, indexPath);
         }
         return;
     }
@@ -2718,6 +2757,265 @@ static void GXKPresentPhrasesEditor(UIViewController *from) {
     wrapper.modalPresentationStyle = UIModalPresentationFullScreen;
     [host presentViewController:wrapper animated:YES completion:nil];
     GXK_LOG(@"[*] 常用语编辑器已弹出");
+}
+
+#pragma mark - 主 App：标点长按弹层设置（符号与个数）
+
+// 设置页：上半是「显示个数」的加减，下半是可编辑的符号表（增/删/改/复位）。
+// 一律走 App Group，键盘扩展 0.5 秒内跟上，不需要重启键盘。
+@interface GXKPunctEditorController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) UITableView *table;
+@property (nonatomic, strong) NSMutableArray<NSString *> *symbols;
+@property (nonatomic, assign) NSInteger count;
+@property (nonatomic, assign) BOOL dismissable;
+@property (nonatomic, assign) BOOL darkAppearance;
+@property (nonatomic, strong) UIColor *nativeTextColor;
+@end
+
+@implementation GXKPunctEditorController
+
+- (instancetype)init {
+    self = [super initWithNibName:nil bundle:nil];
+    if (!self) return nil;
+    self.title = @"标点长按弹层";
+    _symbols = [GXKPunctSymbols() mutableCopy];
+    _count = GXKPunctSymbolCount();
+    if (_count > (NSInteger)_symbols.count) _count = (NSInteger)_symbols.count;
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = GXKPhraseBackgroundColor(nil, NO);
+    UITableView *table = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleGrouped];
+    table.dataSource = self;
+    table.delegate = self;
+    table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    table.backgroundColor = [UIColor clearColor];
+    table.separatorColor = GXKPhraseSeparatorColor(nil, NO);
+    [self.view addSubview:table];
+    self.table = table;
+    UIBarButtonItem *add =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
+                                                      target:self
+                                                      action:@selector(onAdd:)];
+    UIBarButtonItem *reset = [[UIBarButtonItem alloc] initWithTitle:@"复位"
+                                                              style:UIBarButtonItemStylePlain
+                                                             target:self
+                                                             action:@selector(onReset:)];
+    self.navigationItem.rightBarButtonItems = @[reset, add];
+    if (self.dismissable) {
+        self.navigationItem.leftBarButtonItem =
+            [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                          target:self
+                                                          action:@selector(onDone:)];
+    }
+    [self gxkApplyAppearance];
+}
+
+- (void)gxkApplyAppearance {
+    UIView *body = (gToolbarNineBody && gToolbarNineBody.window) ? gToolbarNineBody : nil;
+    UIColor *skin = GXKPhraseSkinColor(body);
+    UIColor *native = body ? GXKToolbarTextStyle(body, NULL) : nil;
+    if (![native isKindOfClass:[UIColor class]]) native = nil;
+    BOOL dark = GXKPhrasePrefersDark(body, skin, self.traitCollection);
+    self.darkAppearance = dark;
+    self.nativeTextColor = native;
+    self.view.backgroundColor = GXKPhraseBackgroundColor(skin, dark);
+    self.table.separatorColor = GXKPhraseSeparatorColor(native, dark);
+    [self.table reloadData];
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    [self gxkApplyAppearance];
+}
+
+- (void)onDone:(id)sender {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onReset:(id)sender {
+    GXKPunctResetSettings();
+    self.symbols = [GXKPunctDefaultSymbols() mutableCopy];
+    self.count = (NSInteger)self.symbols.count;
+    [self.table reloadData];
+    GXK_LOG(@"[*] 标点弹层已复位为默认符号表");
+}
+
+// 写盘后再刷新：先落 App Group，键盘侧下一次长按就是新表。
+- (void)gxkPersist {
+    GXKPunctSaveSettings(self.symbols, self.count);
+    [self.table reloadData];
+}
+
+- (void)onAdd:(id)sender {
+    if (self.symbols.count >= GXK_PUNCT_MAX_SYMBOLS) {
+        [self gxkToast:[NSString stringWithFormat:@"最多 %d 个符号", GXK_PUNCT_MAX_SYMBOLS]];
+        return;
+    }
+    __weak GXKPunctEditorController *weakSelf = self;
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"新增符号"
+                                            message:@"可以是一个或多个字符"
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = @"例如：～";
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"保存"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        NSString *text = alert.textFields.firstObject.text;
+        if (text.length == 0) return;
+        [weakSelf.symbols addObject:text];
+        if (weakSelf.count < (NSInteger)weakSelf.symbols.count) weakSelf.count++;
+        [weakSelf gxkPersist];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)gxkEditAtRow:(NSInteger)row {
+    if (row < 0 || row >= (NSInteger)self.symbols.count) return;
+    __weak GXKPunctEditorController *weakSelf = self;
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"修改符号"
+                                            message:nil
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.text = weakSelf.symbols[(NSUInteger)row];
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"保存"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        NSString *text = alert.textFields.firstObject.text;
+        if (text.length == 0) return;
+        [weakSelf.symbols replaceObjectAtIndex:(NSUInteger)row withObject:text];
+        [weakSelf gxkPersist];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)gxkStepCount:(NSInteger)delta {
+    NSInteger next = self.count + delta;
+    if (next < 1) next = 1;
+    if (next > (NSInteger)self.symbols.count) next = (NSInteger)self.symbols.count;
+    if (next == self.count) return;
+    self.count = next;
+    [self gxkPersist];
+}
+
+- (void)gxkToast:(NSString *)text {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:nil
+                                                                  message:text
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - UITableViewDataSource
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return 2;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return section == 0 ? 1 : (NSInteger)self.symbols.count;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    return section == 0 ? @"显示个数" : @"符号（从上到下即弹层从左到右）";
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (section == 0) return @"只显示符号表的前 N 个；改动后键盘下次长按生效。";
+    return [NSString stringWithFormat:@"最多 %d 个；左滑删除，点一行修改。", GXK_PUNCT_MAX_SYMBOLS];
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *const cellID = @"gxk_punct_cell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cellID];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:cellID];
+        cell.backgroundColor = [UIColor clearColor];
+    }
+    UIColor *text = GXKPhrasePrimaryTextColor(self.nativeTextColor, self.darkAppearance);
+    cell.textLabel.textColor = text;
+    cell.detailTextLabel.textColor = GXKPhraseSecondaryTextColor(self.nativeTextColor, self.darkAppearance);
+    if (indexPath.section == 0) {
+        cell.textLabel.text = @"显示个数";
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld", (long)self.count];
+        cell.accessoryType = UITableViewCellAccessoryNone;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        UIStepper *stepper = [[UIStepper alloc] init];
+        stepper.minimumValue = 1;
+        stepper.maximumValue = (double)MAX((NSInteger)1, (NSInteger)self.symbols.count);
+        stepper.value = (double)self.count;
+        [stepper addTarget:self action:@selector(onStepper:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = stepper;
+        return cell;
+    }
+    cell.textLabel.text = self.symbols[(NSUInteger)indexPath.row];
+    BOOL shown = indexPath.row < self.count;
+    cell.detailTextLabel.text = shown ? @"显示" : @"隐藏";
+    cell.accessoryType = UITableViewCellAccessoryNone;
+    cell.accessoryView = nil;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    return cell;
+}
+
+- (void)onStepper:(UIStepper *)stepper {
+    NSInteger next = (NSInteger)stepper.value;
+    if (next < 1) next = 1;
+    if (next > (NSInteger)self.symbols.count) next = (NSInteger)self.symbols.count;
+    self.count = next;
+    [self gxkPersist];
+}
+
+#pragma mark - UITableViewDelegate
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:NO];
+    if (indexPath.section == 0) return;
+    [self gxkEditAtRow:indexPath.row];
+}
+
+- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
+    return indexPath.section == 1;
+}
+
+- (void)tableView:(UITableView *)tableView
+    commitEditingStyle:(UITableViewCellEditingStyle)editingStyle
+     forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (editingStyle != UITableViewCellEditingStyleDelete) return;
+    if (indexPath.section != 1) return;
+    if (indexPath.row < 0 || indexPath.row >= (NSInteger)self.symbols.count) return;
+    [self.symbols removeObjectAtIndex:(NSUInteger)indexPath.row];
+    if (self.count > (NSInteger)self.symbols.count) self.count = (NSInteger)self.symbols.count;
+    if (self.count < 1) self.count = 1;
+    [self gxkPersist];
+}
+
+@end
+
+static void GXKPresentPunctEditor(UIViewController *from, id collectionView, id indexPath) {
+    if (!from) return;
+    // 标题里带当前格数，改完就地刷新，不用重开设置页。
+    id row = GXKDescriptorRowAt(from, indexPath);
+    if ([row respondsToSelector:@selector(setTitle:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(row, @selector(setTitle:), GXKPunctRowTitle());
+    }
+    UIViewController *host = from;
+    while (host.presentedViewController && host.presentedViewController != host) {
+        host = host.presentedViewController;
+    }
+    GXKPunctEditorController *editor = [[GXKPunctEditorController alloc] init];
+    editor.dismissable = YES;
+    UINavigationController *wrapper = [[UINavigationController alloc] initWithRootViewController:editor];
+    wrapper.modalPresentationStyle = UIModalPresentationFullScreen;
+    [host presentViewController:wrapper animated:YES completion:nil];
+    GXK_LOG(@"[*] 标点弹层设置已弹出");
 }
 
 #pragma mark - 隐私上报拦截 (只掐 clearcut 与 Breakpad 上报)
