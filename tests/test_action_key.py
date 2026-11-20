@@ -220,6 +220,41 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("label.font ?: GXKNativeKeyFont(body, root)", toolbar)
         self.assertNotIn("arrayWithObject:", toolbar)
 
+    def test_native_icon_write_guard_clears_only_the_bound_key_in_the_same_pass(self):
+        """原生 updateView 写完的同一轮清前景，否则下一拍清除前会闪一帧圆圈。"""
+        guard = function_body(self.source, "static id gxk_key_updateView(id self, SEL _cmd) {")
+        # 先透传原实现并原样回传它的返回值，不改变原生语义。
+        self.assertIn("id result = gOrigKeyUpdateView ? gOrigKeyUpdateView(self, _cmd) : nil;", guard)
+        self.assertGreaterEqual(guard.count("return result;"), 6, "every early exit must forward the native result")
+        # 只处理已绑定的那一个键；未绑定的键必须保留原生前景，否则新布局绑不上。
+        self.assertIn("key != gEmojiSoftKeyView", guard)
+        self.assertIn("icon != gActionNativeIcon", guard)
+        # 原生重画的图要先存档再清，撤键时才还原得回来。
+        self.assertLess(guard.index("gActionNormalImage = icon.image"), guard.index("icon.image = nil"))
+        self.assertLess(guard.index("gActionHighlightedImage = icon.highlightedImage"),
+                        guard.index("icon.highlightedImage = nil"))
+        # 不碰键帽外观：不隐藏、不透明、不改背景层。
+        for retired in ("hidden", "alpha", "backgroundLayer", "backgroundColor", "cornerRadius"):
+            self.assertNotIn(retired, guard)
+
+        install = function_body(self.source, "static void GXKInstallIconWriteGuard(void) {")
+        self.assertIn("if (gxk_icon_guard_hooked) return;", install)
+        self.assertIn('NSClassFromString(@"GKBSoftKeyView")', install)
+        self.assertIn("class_getInstanceMethod(cls, @selector(updateView))", install)
+        self.assertIn("method_getImplementation(m)", install)
+        self.assertIn("method_setImplementation(m, (IMP)gxk_key_updateView)", install)
+        self.assertIn("gxk_icon_guard_hooked = YES;", install)
+
+        # 构造期先挂，类晚加载时 viewWillAppear 补挂。
+        init = function_body(self.source, "static void gkx_init(void)")
+        self.assertIn("GXKInstallIconWriteGuard();", init)
+        self.assertLess(init.index("GXKInstallIconWriteGuard();"),
+                        init.index("GXKApplyTelemetryBlockIfNeeded()"))
+        appear = function_body(self.source, "static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated)")
+        self.assertIn("GXKInstallIconWriteGuard();", appear)
+        self.assertLess(appear.index("GXKSymbolInstallHooks()"),
+                        appear.index("GXKInstallIconWriteGuard();"))
+
     def test_native_typography_owner_is_return_key_dictionary_label_not_candidate(self):
         label = function_body(self.native_style, "static UILabel *GXKNativeReturnLabel(")
         for required in ('key.restorationIdentifier isEqualToString:@"key_pos_9keys_return"',

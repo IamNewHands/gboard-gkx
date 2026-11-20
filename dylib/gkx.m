@@ -510,6 +510,50 @@ static BOOL GXKModelHasNativeActions(id model) {
     return [actions isKindOfClass:[NSArray class]] && actions.count > 0;
 }
 
+#pragma mark - 原生笑脸图标写入守卫
+
+// 原生 -[GKBSoftKeyView updateView] 每次都会把笑脸（带圆圈）重新写进九键表情键的
+// 前景图层（GKBImageViewWithBackground 的 setImage: 转发到 GKBImageLayer）。
+// 我们的清除发生在下一拍轮询/布局里，中间那一段就是用户看到的圆圈闪烁。
+// 这里在原生写完的同一轮立刻把前景搬走，帧提交前图层已经是空的：
+// 不改 alpha/hidden/背景，不碰键帽样式，也不碰其它键。
+static BOOL gxk_icon_guard_hooked = NO;
+// 原实现的返回类型没有可查的签名：按 id 接管并原样回传。原方法若返回 void，
+// 调用方本来就不读这个寄存器；若返回对象，回传的就是原实现自己的值。
+static id (*gOrigKeyUpdateView)(id, SEL);
+
+static id gxk_key_updateView(id self, SEL _cmd) {
+    id result = gOrigKeyUpdateView ? gOrigKeyUpdateView(self, _cmd) : nil;
+    // 没有绑定中的覆盖按钮就完全交给原生：26键、绑定失败、撤键之后一律不拦。
+    if (!gActionKeyButton || !gCurrentVC || !gCurrentVC.isViewLoaded) return result;
+    UIView *key = (UIView *)self;
+    // 只处理已绑定的那一个键：未绑定的键保留原生前景，否则新布局会因缺前景绑不上。
+    if (key != gEmojiSoftKeyView || ![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return result;
+    if (key.window != gCurrentVC.view.window) return result;
+    UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(key);
+    if (!icon || icon != gActionNativeIcon) return result;
+    if (!GXKModelHasNativeActions(((id<GXKNativeSoftKeyContent>)key).softKeyDef)) return result;
+    // 原生这一轮重画的图先存档再清：撤键时仍能按原样还原。
+    if (icon.image) gActionNormalImage = icon.image;
+    if (icon.highlightedImage) gActionHighlightedImage = icon.highlightedImage;
+    // 只清前景两态，背景层与原生键帽保持原样。
+    if (icon.image) icon.image = nil;
+    if (icon.highlightedImage) icon.highlightedImage = nil;
+    return result;
+}
+
+// 类可能晚于构造阶段加载：viewWillAppear 里补挂一次，挂上即置位，不重复接管。
+static void GXKInstallIconWriteGuard(void) {
+    if (gxk_icon_guard_hooked) return;
+    Class cls = NSClassFromString(@"GKBSoftKeyView");
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, @selector(updateView));
+    if (!m) return;
+    gOrigKeyUpdateView = (id (*)(id, SEL))method_getImplementation(m);
+    method_setImplementation(m, (IMP)gxk_key_updateView);
+    gxk_icon_guard_hooked = YES;
+}
+
 #import "native_key_style.h"
 
 static UIFont *GXKNativeActionFont(UIView *key, UIView *root) {
@@ -1296,6 +1340,7 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     GXKInstallPhrasesHooks(); // 常用语分页：同上。
     GXKInstallMainAppHooks(); // 主 App 侧入口（键盘进程里类不存在，自然跳过）。
     GXKSymbolInstallHooks(); // 符号页双击/停留：构造函数时类若未加载，这里补挂。
+    GXKInstallIconWriteGuard(); // 笑脸键写入守卫：同上，类晚加载时补挂。
 
     // 部署外部万象词库
     GXKEnsureUserDictionaryDeployed();
@@ -3135,6 +3180,9 @@ static void gkx_init(void) {
             method_setImplementation(mText, (IMP)gkx_textDidChange);
         }
     }
+
+    // 九键笑脸键：原生写入的同一轮就清掉前景，帧提交前不留圆圈。
+    GXKInstallIconWriteGuard();
 
     // 只掐无意义上报；翻译/YouTube/天气不受影响。
     GXKApplyTelemetryBlockIfNeeded();
