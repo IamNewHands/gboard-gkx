@@ -79,7 +79,7 @@
 * **高频回调合并成最后一次**：`textDidChange` 与 `viewDidLayoutSubviews` 一帧内可能连来几十次。两者都改成「递增序号 + `dispatch_async` + 块内比对序号」，只有最后一次真正刷新，前面排队的直接丢弃；布局回调的同步段不再直接跑任何全量刷新。
 * **扫描热路径类指针缓存**：`NSClassFromString` 原本在 1500 节点的循环里对每个软键都要查一次运行时类表。现在统一走 `GXKClassCached(name, &slot)`，第一次解析成功才写缓存（类晚加载时会自动重试），五个扫描函数体内已无 `NSClassFromString`。
 * **band 结果按邻居签名复用**：`GXKToolbarBand` 的邻居可见性判定要沿父链 `convertRect`，是这条路径上唯一还会每拍重复的工作。现在先算一个只读 `frame/hidden/alpha` 的邻居签名，行尺寸、G 图标位置、装饰数量、签名、代次全都没变就直接返回上次结果；挂载与撤走时自增 `gToolbarBandEpoch` 强制失效。
-* **回归护栏**：`tests/test_perf.py` 锁住上述各条（缓存必须早于 `NSStringFromClass` 返回、扫描必须节流且带尾随、普通打字只补两拍、约束必须先撤后加、触觉闲置释放、钉子不同步、词库只打一份、轮询不挂 CommonModes、高频回调合并到最后一次、热路径类指针缓存、band 邻居签名复用）。
+* **回归护栏**：`tests/test_perf.py` 锁住上述各条（缓存必须早于 `NSStringFromClass` 返回、扫描必须节流且带尾随、普通打字只补两拍、约束必须先撤后加、触觉闲置释放、钉子不同步、词库只打一份、轮询不挂 CommonModes、高频回调合并到最后一次、热路径类指针缓存、band 邻居签名复用、诊断关时不建数组不拼日志、工具条中心未变不失效布局、标点键未换不重挂手势、包内无词库即 settle）。
 
 ### 8. 诊断日志：默认关，只有手动打开才存在
 * **屏幕上默认什么都没有**：标点键的诊断 HUD（左上角小胶囊）只在开关打开时才建视图。关着时 `GXKPunctDiagAttachHud` 直接返回，不 `alloc` 任何 `UILabel`、不 `addSubview`；之前建过的也会 `removeFromSuperview`。环形缓冲同样不写——`GXKPunctDiagLog` 在展开参数之前就 `return`，关着时连字符串都不拼。
