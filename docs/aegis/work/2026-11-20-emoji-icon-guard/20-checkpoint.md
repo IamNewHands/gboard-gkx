@@ -21,3 +21,10 @@
 - 产物：`dist/gboard-ntr-1.0-unsigned.ipa` 35980290 bytes，SHA256 `11df7f9fa60bee2a0057c590381f0cec164a9bc9c624c7d60196591cb1118ccc`；验包 CRC OK、2050 条目、新增 dylib 与词库（1688094 bytes）、移除 3 个 CodeResources、包内 dylib 与 CI 产物同哈希。
 - 教训：从二进制方法表解类型编码，不要凭「取不到编码串」推断签名；包装未知签名方法一律先校验。
 
+## 切页仍闪一帧的二次修复（2026-11-20，同批次）
+
+- 现场：11df7f9f 包不闪退，但九键「拼音」↔「符号」反复切页时换行键仍闪一帧笑脸。
+- 根因：首版守卫判据是对象同一性（`key != gEmojiSoftKeyView`、`icon != gActionNativeIcon`）且入口先看 `!gActionKeyButton`。切页那一拍原生对旧布局调 `updateView`，此时按钮已被 detach 摘掉、icon 已被原生重建，两条都放行 → 笑脸提交一帧。
+- 修复：新增 `static __weak UIView *gGuardKey` 作归属；绑定建立时赋值，撤键时先清空再调还原用的原生 `updateView`；守卫改判「归属键 + emoji id + 九键 body + 同 window + 有原生 action」，图标每次现取。
+- 回归：tests 10 文件全 OK；test_action_key 26 项，新增断言锁定「判据不得引用按钮/图标同一性」「图标先现取再清空」「gGuardKey = nil 先于原生 updateView」。
+

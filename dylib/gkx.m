@@ -44,6 +44,8 @@ static NSString *const GXKEmojiKeyID = @"key_pos_9keys_emoji";
 
 static __weak UIViewController *gCurrentVC;
 static __weak UIView *gEmojiSoftKeyView;
+// 守卫归属：绑定期间指向我们接管的九键表情键；撤键结束即清空，未绑定的键保持原生。
+static __weak UIView *gGuardKey;
 static __weak UIView<GXKNativeIconContent> *gActionNativeIcon;
 static UIImage *gActionNormalImage;
 static UIImage *gActionHighlightedImage;
@@ -524,14 +526,17 @@ static void (*gOrigKeyUpdateView)(id, SEL);
 
 static void gxk_key_updateView(id self, SEL _cmd) {
     if (gOrigKeyUpdateView) gOrigKeyUpdateView(self, _cmd);
-    // 没有绑定中的覆盖按钮就完全交给原生：26键、绑定失败、撤键之后一律不拦。
-    if (!gActionKeyButton || !gCurrentVC || !gCurrentVC.isViewLoaded) return;
+    // 没有归属中的键就完全交给原生：26键、绑定失败、撤键之后一律不拦。
+    if (!gCurrentVC || !gCurrentVC.isViewLoaded) return;
     UIView *key = (UIView *)self;
-    // 只处理已绑定的那一个键：未绑定的键保留原生前景，否则新布局会因缺前景绑不上。
-    if (key != gEmojiSoftKeyView || ![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return;
+    // 判据不能挂在按钮或图标对象的同一性上：切页这一拍原生会重建 icon，
+    // 甚至 GXKDetachActionKey 已把按钮撤走，两种情况下旧判据都放行、笑脸照原样提交一帧。
+    // 改为按「这把键此刻是不是我们归属的九键表情键」判定，图标每次现取。
+    if (key != gGuardKey || ![key.restorationIdentifier isEqualToString:GXKEmojiKeyID]) return;
+    if (!GXKNineKeyBodyForKey(key, gCurrentVC.view)) return;
     if (key.window != gCurrentVC.view.window) return;
     UIView<GXKNativeIconContent> *icon = GXKNativeIconForKey(key);
-    if (!icon || icon != gActionNativeIcon) return;
+    if (!icon) return;
     if (!GXKModelHasNativeActions(((id<GXKNativeSoftKeyContent>)key).softKeyDef)) return;
     // 原生这一轮重画的图先存档再清：撤键时仍能按原样还原。
     if (icon.image) gActionNormalImage = icon.image;
@@ -583,6 +588,9 @@ static void GXKDetachActionKey(void) {
     gActionHost = nil;
     gActionKeyButton = nil;
     [oldButton removeFromSuperview];
+    // 归属先释放再调原生 updateView：这次重画是「还原」，守卫不能再把图搬走，
+    // 否则本地存档为空时键会停在无前景状态。
+    gGuardKey = nil;
     if (oldKey && [oldKey respondsToSelector:@selector(updateView)]) {
         // 原生updateView还会应用viewAttributes并setHidden:NO，保留宿主现有隐藏状态。
         BOOL wasHidden = oldKey.isHidden;
@@ -1223,6 +1231,7 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         btn.autoresizingMask = UIViewAutoresizingNone; // 每帧按currentKey换算frame，不随父视图拉伸。
         [btn addTarget:gActionTarget action:@selector(onActionKeyTapped:) forControlEvents:UIControlEventTouchUpInside];
         gEmojiSoftKeyView = currentKey;
+        gGuardKey = currentKey; // 守卫归属随绑定建立，切页重建图标后仍认这把键。
         gActionNativeIcon = icon;
         gActionSoftKeyDef = model;
         gActionHost = host;

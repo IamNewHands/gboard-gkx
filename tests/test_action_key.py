@@ -142,6 +142,11 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("GXKNativeIconForKey(oldKey) == oldIcon", detach)
         self.assertIn("oldKey.hidden = wasHidden", detach)
         self.assertIn("gActionNormalImage = nil", detach)
+        # 归属只活到撤键结束：撤键后这把键完全回到原生，守卫不再清它的前景。
+        # 且必须先释放归属再调原生 updateView——那次重画是还原，不能被守卫再搬走一次。
+        self.assertIn("gGuardKey = nil", detach)
+        self.assertLess(detach.index("gGuardKey = nil"),
+                        detach.index("[(id<GXKNativeSoftKeyContent>)oldKey updateView]"))
         self.assertIn("gActionHighlightedImage = nil", detach)
 
     def test_rebinding_creates_fresh_button_after_detaching(self):
@@ -228,9 +233,15 @@ class ActionKeySourceContracts(unittest.TestCase):
         self.assertIn("static void (*gOrigKeyUpdateView)(id, SEL);", self.source)
         self.assertNotIn("return result;", guard)
         self.assertIn("if (gOrigKeyUpdateView) gOrigKeyUpdateView(self, _cmd);", guard)
-        # 只处理已绑定的那一个键；未绑定的键必须保留原生前景，否则新布局绑不上。
-        self.assertIn("key != gEmojiSoftKeyView", guard)
-        self.assertIn("icon != gActionNativeIcon", guard)
+        # 判据挂在「归属的九键表情键」上，不能挂按钮/图标对象同一性：切页这一拍原生会
+        # 重建 icon，detach 又会先把按钮撤走，旧判据在这两种情况下都放行、笑脸照原样提交一帧。
+        self.assertIn("key != gGuardKey", guard)
+        self.assertIn("GXKNineKeyBodyForKey(key, gCurrentVC.view)", guard)
+        self.assertNotIn("key != gEmojiSoftKeyView", guard)
+        self.assertNotIn("icon != gActionNativeIcon", guard)
+        self.assertNotIn("!gActionKeyButton", guard)
+        # 图标必须每次现取：守卫里缓存的那一个在切页后已经不是图层上的那一个。
+        self.assertLess(guard.index("GXKNativeIconForKey(key)"), guard.index("icon.image = nil"))
         # 原生重画的图要先存档再清，撤键时才还原得回来。
         self.assertLess(guard.index("gActionNormalImage = icon.image"), guard.index("icon.image = nil"))
         self.assertLess(guard.index("gActionHighlightedImage = icon.highlightedImage"),

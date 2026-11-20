@@ -18,3 +18,12 @@
 - 独立验包：ZIP CRC OK；条目 2050（原 3633，原包含大量目录条目）；新增 `Frameworks/libgkx.dylib` 与 `Frameworks/user_dictionary.db`；移除 3 个 `_CodeSignature/CodeResources`；变更仅 `gboard_framework`、主 `Gboard`、`Gboard.appex/Gboard`；其余 2045 个原生文件 SHA256 逐字节相同；包内 dylib SHA256 与 CI artifact 一致。
 - 加载命令：主 exe ncmds=50 各 1 条 `@rpath/libgkx.dylib`、rpath `@executable_path/Frameworks`；appex ncmds=48、rpath `@executable_path/../../Frameworks`；框架 8 处 app group 已改写为 `group.zunbengege.top`。
 - 未覆盖：本机无 iOS clang/SDK，未做本地编译；未在真机上安装。闪烁是否消失、切页与 9↔26 切换、滑行输入是否回归均需用户自签后验收。
+
+## 2026-11-20 切页仍闪一帧（二次修复）
+
+- 现场：装 11df7f9f 包后不再闪退，但九键下反复点「拼音」↔「符号」分页时，换行键上仍闪一下带圆圈的笑脸。
+- 根因：首版守卫的判据挂在对象同一性上（`key != gEmojiSoftKeyView`、`icon != gActionNativeIcon`），且入口先看 `!gActionKeyButton`。切页这一拍原生会对旧布局的 `GKBSoftKeyView` 调 `updateView`：此时 `GXKDetachActionKey` 已把按钮置空、原生又重建了 icon，两条判据都放行 → 笑脸写进图层并提交一帧，下一拍轮询才清。
+- 修复：新增归属引用 `static __weak UIView *gGuardKey`，绑定建立时赋值（gkx.m:1233），撤键时**先于**还原用的原生 `updateView` 清空（gkx.m:589 附近）。守卫判据改为 `key == gGuardKey` + `restorationIdentifier == GXKEmojiKeyID` + `GXKNineKeyBodyForKey(key, gCurrentVC.view)` + 同 window + `GXKModelHasNativeActions`，图标每次 `GXKNativeIconForKey(key)` 现取，不再与按钮或图标对象同一性比较。
+- 撤键顺序的理由：撤键里那次 `updateView` 是「还原」，若归属仍指向该键，守卫会把原生刚写回的图再搬走一次；本地存档为空时键会停在无前景状态。
+- 回归：tests 10 个文件逐个跑全 OK（test_action_key 26 项，新增/改写 4 条断言：判据不得引用 `gEmojiSoftKeyView`／`gActionNativeIcon`／`!gActionKeyButton`、图标须先于清空现取、detach 内 `gGuardKey = nil` 先于原生 updateView）。
+- 未覆盖：仍未真机验收；本机无 iOS clang/SDK。
