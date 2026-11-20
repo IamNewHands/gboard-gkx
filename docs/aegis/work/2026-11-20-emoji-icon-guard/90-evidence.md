@@ -27,3 +27,11 @@
 - 撤键顺序的理由：撤键里那次 `updateView` 是「还原」，若归属仍指向该键，守卫会把原生刚写回的图再搬走一次；本地存档为空时键会停在无前景状态。
 - 回归：tests 10 个文件逐个跑全 OK（test_action_key 26 项，新增/改写 4 条断言：判据不得引用 `gEmojiSoftKeyView`／`gActionNativeIcon`／`!gActionKeyButton`、图标须先于清空现取、detach 内 `gGuardKey = nil` 先于原生 updateView）。
 - 未覆盖：仍未真机验收；本机无 iOS clang/SDK。
+
+## 2026-11-20 发布补做（Release 资产落后）
+
+- 现场：本地 `dist/gboard-ntr-1.0-unsigned.ipa` 三次重打、CI 三次出新 dylib，但 `gh release view v1.0` 的资产一直是 35980290 bytes / SHA `11df7f9f…`，正文也写着旧哈希；用户第二次问「为什么又没发布 release」。
+- 根因：流程缺步，不是操作失误。README 第 3 步止于「本地注入打包」，agent.md 速查止于「校验产物」，两处都没有「上传 Release」。
+- 补做：新增 `tools/publish_release.py`（`gh release upload --clobber` → 置草稿再发布重置 `published_at` → 读回校验 size → 打印固定下载地址与远端 digest）；README 增「4. 发布到 GitHub Release」，agent.md 速查增第 6 步并新增避坑 11。
+- 结果：`v1.0` 资产 35980398 bytes，远端 digest `sha256:0c330dc44d51cdc89e5185b720839ece35f63fd9b7722da19c1c61a5012cd0ee`，`published_at=2026-11-20T12:55:56Z`（原 11:04:15Z），正文 SHA-256 已同步。
+- 注意：`--clobber` 会把旧资产先删再传，网络中断会留下空资产列表（本次即遇到一次，重跑即恢复）；`publish_release.py` 因此带了读回校验。

@@ -148,7 +148,8 @@ gboard-ntr/
 ├── tools/
 │   ├── inject.py                  # 纯 Python Mach-O 注入、App Group 原地改写与 Unix 权限打包
 │   ├── dict_converter.py          # 词库转换器：清洗万象 YAML/文本，精选 6 万词生成紧凑 Protobuf
-│   └── inspect_signed.py          # 只读元数据自检工具：校验 Mach-O、依赖链与权限
+│   ├── inspect_signed.py          # 只读元数据自检工具：校验 Mach-O、依赖链与权限
+│   └── publish_release.py         # 发布到 GitHub Release：覆盖资产、刷新 published_at、读回校验
 ├── tests/                         # 源码契约测试（python -m unittest discover -s tests）
 ├── dist/                          # 构建产物与词库生成目录
 │   ├── user_dictionary.db         # 转换生成的紧凑万象词库 (1.61 MB)
@@ -208,6 +209,26 @@ python tools/inject.py `
 3. 将 `libgkx.dylib` 部署至主 App 的 `Payload/Gboard.app/Frameworks/`（因扩展 `@rpath` 指向主 App）；
 4. 原地改写二进制中 8 处 Google 官方 App Group 为自签描述文件支持的 `group.zunbengege.top`；
 5. 重打包并赋予可执行文件 `0o755` 权限。
+
+### 4. 发布到 GitHub Release（出包后必做，漏了等于没发）
+
+本项目只保留**一条** release（tag `v1.0`），资产名固定为 `gboard-ntr-1.0-unsigned.ipa`，下载地址因此固定：
+
+```
+https://github.com/IamNewHands/gboard-ntr/releases/latest/download/gboard-ntr-1.0-unsigned.ipa
+```
+
+每次出包都是**就地覆盖**这条 release 的资产，不新建 tag、不新建 release：
+
+```powershell
+python tools/publish_release.py --asset dist/gboard-ntr-1.0-unsigned.ipa --repo IamNewHands/gboard-ntr
+```
+
+脚本做四件事：`gh release upload --clobber` 覆盖资产 → 置草稿再发布（把 `published_at` 刷新成这次出包时间，否则页面一直显示 tag 首次发布那天）→ 读回校验资产大小 → 打印固定下载地址与远端 SHA-256。
+
+**验收口径**：`gh release view v1.0 --json publishedAt,assets` 的 `publishedAt` 是刚才的时间，资产 size 与 `dist/` 里的一致，正文里的 SHA-256 是本包哈希。三者任一不符就是没发成。
+
+> 历史坑：本地 `dist/` 已经重新打包、CI 也出了新 dylib，但 Release 页面上还是上一版（资产 SHA 对不上），原因是发布流程里只有「打包」没有「发 Release」这一步。`tools/publish_release.py` 就是补这一步的。
 
 ---
 

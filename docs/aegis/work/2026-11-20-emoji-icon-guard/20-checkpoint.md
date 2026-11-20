@@ -27,4 +27,5 @@
 - 根因：首版守卫判据是对象同一性（`key != gEmojiSoftKeyView`、`icon != gActionNativeIcon`）且入口先看 `!gActionKeyButton`。切页那一拍原生对旧布局调 `updateView`，此时按钮已被 detach 摘掉、icon 已被原生重建，两条都放行 → 笑脸提交一帧。
 - 修复：新增 `static __weak UIView *gGuardKey` 作归属；绑定建立时赋值，撤键时先清空再调还原用的原生 `updateView`；守卫改判「归属键 + emoji id + 九键 body + 同 window + 有原生 action」，图标每次现取。
 - 回归：tests 10 文件全 OK；test_action_key 26 项，新增断言锁定「判据不得引用按钮/图标同一性」「图标先现取再清空」「gGuardKey = nil 先于原生 updateView」。
+- 发布（补做）：本次三包（c86e7cb / 5b6bd55 / 61b8d32）都只重打了 `dist/`，Release 资产一直是旧的，用户两次追问「为什么又没发布 release」。已补 `tools/publish_release.py` 并把「第 6 步 发布」写进 README 与 agent.md 速查。最终 Release：tag `v1.0`，资产 `gboard-ntr-1.0-unsigned.ipa` 35980398 bytes，远端 digest `sha256:0c330dc4…cd0ee`，`published_at` 刷新为 2026-11-20T12:55:56Z，正文 SHA-256 已同步。
 
