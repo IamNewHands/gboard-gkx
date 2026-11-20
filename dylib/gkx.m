@@ -655,7 +655,6 @@ static void GXKFlashTitle(UIButton *button, NSString *text) {
 
 #import "toolbar_layout.h"
 #import "toolbar_visibility.h"
-#import "symbol_probe.h"
 
 // Identified native key owns font; a verified current icon owns neutral theme tint.
 static UIColor *GXKToolbarTextStyle(UIView *body, UIFont **outFont) {
@@ -1169,7 +1168,6 @@ static void GXKUpdateActionKey(UIViewController *vc) {
         btn.titleLabel.minimumScaleFactor = 0.85;
         btn.autoresizingMask = UIViewAutoresizingNone; // 每帧按currentKey换算frame，不随父视图拉伸。
         [btn addTarget:gActionTarget action:@selector(onActionKeyTapped:) forControlEvents:UIControlEventTouchUpInside];
-        GXKProbeAttachLongPress(btn); // [DEBUG-symbol] 0.8s 长按开始/停止采集，普通点击不变。
         gEmojiSoftKeyView = currentKey;
         gActionNativeIcon = icon;
         gActionSoftKeyDef = model;
@@ -1275,7 +1273,6 @@ static void gkx_viewDidLayoutSubviews(id self, SEL _cmd) {
         GXKSymbolNoteLayout();
         // 标点键长按弹层：本帧布局已定稿，键位置才是最终值；每帧至多一次全树定位。
         GXKPunctPopupUpdate(vc);
-        GXKProbeNoteLayout(@"layout"); // [DEBUG-symbol] 只在长按开启探针后记录。
     });
 }
 
@@ -1302,7 +1299,6 @@ static void gkx_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     // 这里只给一小段补帧窗口，窗口走完自动停表。
     GXKBumpPolling(GXK_POLL_BURST);
     GXKUpdateToolbar((UIViewController *)self); // 首帧先尝试挂载，失败即保持原生。
-    GXKProbeNoteLayout(@"appear"); // [DEBUG-symbol]
 }
 
 static void gkx_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
@@ -2238,6 +2234,8 @@ static void GXKInstallPhrasesHooks(void) {
 // 真正上屏的是 GKBSettingsPageViewController。要加一行只能改这份 descriptor：
 // 复制一行原生条目（沿用它的 type / settingID，渲染与原生完全一致），只换标题与 key。
 static NSString *const GXKPhrasesRowKey = @"GXKPhrasesRow";
+static NSString *const GXKDiagRowKey = @"GXKDiagRow";
+static NSString *const GXKDiagLogKey = @"GXKDiagLogEnabled";
 
 // 这些类在 dylib 里没有头文件，一律用 objc_msgSend 显式取，避免编译器按静态类型挑方法。
 static NSArray *GXKSectionsOf(id object) {
@@ -2285,9 +2283,14 @@ static id GXKPhrasesRowTemplate(NSArray *sections, id *outSection) {
     return fallback;
 }
 
+// 我们自己的行：常用语与诊断日志。两者共用同一套复制原生行的注入方式。
+static BOOL GXKKeyIsOurs(NSString *key) {
+    if (!key) return NO;
+    return [key isEqualToString:GXKPhrasesRowKey] || [key isEqualToString:GXKDiagRowKey];
+}
+
 static BOOL GXKSettingsRowIsOurs(id row) {
-    NSString *key = GXKKeyOf(row);
-    return key ? [key isEqualToString:GXKPhrasesRowKey] : NO;
+    return GXKKeyIsOurs(GXKKeyOf(row));
 }
 
 static id GXKPhrasesSettingsRow(id template) {
@@ -2307,7 +2310,36 @@ static id GXKPhrasesSettingsRow(id template) {
     return row;
 }
 
+// 当前开关状态：主 App 与键盘读同一个 App Group 键，默认关。
+static BOOL GXKDiagLogOn(void) {
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+    if (!defaults) defaults = [NSUserDefaults standardUserDefaults];
+    return [defaults boolForKey:GXKDiagLogKey];
+}
+
+// 标题带状态，省得点进去才发现是开是关。原生设置行没有开关控件可用，
+// 所以状态只能写在标题里：打开设置页时现读一次 App Group。
+static NSString *GXKDiagRowTitle(void) {
+    return GXKDiagLogOn() ? @"诊断日志（开）" : @"诊断日志（关）";
+}
+
 // 幂等：descriptor 每次打开设置都会重新生成，所以每次调用都检查一遍。
+static id GXKDiagSettingsRow(id template) {
+    Class itemClass = NSClassFromString(@"GKBSettingsItem");
+    if (!itemClass || !template) return nil;
+    long long type = 0;
+    long long settingID = 0;
+    if ([template respondsToSelector:@selector(type)]) {
+        type = ((long long (*)(id, SEL))objc_msgSend)(template, @selector(type));
+    }
+    if ([template respondsToSelector:@selector(settingID)]) {
+        settingID = ((long long (*)(id, SEL))objc_msgSend)(template, @selector(settingID));
+    }
+    return ((id (*)(id, SEL, long long, long long, id, id, id))objc_msgSend)(
+        [itemClass alloc], @selector(initWithType:settingID:title:accessibilityIdentifier:key:),
+        type, settingID, GXKDiagRowTitle(), @"gxk_diag_row", GXKDiagRowKey);
+}
+
 static void GXKInjectPhrasesRow(id descriptor) {
     NSArray *sections = GXKSectionsOf(descriptor);
     if (sections.count == 0) return;
@@ -2319,21 +2351,36 @@ static void GXKInjectPhrasesRow(id descriptor) {
     }
     NSArray *rows = GXKRowsOf(targetSection);
     if (!rows) return;
-    NSMutableArray *newRows = [NSMutableArray arrayWithCapacity:rows.count + 1];
+    NSMutableArray *newRows = [NSMutableArray arrayWithCapacity:rows.count + 2];
     NSUInteger insertAt = rows.count;
+    BOOL hasPhrases = NO;
+    BOOL hasDiag = NO;
     for (NSUInteger i = 0; i < rows.count; i++) {
         id row = rows[i];
-        if (GXKSettingsRowIsOurs(row)) return; // 已经加过了。
+        NSString *key = GXKKeyOf(row);
+        if (GXKSettingsRowIsOurs(row)) {
+            if ([key isEqualToString:GXKPhrasesRowKey]) hasPhrases = YES;
+            if ([key isEqualToString:GXKDiagRowKey]) hasDiag = YES;
+        }
         [newRows addObject:row];
         if (row == template) insertAt = i + 1;
     }
-    id ours = GXKPhrasesSettingsRow(template);
-    if (!ours) return;
+    NSMutableArray *ours = [NSMutableArray arrayWithCapacity:2];
+    if (!hasPhrases) {
+        id row = GXKPhrasesSettingsRow(template);
+        if (row) [ours addObject:row];
+    }
+    if (!hasDiag) {
+        id row = GXKDiagSettingsRow(template);
+        if (row) [ours addObject:row];
+    }
+    if (ours.count == 0) return; // 两行都在，不用改 descriptor。
     if (insertAt > newRows.count) insertAt = newRows.count;
-    [newRows insertObject:ours atIndex:insertAt];
+    [newRows insertObjects:ours atIndexes:[NSIndexSet indexSetWithIndexesInRange:
+        NSMakeRange(insertAt, ours.count)]];
     if (![targetSection respondsToSelector:@selector(setRows:)]) return;
     ((void (*)(id, SEL, id))objc_msgSend)(targetSection, @selector(setRows:), newRows);
-    GXK_LOG(@"[*] 设置主菜单已插入「常用语」一行");
+    GXK_LOG(@"[*] 设置主菜单已插入 %lu 行（常用语/诊断日志）", (unsigned long)ours.count);
 }
 
 static id gxk_settingsMainMenu(id self, SEL _cmd) {
@@ -2362,6 +2409,50 @@ static BOOL GXKCellShowsPhrasesTitle(id collectionView, id indexPath) {
     id cell = ((id (*)(id, SEL, id))objc_msgSend)(collectionView, @selector(cellForItemAtIndexPath:), indexPath);
     if (![cell isKindOfClass:[UIView class]]) return NO;
     return GXKViewShowsPhrasesTitle((UIView *)cell, 0);
+}
+
+// descriptor 里第 indexPath 行对应的对象；取不到就返回 nil。
+static id GXKDescriptorRowAt(id self, id indexPath) {
+    if (![indexPath isKindOfClass:[NSIndexPath class]]) return nil;
+    if (![self respondsToSelector:@selector(pageDescriptor)]) return nil;
+    id descriptor = ((id (*)(id, SEL))objc_msgSend)(self, @selector(pageDescriptor));
+    NSArray *sections = GXKSectionsOf(descriptor);
+    NSInteger section = ((NSInteger (*)(id, SEL))objc_msgSend)(indexPath, @selector(section));
+    NSInteger row = ((NSInteger (*)(id, SEL))objc_msgSend)(indexPath, @selector(row));
+    if (!sections || section < 0 || (NSUInteger)section >= sections.count) return nil;
+    NSArray *rows = GXKRowsOf(sections[(NSUInteger)section]);
+    if (!rows || row < 0 || (NSUInteger)row >= rows.count) return nil;
+    return rows[(NSUInteger)row];
+}
+
+// 点「诊断日志」那一行：就地翻转 App Group 里的开关，键盘侧半秒内跟上。
+// 键盘扩展里 HUD 只读这个值，所以主 App 关掉之后键盘不需要重启。
+static void GXKToggleDiagLog(id self, id collectionView, id indexPath) {
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+    if (!defaults) defaults = [NSUserDefaults standardUserDefaults];
+    BOOL enabled = ![defaults boolForKey:GXKDiagLogKey];
+    [defaults setBool:enabled forKey:GXKDiagLogKey];
+    [defaults synchronize]; // 跨进程，键盘那边要立刻看见。
+    // 行对象在内存里就地改标题；不支持 setTitle: 就只靠重开设置页生效。
+    id row = GXKDescriptorRowAt(self, indexPath);
+    if ([row respondsToSelector:@selector(setTitle:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(row, @selector(setTitle:), GXKDiagRowTitle());
+    }
+    if ([collectionView respondsToSelector:@selector(deselectItemAtIndexPath:animated:)]) {
+        ((void (*)(id, SEL, id, BOOL))objc_msgSend)(
+            collectionView, @selector(deselectItemAtIndexPath:animated:), indexPath, NO);
+    }
+    if ([collectionView respondsToSelector:@selector(reloadData)]) {
+        ((void (*)(id, SEL))objc_msgSend)(collectionView, @selector(reloadData));
+    }
+    GXK_LOG(@"[*] 诊断日志已%@", enabled ? @"开启" : @"关闭");
+}
+
+// 「诊断日志」那一行是否被点到：只按 key 认，没有文字兜底——
+// 屏幕上不会出现第二格写着这四个字的原生行，认错的风险为零。
+static BOOL GXKIsDiagRowSelected(id self, id collectionView, id indexPath) {
+    NSString *key = GXKKeyOf(GXKDescriptorRowAt(self, indexPath));
+    return [key isEqualToString:GXKDiagRowKey];
 }
 
 // 先认行对象（key 对上），认不出再认屏幕上那格显示的文字——两条路都不依赖 descriptor 的
@@ -2394,6 +2485,10 @@ static void gxk_settingsPageDidSelect(id self, SEL _cmd, id collectionView, id i
         }
         return;
     }
+    if (GXKIsDiagRowSelected(self, collectionView, indexPath)) {
+        GXKToggleDiagLog(self, collectionView, indexPath);
+        return;
+    }
     if (gOrigSettingsPageDidSelect) gOrigSettingsPageDidSelect(self, _cmd, collectionView, indexPath);
 }
 
@@ -2405,7 +2500,7 @@ static void GXKInstallMainAppHooks(void) {
     GXKSwizzleOrSkip(@"GKBSettingsPageViewController", @"collectionView:didSelectItemAtIndexPath:",
                      (IMP)gxk_settingsPageDidSelect, (void **)&gOrigSettingsPageDidSelect);
     gxk_settings_hooked = YES;
-    GXK_LOG(@"[*] 主 App 设置入口已接入（常用语）");
+    GXK_LOG(@"[*] 主 App 设置入口已接入（常用语 + 诊断日志）");
 }
 
 @interface GXKPhrasesEditorController : UIViewController <UITableViewDataSource, UITableViewDelegate>

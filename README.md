@@ -81,6 +81,13 @@
 * **band 结果按邻居签名复用**：`GXKToolbarBand` 的邻居可见性判定要沿父链 `convertRect`，是这条路径上唯一还会每拍重复的工作。现在先算一个只读 `frame/hidden/alpha` 的邻居签名，行尺寸、G 图标位置、装饰数量、签名、代次全都没变就直接返回上次结果；挂载与撤走时自增 `gToolbarBandEpoch` 强制失效。
 * **回归护栏**：`tests/test_perf.py` 锁住上述各条（缓存必须早于 `NSStringFromClass` 返回、扫描必须节流且带尾随、普通打字只补两拍、约束必须先撤后加、触觉闲置释放、钉子不同步、词库只打一份、轮询不挂 CommonModes、高频回调合并到最后一次、热路径类指针缓存、band 邻居签名复用）。
 
+### 8. 诊断日志：默认关，只有手动打开才存在
+* **屏幕上默认什么都没有**：标点键的诊断 HUD（左上角小胶囊）只在开关打开时才建视图。关着时 `GXKPunctDiagAttachHud` 直接返回，不 `alloc` 任何 `UILabel`、不 `addSubview`；之前建过的也会 `removeFromSuperview`。环形缓冲同样不写——`GXKPunctDiagLog` 在展开参数之前就 `return`，关着时连字符串都不拼。
+* **开关在主 App 里**：「设置 → Gboard → 诊断日志」，和「常用语」同一层级、同一套注入方式（复制一条原生设置行，沿用它的 `type`／`settingID`）。点一下就地翻转，值写进 App Group 的 `GXKDiagLogEnabled`。
+* **跨进程半秒内生效**：键盘扩展读的是同一个 App Group 键，读取结果按 0.5 秒缓存（每帧都会问，不能每次读磁盘）。主 App 改完，键盘侧最多半秒后跟上，不需要重启键盘。
+* **换行键上不再有任何诊断**：早先挂在动作键（换行/重输）上的 0.8 秒长按探针整份删除（`dylib/symbol_probe.h` 已移除），普通点击与长按行为完全回到原生。符号页识别本身是生产逻辑（`shouldReturnToPrimeOnKey:` 靠它判断当前在不在符号页），已迁到 `dylib/symbol_doubletap.h` 的 `GXKSymbolFindHost`，只读 `restorationIdentifier` 与可见性，不碰任何键盘内部属性。
+* **回归护栏**：`tests/test_diag.py` 锁住「探针文件不存在且全源无 `GXKProbe`」「符号页判定仍在 `symbol_doubletap.h`」「三处 HUD 入口都先问开关且建视图晚于开关判定」「设置开关走 App Group 且 `synchronize`」。
+
 ---
 
 ## 📐 开发规范与架构红线 (Development Standards)
@@ -119,7 +126,9 @@
 ```
 gboard-gkx/
 ├── dylib/
-│   └── gkx.m                      # 核心注入源码：万象词库部署 + 九键重输/换行按键管理
+│   ├── gkx.m                      # 核心注入源码：万象词库部署 + 九键重输/换行按键管理
+│   ├── punct_diag.h               # 标点诊断 HUD（默认关，主 App 设置里开）
+│   └── symbol_doubletap.h         # 符号页双击/停留判定
 ├── .github/workflows/
 │   └── build-dylib.yml            # CI 编译流：macOS-15 runner，原生 clang arm64 + ldid 伪签名
 ├── tools/

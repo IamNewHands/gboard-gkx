@@ -7,6 +7,10 @@
 // 为什么默认收起：展开的 HUD 会盖住候选行，成对补全的复现需要正常打字；
 //          收起后只占 62x16，不挡任何按键，需要看时点一下。
 //
+// 开关：主 App「设置 → Gboard → 诊断日志」。关（默认）时本文件不建视图、不写环形缓冲，
+//      GXKPunctDiagLog 在展开参数之前就 return，键盘侧零成本、屏幕上完全看不见。
+//      开关值存 App Group（GXKDiagLogEnabled），主 App 写、键盘扩展读，跨进程立刻生效。
+//
 // 删除方式：删掉本文件，再 grep -n "DIAG-punct" dylib/ 去掉所有埋点即可，其余逻辑零改动。
 #ifndef GXK_PUNCT_DIAG_H
 #define GXK_PUNCT_DIAG_H
@@ -27,8 +31,25 @@ static NSUInteger gDiagFire, gDiagPairOk, gDiagPairTimeout, gDiagPairOffPage, gD
 
 static NSString *GXKPunctDiagReport(void);
 
+// 诊断开关：App Group 里主 App 写入的 BOOL，默认关。
+// 每帧都会被问到，所以按 0.5 秒缓存一次；设置里刚改完的那一侧最多半秒后就同步。
+static BOOL GXKPunctDiagEnabled(void) {
+    static BOOL cached = NO;
+    static NSTimeInterval cachedAt = 0;
+    static BOOL primed = NO;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (primed && now - cachedAt < 0.5) return cached;
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:GXKGroup];
+    if (!defaults) defaults = [NSUserDefaults standardUserDefaults];
+    cached = [defaults boolForKey:@"GXKDiagLogEnabled"];
+    cachedAt = now;
+    primed = YES;
+    return cached;
+}
+
 static void GXKPunctDiagLog(NSString *fmt, ...) {
     if (!fmt) return;
+    if (!GXKPunctDiagEnabled()) return; // 关着就不分配、不拼串、不写环形缓冲。
     va_list ap;
     va_start(ap, fmt);
     NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
@@ -63,6 +84,7 @@ static void GXKPunctDiagApplyFrame(void) {
 
 static void GXKPunctDiagHud(void) {
     if (!gDiagLabel) return;
+    if (!GXKPunctDiagEnabled()) return;
     if (CACurrentMediaTime() < gDiagFreezeUntil) return;
     NSString *text = gDiagExpanded
         ? GXKPunctDiagTail(GXK_DIAG_HUD_LINES)
@@ -114,6 +136,16 @@ static GXKPunctDiagTarget *gDiagTarget;
 
 static void GXKPunctDiagAttachHud(UIView *root) {
     if (!root) return;
+    // 关着：已经建过的 HUD 撤走，之后也不再建。屏幕上不留任何痕迹。
+    if (!GXKPunctDiagEnabled()) {
+        if (gDiagLabel) {
+            [gDiagLabel removeFromSuperview];
+            gDiagLabel = nil;
+            gDiagLastHud = nil;
+        }
+        gDiagRoot = nil;
+        return;
+    }
     gDiagRoot = root;
     if (!gDiagLabel) {
         UILabel *label = [[UILabel alloc] initWithFrame:CGRectZero];

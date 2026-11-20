@@ -101,6 +101,25 @@ static BOOL GXKSymbolViewIsOnSymbolPage(UIView *view) {
     return NO;
 }
 
+// 符号页那一格：只认 restorationIdentifier 为 key_pos_9keys_symbols、且真正上屏的视图。
+// 早先这条判定住在诊断探针里，探针删掉后留在生产路径上——它是符号页识别本身，不是埋点。
+// v9 的教训：光看 GKBSoftKeyCollectionView 会把 123 页也认成符号页，所以只认标识符。
+static UIView *GXKSymbolFindHost(UIView *root) {
+    if (![root isKindOfClass:[UIView class]]) return nil;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    NSUInteger visited = 0;
+    while (stack.count && visited++ < 3000) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        NSString *ident = view.restorationIdentifier;
+        BOOL named = [ident isKindOfClass:[NSString class]] &&
+                     [ident isEqualToString:GXK_SYMBOL_PAGE_IDENT];
+        if (named && !view.isHidden && !CGRectIsEmpty(view.bounds)) return view;
+        [stack addObjectsFromArray:view.subviews];
+    }
+    return nil;
+}
+
 // 全树判定：只用于拿不到按键视图的场合（shouldReturnToPrimeOnKey:）。
 // 结果按布局缓存，布局一变（换页必然触发布局）就失效，不在打字热路径上重复扫描。
 static UIView *GXKSymbolHost(void) {
@@ -111,7 +130,7 @@ static UIView *GXKSymbolHost(void) {
         if (!cached) return nil;
         if (cached.window && !cached.isHidden) return cached;
     }
-    UIView *host = GXKProbeSymbolHost(vc.view); // symbol_probe.h 里同一条判定
+    UIView *host = GXKSymbolFindHost(vc.view);
     gSymbolHostCache = host;
     gSymbolPageCacheValid = YES;
     return host;
