@@ -1,4 +1,4 @@
-# Gboard-GKX 项目接手与工程架构指南 (Agent.md)
+# Gboard-NTR 项目接手与工程架构指南 (Agent.md)
 
 > 本文档专为后续接手维护、开发与排错的 AI Agent（及开发者）编写。
 > 汇总了项目核心架构、逆向注入机制、iOS 键盘扩展沙盒底层细节、历代重大 Bug 根因与规避红线。接手前请务必通读本文档。
@@ -25,7 +25,7 @@
 ## 2. 仓库目录结构索引
 
 ```
-gboard-gkx/
+gboard-ntr/
 ├── dylib/
 │   └── gkx.m                          # 核心动态库源码：词库部署 + 九键重输/换行 + G 图标 band 工具栏 + 分页裁剪 + 搜索历史单条删除 + 常用语分页/设置主菜单维护
 ├── .github/workflows/
@@ -35,7 +35,7 @@ gboard-gkx/
 │   ├── dict_converter.py              # 词库转换器：万象词库解析、声调清洗、6万词容量上限与零 comment 紧凑 Protobuf 序列化
 │   └── inspect_signed.py              # 签名与 Mach-O 结构自检工具
 ├── dist/                              # 本地构建输出与产物目录
-│   ├── gboard-gkx-unsigned.ipa        # 重打包最新未签名 IPA
+│   ├── gboard-ntr-1.0-unsigned.ipa        # 重打包最新未签名 IPA
 │   ├── user_dictionary.db             # 紧凑万象词库 (1.61 MB)
 │   └── libgkx.dylib                   # CI 编译下载的动态库 (约 60 KB)
 ├── README.md                          # 仓库主说明与开发规范
@@ -150,10 +150,10 @@ python tools/inject.py `
   --dylib "dist/libgkx.dylib" `
   --dict "dist/user_dictionary.db" `
   --app-group "group.zunbengege.top" `
-  --out "dist/gboard-gkx-unsigned.ipa"
+  --out "dist/gboard-ntr-1.0-unsigned.ipa"
 #    若 dist 目录 ACL 拒绝创建临时目录（WinError 5），加 --keep 指向仓库外目录：
 #    --keep "<repo 外的临时目录>\gkx-pack-<tag>"，产物仍写 dist。
 
 # 5. 校验产物 Mach-O 与权限
-python tools/inspect_signed.py "dist/gboard-gkx-unsigned.ipa"
+python tools/inspect_signed.py "dist/gboard-ntr-1.0-unsigned.ipa"
 ```

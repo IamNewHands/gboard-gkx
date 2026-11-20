@@ -605,6 +605,40 @@ class PerfContracts(unittest.TestCase):
         self.assertLess(fast.index("GXKToolbarNativeSpaceClear"), fast.index("if (CGRectEqualToRect(band, gToolbarBand)"))
         self.assertIn("stack.hidden = composing || !clear;", update)
 
+    def test_geometry_only_invalidates_layout_when_center_moves(self):
+        """中心没变就不要 setNeedsLayout：五个按钮每拍各失效一次会白排整棵子树。"""
+        geometry = function_body(self.source, "static BOOL GXKSyncToolbarGeometry(")
+        self.assertIn("if (button.gxkContentCenterY != centerY) {", geometry)
+        guard = geometry[geometry.index("if (button.gxkContentCenterY != centerY) {"):]
+        self.assertLess(guard.index("button.gxkContentCenterY = centerY;"), guard.index("[button setNeedsLayout]"))
+        self.assertLess(guard.index("[button setNeedsLayout]"), guard.index("}"))
+
+    def test_missing_bundled_dictionary_settles_instead_of_rescanning(self):
+        """包里没有词库时也要 settle：否则每次弹键盘都再摸三次磁盘。"""
+        deploy = function_body(self.source, "static void GXKEnsureUserDictionaryDeployed(void) {")
+        missing = deploy[deploy.index("if (!bundlePath) {"):]
+        body = missing[:missing.index("}")]
+        self.assertIn("gDictDeploySettled = YES;", body)
+        self.assertLess(body.index("gDictDeploySettled = YES;"), body.index("return;"))
+
+    def test_punct_popup_does_not_rebuild_an_unchanged_gesture(self):
+        """键没换就别 detach+attach：白删白挂一次手势，还多扫一遍全树。"""
+        popup = (ROOT / "dylib/punct_popup.h").read_text(encoding="utf-8")
+        update = function_body(popup, "static void GXKPunctPopupUpdate(UIViewController *vc) {")
+        same = update[update.index("if (gPunctKey == found) {"):]
+        self.assertLess(same.index("if (gPunctKey == found) {"), same.index("GXKPunctDetach();"))
+        self.assertLess(same.index("if (gPunctKey == found) {"), same.index("GXKPunctAttach(found, root);"))
+
+    def test_punct_diag_bookkeeping_is_off_by_default(self):
+        """诊断关闭时不能建 ident 数组、不能 containsObject、不能拼日志字符串。"""
+        popup = (ROOT / "dylib/punct_popup.h").read_text(encoding="utf-8")
+        find = function_body(popup, "static UIView *GXKPunctFindKey(UIView *root) {")
+        self.assertIn("BOOL diag = GXKPunctDiagEnabled();", find)
+        self.assertIn("NSMutableArray<NSString *> *seenIdents = diag ? [NSMutableArray array] : nil;", find)
+        self.assertIn("if (diag && ident.length && ![seenIdents containsObject:ident])", find)
+        self.assertLess(find.index("if (diag) {"), find.index("gDiagFindMiss++"))
+        self.assertLess(find.index("gDiagFindMiss++"), find.index("componentsJoinedByString"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

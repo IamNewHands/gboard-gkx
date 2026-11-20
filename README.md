@@ -1,4 +1,4 @@
-# Gboard-GKX (iOS Gboard 键盘增强补丁)
+# Gboard-NTR (iOS Gboard 键盘增强补丁)
 
 **中文** | [English](README.en.md)
 
@@ -124,7 +124,7 @@
 ## 📂 仓库结构
 
 ```
-gboard-gkx/
+gboard-ntr/
 ├── dylib/
 │   ├── gkx.m                      # 核心注入源码：万象词库部署 + 九键重输/换行按键管理
 │   ├── punct_diag.h               # 标点诊断 HUD（默认关，主 App 设置里开）
@@ -138,7 +138,7 @@ gboard-gkx/
 ├── dist/                          # 构建产物与词库生成目录
 │   ├── user_dictionary.db         # 转换生成的紧凑万象词库 (1.61 MB)
 │   ├── libgkx.dylib               # CI 编译产物
-│   └── gboard-gkx-unsigned.ipa    # 最终交付的未签名 IPA
+│   └── gboard-ntr-1.0-unsigned.ipa    # 最终交付的未签名 IPA
 ├── README.md                      # 本文档与开发规范
 └── agent.md                       # 逆向工程细节与避坑历史记录
 ```
@@ -178,7 +178,7 @@ python tools/inject.py `
   --dylib "dist/libgkx.dylib" `
   --dict "dist/user_dictionary.db" `
   --app-group "group.zunbengege.top" `
-  --out "dist/gboard-gkx-unsigned.ipa"
+  --out "dist/gboard-ntr-1.0-unsigned.ipa"
 ```
 
 `--app-group` 是必填参数，漏掉脚本直接退出（exit 2）。真机上漏掉这一步的包会表现为：打开 Gboard 应用闪退、键盘锁在 26 键切不到九键。
@@ -196,7 +196,7 @@ python tools/inject.py `
 
 ## 📱 签名安装与真机验证
 
-1. **自签工具安装**：使用 **LCSign**（或 SideInstaller、SideStore、TrollStore）导入 `dist/gboard-gkx-unsigned.ipa` 进行自签并安装至 iOS 设备。
+1. **自签工具安装**：使用 **LCSign**（或 SideInstaller、SideStore、TrollStore）导入 `dist/gboard-ntr-1.0-unsigned.ipa` 进行自签并安装至 iOS 设备。
 2. **完全访问权限**：安装后进入系统 **「设置」→「通用」→「键盘」→「键盘」→「Gboard」**，打开 **「允许完全访问」**（词库与配置读取依赖 App Group 容器）。
 3. **扩展缓存刷新（关键技巧）**：
    * iOS 拥有强力的键盘扩展常驻缓存机制，覆盖安装后若未生效，建议先在设置中删除 Gboard 键盘，重新添加并重新赋予完全访问权限；或重启宿主 App（如微信、备忘录）。

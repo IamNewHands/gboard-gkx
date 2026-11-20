@@ -102,6 +102,8 @@ static void GXKEnsureUserDictionaryDeployed(void) {
         if (candidate.length > 0 && [fm fileExistsAtPath:candidate]) { bundlePath = candidate; break; }
     }
     if (!bundlePath) {
+        // 包内本来就没有词库：同一进程里再找也是同样的结果，settle 掉，别再每次弹键盘都摸三次磁盘。
+        gDictDeploySettled = YES;
         GXK_LOG(@"[*] 安装包内未找到预置 user_dictionary.db");
         return;
     }
@@ -802,9 +804,12 @@ static BOOL GXKSyncToolbarGeometry(UIStackView *stack, CGRect hostBand) {
         if (isfinite(centerY)) {
             centerY = MAX(textHeight * 0.5, MIN(centerY, slot.size.height - textHeight * 0.5));
         }
-        button.gxkContentCenterY = centerY;
-        [button setNeedsLayout];
         if (!isfinite(centerY)) return NO;
+        // 每拍只在中心真的变了才失效布局：5 个按钮每帧各来一次 setNeedsLayout 会白排一整棵子树。
+        if (button.gxkContentCenterY != centerY) {
+            button.gxkContentCenterY = centerY;
+            [button setNeedsLayout];
+        }
     }
     return YES;
 }

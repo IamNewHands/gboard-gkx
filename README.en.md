@@ -1,4 +1,4 @@
-# Gboard-GKX (iOS Gboard enhancement patch)
+# Gboard-NTR (iOS Gboard enhancement patch)
 
 [中文](README.md) | **English**
 
@@ -91,7 +91,7 @@ A `LC_LOAD_DYLIB` command is written in place into the all-zero padding right af
 ## Repository layout
 
 ```
-gboard-gkx/
+gboard-ntr/
 ├── dylib/gkx.m                    # the injected source
 ├── .github/workflows/build-dylib.yml  # macOS-15 runner, arm64 clang, ldid pseudo-sign
 ├── tools/
@@ -126,7 +126,7 @@ python tools/inject.py `
   --dylib "dist/libgkx.dylib" `
   --dict "dist/user_dictionary.db" `
   --app-group "group.zunbengege.top" `
-  --out "dist/gboard-gkx-unsigned.ipa"
+  --out "dist/gboard-ntr-1.0-unsigned.ipa"
 ```
 
 `--app-group` is mandatory (the script exits with code 2 without it). `group.zunbengege.top` is only an **example** group authorized by one self-signing provisioning profile: change `GXKGroup` in `dylib/gkx.m`, the default in `tools/inject.py` and this flag together, or the app crashes on launch and the keyboard stays stuck on the 26-key layout.
@@ -137,7 +137,7 @@ The script unpacks the original IPA, records Unix modes and timestamps, writes `
 
 ## Signing and on-device verification
 
-1. Self-sign `dist/gboard-gkx-unsigned.ipa` with LCSign, SideInstaller, SideStore or TrollStore and install it.
+1. Self-sign `dist/gboard-ntr-1.0-unsigned.ipa` with LCSign, SideInstaller, SideStore or TrollStore and install it.
 2. Enable **Allow Full Access** in **Settings → General → Keyboard → Keyboards → Gboard**; the dictionary and shared configuration depend on the App Group container.
 3. iOS caches keyboard extensions aggressively. If nothing changed after an overwrite install, remove the Gboard keyboard in Settings, add it again, and re-grant Full Access; or restart the host app.
 4. Checks: type `aerjinshan` and `wanxiang` to see the bundled entries near the top; on the nine-key layout the key above return reads "newline" when idle and switches to "retype" while composing; swipe typing must stay smooth on both layouts.

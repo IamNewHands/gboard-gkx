@@ -51,7 +51,9 @@ static UIView *GXKPunctFindKey(UIView *root) {
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     NSUInteger visited = 0;
     // [DIAG-punct] 记录九键体里所有 GKBSoftKeyView 的 ident：判定是「ident 不存在」还是四连判定之一失败。
-    NSMutableArray<NSString *> *seenIdents = [NSMutableArray array];
+    // 诊断关闭（出货默认）时不建数组、不 containsObject、不拼字符串：这条路径每次布局都在跑。
+    BOOL diag = GXKPunctDiagEnabled();
+    NSMutableArray<NSString *> *seenIdents = diag ? [NSMutableArray array] : nil;
     NSUInteger seenKeys = 0, hiddenSkip = 0, bodyFail = 0, visibleFail = 0, dupes = 0;
     while (stack.count && visited++ < 1500) {
         UIView *v = stack.lastObject;
@@ -60,7 +62,7 @@ static UIView *GXKPunctFindKey(UIView *root) {
         if ([v isKindOfClass:keyClass]) {
             seenKeys++;
             NSString *ident = v.restorationIdentifier;
-            if (ident.length && ![seenIdents containsObject:ident]) [seenIdents addObject:ident];
+            if (diag && ident.length && ![seenIdents containsObject:ident]) [seenIdents addObject:ident];
             if ([ident isEqualToString:GXK_PUNCT_KEY_IDENT]) {
                 BOOL inBody = GXKNineKeyBodyForKey(v, root) != nil;
                 BOOL visible = inBody && GXKKeyIsVisible(v, root);
@@ -74,15 +76,17 @@ static UIView *GXKPunctFindKey(UIView *root) {
         }
         [stack addObjectsFromArray:v.subviews];
     }
-    gDiagFindMiss++;
-    GXKPunctDiagLog(@"find keys=%lu visit=%lu hid=%lu bodyFail=%lu visFail=%lu dup=%lu cand=%d tail=%lu ids=%@",
-                    (unsigned long)seenKeys, (unsigned long)visited, (unsigned long)hiddenSkip,
-                    (unsigned long)bodyFail, (unsigned long)visibleFail, (unsigned long)dupes,
-                    candidate != nil, (unsigned long)stack.count,
-                    [seenIdents count] > 24
-                        ? [NSString stringWithFormat:@"%@…(+%lu)", [seenIdents subarrayWithRange:NSMakeRange(0, 24)],
-                                                     (unsigned long)(seenIdents.count - 24)]
-                        : [seenIdents componentsJoinedByString:@","]);
+    if (diag) {
+        gDiagFindMiss++;
+        GXKPunctDiagLog(@"find keys=%lu visit=%lu hid=%lu bodyFail=%lu visFail=%lu dup=%lu cand=%d tail=%lu ids=%@",
+                        (unsigned long)seenKeys, (unsigned long)visited, (unsigned long)hiddenSkip,
+                        (unsigned long)bodyFail, (unsigned long)visibleFail, (unsigned long)dupes,
+                        candidate != nil, (unsigned long)stack.count,
+                        [seenIdents count] > 24
+                            ? [NSString stringWithFormat:@"%@…(+%lu)", [seenIdents subarrayWithRange:NSMakeRange(0, 24)],
+                                                         (unsigned long)(seenIdents.count - 24)]
+                            : [seenIdents componentsJoinedByString:@","]);
+    }
     if (dupes) return nil; // 布局不确定：不动原生
     return stack.count ? nil : candidate;
 }
@@ -299,7 +303,12 @@ static void GXKPunctPopupUpdate(UIViewController *vc) {
         GXKPunctDetach();
         return;
     }
-    if (gPunctKey != found) GXKPunctDiagLog(@"hit new key %@", found.restorationIdentifier ?: @"nil");
+    if (gPunctKey == found) {
+        // 键没换，只是这一拍没走快路径：手势已经在键上，重建等于白删白挂一次。
+        if (gPunctPanel && gPunctPanel.superview != root) [root addSubview:gPunctPanel];
+        return;
+    }
+    GXKPunctDiagLog(@"hit new key %@", found.restorationIdentifier ?: @"nil");
     GXKPunctDetach();
     GXKPunctAttach(found, root);
     if (gPunctPanel && gPunctPanel.superview != root) [root addSubview:gPunctPanel];
