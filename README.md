@@ -2,132 +2,49 @@
 
 **中文** | [English](README.en.md)
 
-在 **iOS Gboard 2.3.19** 官方输入法基础上进行无源码逆向定制与轻量增强，通过 Objective-C 动态库（`libgkx.dylib`）注入与无损二进制改写实现。
+在 iOS **Gboard 2.3.19** 官方输入法上做无源码逆向增强：注入一个 Objective-C 动态库（`libgkx.dylib`），配合无损二进制改写实现。
 
-> **核心设计哲学**：**保持绝对原生，拒绝过度侵入**。
-> 100% 完整保留 Google 官方原生 Mozc 拼音引擎、键盘排布与滑行输入（Glide Typing）手感，杜绝界面遮挡与内存闪退，只专注于最刚需的核心体验提升。
-
----
-
-## 🌟 核心特性
-
-### 1. Rime 万象词库集成（轻量防 Jetsam 杀后台）
-* **语料精选**：从 Rime 万象方案全量词表中严格筛选出 **60,000 条高频核心词库**（Top 45,000 高频词 + 10,000 常用成语俗语 + 3,000 全国行政地名 + 2,000 缩写简语），涵盖日常 99% 的核心拼音输入。
-* **Protobuf 内存与体积瘦身**：
-  * 在 Protobuf 序列化中剔除了冗余的 `comment` 字段，单文件二进制体积从 2.18 MB 骤降至 **1.61 MB**。
-  * 在 Mozc C++ 反序列化时**避免了 60,000 次堆内存分配**，扩展运行时内存增量控制在 **4~6 MB** 安全区间，彻底解决 iOS 键盘扩展因 Jetsam 物理内存超限导致的闪退问题。
-* **无感部署**：初次安装或更新后，扩展启动时自动将词库无感写入 App Group 共享容器（`group.zunbengege.top/user_dictionary.db`），即装即用。
-* **只随包带一份**：词库只落在主 App 的 `Frameworks/user_dictionary.db`。键盘扩展的 `LC_RPATH` 是 `@executable_path/../../Frameworks`，指的就是这一份；再往 `.appex` 里复制一份只是白占 1.7 MB 安装体积，运行时永远读不到。部署代码按「bundle 内 → 主 App Frameworks → 相对上跳两级」逐条 `fileExistsAtPath` 探测，两个进程都能找到。
-
-### 2. 九键表情键智能切换（重输 / 收起 / 换行）
-* **替换范围**：九键拼音及其 **123／符号页**，只替换原生 `key_pos_9keys_emoji` 表情键；原生回车键和 **26 键及其数字／符号页保持不变**。不根据坐标猜测按键身份。
-* **三态动态切换**（优先级：组字 > 联想 > 空闲）：
-  * **拼音组字状态（Composing 活跃）**：显示「**重输**」；点击沿用原有 Gboard `resetKeyboard`／`abortComposing` 清空未上屏拼音，配合中度触觉反馈。
-  * **联想候选态（候选条已有文字、且未组字）**：显示「**收起**」；点击调用公开 API `dismissKeyboard` 收起键盘，配合轻度触觉反馈——整句已经给出时，最省事的一步是收起键盘看结果。
-  * **空闲态（无组字、无候选）**：显示「**换行**」；点击调用 `insertText:@"\n"` 插入换行符，配合轻度触觉反馈。
-* **候选态判定**：与组字状态在**同一趟**全树扫描中产出（命中 `GKBCandidatesCollectionView`／`GKBFixedNumberCandidatesView` 后只查可见 cell 的 `UILabel` 文本，随即剪掉整棵候选子树，不把成百上千个 cell 压进栈）；一旦组字成立立刻作废候选态，键盘退出时一并清空。标题由单一函数 `GXKActionTitle` 统一裁决，廉价路径与完整路径不得各自复制判定。
-* **原生外观**：保留表情键原生背景层、边框和主题，仅替换前景内容；文字取原生字体与前景色。「重输」和「换行」不另加红色、不透明背景或高亮配色。
-* **不留原生圆圈**：表情键的前景图由原生 `-[GKBSoftKeyView updateView]` 每轮重写，清除若晚一拍就会闪出笑脸圆圈。这里在同一轮原实现返回后立刻清掉归属键的前景（清前存档，撤键还原）。判据是「这把键此刻是不是归属的九键表情键」，不挂在按钮／图标对象的同一性上：切页时原生会重建图标，撤键又会先把按钮摘掉，按对象同一性判会在这两拍放行，笑脸照原样提交一帧。图标每次现取，不改 alpha／hidden／背景层。
-* **状态同步**：使用当前可见布局、`viewDidLayoutSubviews`、`textDidChange:` 与 0.2s 轮询；点击时重新验证目标键、当前模型和按钮绑定。原生运行时表现仍需用新编译包真机验证，离线检查不证明 CPU／内存性能。
-
-### 3. 原生纯粹与零遮挡保障
-* **零界面遮挡**：不给键盘增加高度、不移动原生容器。工具栏左缘同时避开 G 的已测量可见图片右缘 +4pt 与 G 按键的完整触摸区域；挂在根视图，自有点击条带默认 28pt，宿主行只有 22pt 时压到行高（下限 18pt）而不是整条消失；文字和分割线单独对齐真实 G 图片中心，不把点击条带挤进相邻原生行。原字号文字放不下时仍不显示。空位不足 200pt、存在独立可见 26 键体、组字中或与原生候选／按键／功能图标重叠时，整条不显示。
-* **不隐藏原生内容**：工具栏使用透明底色，不改 G、语音按钮等原生内容的 `alpha` 或 `hidden`；原生内容出现时工具栏让位，不以隐藏原生内容换取出场。
-* **竖向跟实际图片图层**：G 使用 `GKBImageViewWithBackground`／`GKBImageLayer`，不是普通 `UIImageView`。用实际 `contentsGravity`、`CGImage` 像素尺寸与 `contentsScale` 算显示矩形，再与真实父图层 `masksToBounds` 裁剪区域相交；不把 36pt 载体当作 22pt 图片，不使用虚构方块兜底。动画、变换、蒙版或不完整绑定无法可靠测量时保持原生。顶条行里的 G 常被 26pt 高、`masksToBounds=1` 的祖先裁成 2pt 可见高度，此时用未裁剪的绘制矩形（仍须过 8..64pt 校验）作锚点，不因可见尺寸不合格就判定没有 G。条高默认 28pt、行高不足时压到行高；可见图片矩形不等于不透明像素边界。
-* **外观跟原生功能键走**：字体只读九键回车键 `key_pos_9keys_return` 的 `idToViewDict[@"label"]`，不再读取任意标签或候选词字号；来源失效立即退回原包验证过的 Roboto-Regular 16pt（同尺寸系统字体兜底）。文字色优先读当前绑定的原生表情键图标，退回回车标签与系统主题色。不自动缩小原生字号；五格保留 0.5pt、18% 透明度分割线，随文字对齐 G 中心且完整留在点击条带内，不增加 arrangedSubviews。
-* **工具栏能力**：九键界面提供「全选／复制／粘贴／剪切／收起」五个按钮。组字中拒绝改文本并提示"先完成拼音"；剪切仅在已有选区时生效，无选区只提示"先选中"，绝不做逐字符 `deleteBackward` 循环；「全选」后 15 秒内可直接「剪切」同一段文本。操作成功不弹提示（避免连点卡顿），只有失败才短暂改按钮标题。
-* **缓存不掩盖原生变化**：布局／文本／生命周期事件重建弱引用障碍注册表；隐藏键盘体和暂时没有图片的载体也先注册，每次复用读取当前可见性／内容。九键继承 26 键类，必须先判九键、再排除独立 26 键，不能只看旧九键是否仍在。
-* **滑行触摸链 100% 原生**：绝不全局 Hook `GKBSoftKeyView` 的触摸事件（`touchesBegan`/`touchesMoved`/`touchesEnded`），全键盘与九键滑行输入如丝顺滑。
-
-### 4. G 图标分页裁剪与搜索历史单条删除
-* **去掉两个分页**：G 图标展开页不再出现 YouTube 与联系人两页，三层兜底——`GKBFeatureFlagManager` 的 `enableYouTubeMiniApp`／`enableContactsMiniApp` 返回 `value = NO` 的 flag 对象、`GKBMiniAppExtensionBase` 的 `isMiniAppEnabled:` 对命中项返回 `NO`、`GKBMiniAppManager` 的 `availablePickerItems` 过滤掉这两项。任一类在新版 Gboard 中消失就自动跳过，降级为原生行为。
-* **再隐藏 GIF 与贴纸两页**：26 键表情面板里的「GIF」「贴纸」两个分类同样从分页项里过滤掉，只留 emoji 与颜文字。identifier 真实值是 `gif`／`sticker`（从 `gboard_framework` 的 `__data` CFString 常量里读出来的），按整词比较，避免误伤 `gift` 这类词。
-* **identifier 按内容匹配**：`youtube`／`contacts` 的常量在二进制里取不到可靠值，仍用 `NSString` 小写包含匹配；`gif`／`sticker` 走整词相等，不按域名或 URL 判断。
-* **搜索历史单条删除**：搜索分页每条历史记录右侧叠一个 28pt 的「×」，点击即从当前建议数组删掉该条并重刷列表，同时把持久化记录里同名的条目去掉（只删不造：只有键名含 `RecentQueries` 且确实命中才写回）。
-* **不碰 cell 布局**：× 是 `contentView` 上的叠加按钮（`autoresizingMask` 跟随），不参与原生自动布局、不改行高、不改约束。
-
-### 5. 地图分页定位：完全还原原生（不做任何跳转）
-* **一行代码都不留**：地图分页的「开启位置信息服务」就是 Gboard 原生行为。不装 hook、不叠按钮、不改卡片布局，也不做任何「先唤起主 App 再弹提示」的中转——这套方案在真机上达不到目的，已整体删除。
-* **为什么做不到**：键盘扩展的 `NSExtensionContext` 只放行宿主 App 自己的 URL scheme；主 App 里 `prefs:root=Privacy&path=LOCATION` 同样被系统静默拒绝，唯一能开的 `UIApplicationOpenSettingsURLString` 只到「设置 → Gboard」，进不了定位页。快捷指令能跳是因为它有独立授权，第三方 App 与键盘扩展都没有。
-* **回归护栏**：`tests/test_location_jump.py` 断言源码里不再出现 `GXKLocation*` / `prefs:root=Privacy` / `App-Prefs:root` / `UIApplicationOpenSettingsURLString` / `x-gxk-location`，避免这套无效方案被重新带回来。
-
-### 6. 常用语分页（G 图标内，与搜索／翻译／地图同级）
-* **分页入口**：`GKBMiniAppManager` 的 `availablePickerItems` 末尾追加一项「常用语」（`GKBExtensionSegmentedControlItem`，identifier `gxk_phrases`，图标用 `UIGraphicsImageRenderer` 现画「语」字，不依赖资源名）。`GKBMiniAppExtensionBase` 的 `miniAppPicker:didSelectItem:atIndex:` 命中该 identifier 时改为弹自己的面板，其余分页原样回落。
-* **分页项必须是 `GKBExtensionSegmentedControlItem`**（真机崩溃换来的结论）：分页条是 `GKBExtensionSegmentedControl`，它建按钮时对每个 item 依次发 `badgeableViewType`／`controlItemType`／`accessibilityIdentifier`／`accessibilityLabel`。早先用的 `GKBAppStripItem` 这四条一条都不响应，26 键点表情第一次打开分页条就 `-[GKBAppStripItem badgeableViewType]: unrecognized selector` 崩掉整个键盘扩展（九键的表情键被换成了重输/换行，所以历史版本从未走到这条链路）。该类只有无参 `init`，属性逐个 set；`setIdentifier:` 内部会同步 `accessibilityIdentifier`。
-* **面板是叠加层**：`GXKPhrasesPanel` 铺满键盘视图 `bounds`，`layoutSubviews` 手算 frame，**不新增任何约束、不改键盘高度**。顶部有标题、钉子按钮、「编辑」与关闭「×」，中间是常用语列表，底部一行提示。
-* **面板配色跟随键盘皮肤，而不是跟随系统外观**：Gboard 皮肤可以和系统深浅模式不一致，所以面板不读系统外观开关，改为直接采样键盘本体里面积最大的那块不透明背景色当底色、取同键盘原生标签的文字色当主文字色，再按底色亮度补一层对比度保护（对比度不够才退回内置色）。键盘换肤或深浅切换时由 `didMoveToWindow`／`traitCollectionDidChange:` 重算，且只在颜色真的变了才刷新；单元格不再露出系统白底，编辑器与钉子按钮同样处理。
-* **钉子固定**：钉子关闭（默认）时点一条常用语就上屏并立即关闭面板；钉子打开后点多少条都不关，可以连续输入。状态存 App Group 的 `GXKPhrasesPinned`。
-* **上屏方式**：通过 `UITextDocumentProxy` 的 `insertText:` 写入，和原生输入完全同一条路。
-* **维护入口两处，键盘里那个才是保底**：
-  * 键盘面板右上角「编辑」→ 直接弹出编辑器，**不依赖主 App**，任何情况下都能增删改。
-  * 主 App「设置 → Gboard」**主菜单里的一行「常用语」**，和「搜索设置」「键盘设置」同一层级。做法是 hook `GKBSettingsViewController` 的 `mainMenuPageDescriptor`，复制一条原生设置行（沿用它的 `type`／`settingID`）只换标题与 `key`，插到「搜索设置」后面；点击由 `GKBSettingsPageViewController` 的 `collectionView:didSelectItemAtIndexPath:` 认领，非本行原样回落原生。
-  * 编辑器是 `GXKPhrasesEditorController`：`+` 新增，点行编辑，左滑删除，自带「完成」。改完发 `GXKPhrasesChangedNotification`，键盘面板收到即刷新。
-  * **键盘进程里没有任何「能打字」的入口**：点「+」/点行不再弹带输入框的 alert，改为读剪贴板——先把文字复制好，回来点「+」即新增、点某行即用剪贴板内容替换。剪贴板为空时也不弹提示框，只让导航标题闪一下「先复制文字」。原因见下条。
-  * 数据存 App Group 的 `GXKPhrases` 数组，键盘与主 App 共享同一份。
-* **一律全屏 modal，不 push**：主 App 的设置页跑在 Google 自绘的 `GOONavigationController` 里，往它上面 push 出来的控制器真机上是白屏（早先挂在「搜索设置」导航栏的那版就栽在这里）。所以编辑器统一包一层 `UINavigationController` + `UIModalPresentationFullScreen` present 出来。
-* **键盘扩展里连普通 alert 也不要弹**：不只是带输入框的 alert——扩展内 `presentViewController:` 任何控制器都会再拉一次呈现上下文，真机实测「剪贴板为空时点 +」照样闪退。键盘侧所有提示统一走 `gxkFlashHint:`（改 `self.title` 1.8 秒后复原），只有编辑器本身是唯一允许 present 的控制器。
-* **键盘扩展里绝不能弹输入框**：`UIAlertController` + `addTextFieldWithConfigurationHandler`（或任何内联 `UITextField`）会去要系统键盘，而系统键盘就是这个扩展自己，系统会递归激活同一扩展并杀掉进程。真机实测：G 图标 → 常用语 → 编辑 → 新增，必闪退；删除与上屏不受影响。所以 `GXKIsKeyboardExtension()` 为真时一律走剪贴板，主 App 侧（普通 App 进程）仍保留 alert 输入。
-* **为什么复制原生行而不是硬造**：二进制里查不到任何 `GKBSettingType*` 字符串，`GKBSettingsItem` 的 type 枚举值无法静态确定，硬塞会有崩风险；复制一条真实存在的行才能保证渲染、点击、埋点行为与原生完全一致。
-
-### 7. 打字流畅度：把每键的刷新成本压到常数级
-* **轮询窗口按需**：状态同步仍靠 `NSTimer`（0.2s），但补帧次数从每键 15 拍降到普通打字 2 拍（`GXK_POLL_SETTLE`），只有「组字 ↔ 空闲」真的翻转时才用 5 拍（`GXK_POLL_BURST`）。空闲自动停表，不留常驻定时器。
-* **类名判定按类指针缓存**：全树扫描原本对每个节点调一次 `NSStringFromClass` 再做两次 `containsString`；现在第一次见到某个 `Class` 就把结果记进 `gViewKindCache`，之后直接查表。
-* **全树扫描节流 + 尾随**：`GXKComposingFullScan` 最快 0.25s 跑一次（`GXK_COMPOSING_SCAN_MIN_INTERVAL`）；被节流跳过的那次用一次 `dispatch_after` 尾随补扫，且只有状态真的翻转才触发界面刷新。代理已经明确给出组字标记时走 O(1) 路径，完全不扫。
-* **工具条不再每拍重建**：同一宿主行（G 图标行）复用已有 `UIStackView` 与 5 个按钮，只同步配色；约束先 `deactivateConstraints:` 再 `activateConstraints:`，不层层叠加。装饰扫描按 band 记忆，同一个 band 只走一次 800 节点。
-* **触觉引擎闲置即释放**：`prepare` 会让 Taptic 一直预热，停手 2 秒（`GXK_HAPTIC_IDLE_SECONDS`）就把两个 `UIImpactFeedbackGenerator` 置空，下次点击再懒建。连续点击期间不重建，手感不变。
-* **钉子状态不强制落盘**：`GXKPhrasesPinned` 只有键盘进程自己读写，去掉 `synchronize`；常用语正文 `GXKPhraseSave` 的 `synchronize` 必须保留——主 App 编辑、键盘读取，跨进程要立刻可见。
-* **轮询只挂默认模式**：`scheduledTimerWithTimeInterval:` 本身已把表挂到默认模式，原先再补一行 `addTimer:forMode:NSRunLoopCommonModes` 会让 0.2 秒的状态轮询在滚动、动画、触摸跟踪期间继续抢主线程——那正是「动画卡顿」的来源。现在全源不出现 `NSRunLoopCommonModes`。
-* **高频回调合并成最后一次**：`textDidChange` 与 `viewDidLayoutSubviews` 一帧内可能连来几十次。两者都改成「递增序号 + `dispatch_async` + 块内比对序号」，只有最后一次真正刷新，前面排队的直接丢弃；布局回调的同步段不再直接跑任何全量刷新。
-* **扫描热路径类指针缓存**：`NSClassFromString` 原本在 1500 节点的循环里对每个软键都要查一次运行时类表。现在统一走 `GXKClassCached(name, &slot)`，第一次解析成功才写缓存（类晚加载时会自动重试），五个扫描函数体内已无 `NSClassFromString`。
-* **band 结果按邻居签名复用**：`GXKToolbarBand` 的邻居可见性判定要沿父链 `convertRect`，是这条路径上唯一还会每拍重复的工作。现在先算一个只读 `frame/hidden/alpha` 的邻居签名，行尺寸、G 图标位置、装饰数量、签名、代次全都没变就直接返回上次结果；挂载与撤走时自增 `gToolbarBandEpoch` 强制失效。
-* **回归护栏**：`tests/test_perf.py` 锁住上述各条（缓存必须早于 `NSStringFromClass` 返回、扫描必须节流且带尾随、普通打字只补两拍、约束必须先撤后加、触觉闲置释放、钉子不同步、词库只打一份、轮询不挂 CommonModes、高频回调合并到最后一次、热路径类指针缓存、band 邻居签名复用、诊断关时不建数组不拼日志、工具条中心未变不失效布局、标点键未换不重挂手势、包内无词库即 settle）。
-
-### 8. 诊断日志：默认关，只有手动打开才存在
-* **屏幕上默认什么都没有**：标点键的诊断 HUD（左上角小胶囊）只在开关打开时才建视图。关着时 `GXKPunctDiagAttachHud` 直接返回，不 `alloc` 任何 `UILabel`、不 `addSubview`；之前建过的也会 `removeFromSuperview`。环形缓冲同样不写——`GXKPunctDiagLog` 在展开参数之前就 `return`，关着时连字符串都不拼。
-* **开关在主 App 里**：「设置 → Gboard → 诊断日志」，和「常用语」同一层级、同一套注入方式（复制一条原生设置行，沿用它的 `type`／`settingID`）。点一下就地翻转，值写进 App Group 的 `GXKDiagLogEnabled`。
-* **跨进程半秒内生效**：键盘扩展读的是同一个 App Group 键，读取结果按 0.5 秒缓存（每帧都会问，不能每次读磁盘）。主 App 改完，键盘侧最多半秒后跟上，不需要重启键盘。
-* **换行键上不再有任何诊断**：早先挂在动作键（换行/重输）上的 0.8 秒长按探针整份删除（`dylib/symbol_probe.h` 已移除），普通点击与长按行为完全回到原生。符号页识别本身是生产逻辑（`shouldReturnToPrimeOnKey:` 靠它判断当前在不在符号页），已迁到 `dylib/symbol_doubletap.h` 的 `GXKSymbolFindHost`，只读 `restorationIdentifier` 与可见性，不碰任何键盘内部属性。
-* **回归护栏**：`tests/test_diag.py` 锁住「探针文件不存在且全源无 `GXKProbe`」「符号页判定仍在 `symbol_doubletap.h`」「三处 HUD 入口都先问开关且建视图晚于开关判定」「设置开关走 App Group 且 `synchronize`」。
-
-### 9. 标点长按弹层：跟随键盘配色，符号表可在主 App 里改
-* **是什么**：九键的「，。？！」键长按 0.32 秒（`GXK_PUNCT_HOLD_DELAY`，比原生 0.5s 跟手）弹出一排符号，按住滑到目标松开即上屏，滑出弹层或抬手取消。
-* **配色不再写死**：早先弹层是固定白底黑字，深色皮肤上像贴了一张纸。现在复用常用语面板那套采样——取键盘本体面积最大的不透明底色当面板色、取原生标签文字色当文字色，再按底色亮度定深浅（`GXKPunctRefreshTheme` → `GXKPunctPanelColor`／`GXKPunctTextColor`／`GXKPunctHighlightColor`）。高亮块深色皮肤用白 14%、浅色皮肤用黑 14%，两种底色下都读得清。不读系统外观开关：Gboard 皮肤可以和系统深浅模式不一致。
-* **符号表与个数都能改**：主 App「设置 → Gboard → 标点长按弹层（N 个）」进入编辑器，两个分区——「显示个数」用 `UIStepper` 调 1..10，「符号」逐条增删（`+` 新增、点行改、左滑删），右上角「复位」一键回默认表。默认表是 `，。？！、；：…“”` 十项，未改过设置时弹层与旧版完全一致。
-* **改完立刻生效**：数据存 App Group 的 `GXKPunctSymbols`（字符串数组）与 `GXKPunctCount`（整数），写盘后 `synchronize`。键盘侧 `GXKPunctCandidates()` 按 0.5 秒缓存读取，且**只有内容真的变了才换新对象**——调用方拿指针比较就知道要不要重建格子，不必每帧逐项比对字符串。
-* **格子按需重建**：`GXKPunctBuildPanelIfNeeded` 先刷配色，弹层已存在就只 `GXKPunctSyncCells`（符号表指针没变直接 return）＋ `GXKPunctApplyTheme`；弹层本身、手势与遮挡登记都不重建。弹层连同格子登记进 `GXKToolbarOwnViewRegister`，不会被工具条当成原生遮挡物。
-* **上限 10 格的理由**：375pt 宽键盘按 10 格均分后单格仍有 37pt，再往上单格窄于 34pt 就会开始误触。
-* **回归护栏**：`tests/test_punct_settings.py` 锁住「默认表十项且顺序不变」「非正数回退全显示、超过上限截到上限」「读的是 App Group 且写盘 `synchronize`」「符号表没变不重建格子」「编辑器走全屏 modal 不 push」「设置行按 key 认、不被常用语行吞掉」「弹层配色取自键盘皮肤而非系统外观」。
+> **设计哲学**：保持绝对原生。完整保留 Google 原生 Mozc 拼音引擎、键盘排布与滑行输入手感，不加高键盘、不遮挡界面、不拦截触摸。
 
 ---
 
-## 📐 开发规范与架构红线 (Development Standards)
+## 🌟 功能
 
-为了保证后续功能的迭代与调整不会破坏键盘的核心稳定性，所有后续开发必须严格遵守以下**五大红线规范**：
+**1. Rime 万象词库**
+精选 6 万条高频词（高频词 4.5 万 + 成语 1 万 + 地名 3 千 + 缩写 2 千），剔除 Protobuf 冗余字段后单文件 1.61 MB。首次启动自动写入 App Group 容器，即装即用；只随包带一份，不额外占安装体积。
 
-### 🚫 红线 1：最小侵入原则，严禁篡改键盘根视图约束与高度
-* **规范**：Gboard 的 `_keyboardHeader`、`_keyboardBody` 和 `GKBNibView`（候选词行）均有官方严密的约束系统。
-* **禁区**：严禁通过 `updateViewConstraints` 强行添加根高度扩张约束，严禁递归位移 Header/Body 容器。任何根高度与坐标的篡改都会导致特定机型或横屏下候选词被挤出屏幕或产生上下黑白空隙。
+**2. 九键动作键三态切换**
+只替换九键及其符号页的原生表情键，26 键与回车键不动。按状态显示：
+- 组字中 → **重输**（清空未上屏拼音）
+- 有候选未组字 → **收起**（收起键盘）
+- 空闲 → **换行**（插入换行符）
 
-### 🚫 红线 2：滑行触摸保护，严禁全局拦截按键触摸事件
-* **规范**：Gboard 的滑行输入（Glide Typing）对触摸采样率和事件连贯性要求极高。
-* **禁区**：严禁在 `GKBSoftKeyView` 或其父类上全局替换 `touchesBegan:withEvent:`、`touchesMoved:withEvent:`、`touchesEnded:withEvent:`。按键定制只能采用**在目标软键上挂载独立子视图控件（如单一 UIButton）**的方式进行局部呈现。
+保留原生背景、边框与配色，仅换前景文字，不额外加高或遮挡。
 
-### 🚫 红线 3：内存与防 Jetsam 硬指标（必须严格受限）
-* **规范**：iOS 键盘扩展进程受到内核 Jetsam 守护进程的严苛物理内存限制（通常仅 30MB ~ 50MB 水位）。
-* **指标**：
-  1. 外部词库 `user_dictionary.db` 总词条数**绝对禁止超过 70,000 条**（文件体积严禁超过 2.5 MB）。
-  2. 转换 Protobuf 时，所有 Entry 必须省略非必要的 string 属性（如 `comment` 必须为空），避免 C++ 反序列化时产生几万次散列堆分配。
-  3. 严禁在 `libgkx.dylib` 中引入庞大的静态数据结构或无法释放的常驻缓存。
+**3. G 图标分页裁剪**
+去掉 YouTube、联系人、GIF、贴纸四个分页，只留 emoji、颜文字与自带分页。任一类在新版 Gboard 中消失则自动跳过，降级为原生行为。
 
-### 🚫 红线 4：Windows 打包必须严格保留 Unix 权限元数据
-* **规范**：在 Windows 文件系统上解包/重打包 ZIP 时，文件属性默认为 `0o666`，丢失可执行权限。
-* **要求**：`tools/inject.py` 必须以二进制方式记录原 IPA 内的 Unix 权限，并在重新打包时将 `libgkx.dylib`、主 App 与扩展二进制显式标记为 `0o755`（`rwxr-xr-x`），数据文件标记为 `0o644`。缺失执行权限会导致自签工具报错或扩展启动被系统 SIGKILL。
+**4. 常用语**
+G 图标分页新增「常用语」，面板跟随键盘皮肤配色。钉子关闭时点一条即上屏并关闭，打开后可连续输入。编辑器在键盘内可直接打开（不依赖主 App），主 App「设置 → Gboard → 常用语」是第二个入口。
 
-### 🚫 红线 5：无损二进制注入与 App Group 等长改写
-* **规范**：Mach-O 注入严禁依赖外部闭源或高风险二进制重写工具。
-* **实现**：
-  1. 仅在 Load Commands 后的原装全零填充区（Padding）原地写入 `LC_LOAD_DYLIB`，禁止移动后续任何 Section 偏移。
-  2. 改写 App Group（如 `group.zunbengege.top`）必须使用等长或更短字符串原地覆盖并以 `\0` 补齐，严禁超出原槽位长度。
+**5. 标点长按弹层**
+九键「，。？！」长按 0.32 秒弹出一排符号，滑到目标松开即上屏。符号表与显示个数（1–10）可在主 App 里改，配色跟随键盘皮肤。
+
+**6. 诊断日志（默认关）**
+关闭时不建任何视图、不拼字符串。开关在「设置 → Gboard → 诊断日志」，跨进程半秒内生效。
+
+**7. 地图分页**
+完全还原原生，不做任何跳转。键盘扩展无权打开定位设置页，此前尝试过的方案在真机上无效，已整体删除。
+
+---
+
+## 📐 开发红线
+
+1. **不改根视图约束与键盘高度**——会导致候选词被挤出屏幕或出现空隙。
+2. **不拦截按键触摸事件**——滑行输入对触摸连贯性极敏感，只能在目标软键上挂独立子视图。
+3. **词库硬指标**——不超过 7 万条、2.5 MB，转换时省略冗余字段，避免 Jetsam 杀进程。
+4. **Windows 打包必须保留 Unix 权限**——可执行文件 0o755，数据文件 0o644，否则自签报错或启动被杀。
+5. **无损注入**——只在 Load Commands 后的全零填充区写 `LC_LOAD_DYLIB`，App Group 等长改写。
 
 ---
 
@@ -135,116 +52,55 @@
 
 ```
 gboard-ntr/
-├── dylib/
-│   ├── gkx.m                      # 核心注入源码：词库部署、按键管理、工具栏、常用语与标点设置入口
-│   ├── native_key_style.h         # 原生按键字体与文字色采样
-│   ├── punct_diag.h               # 标点诊断 HUD（默认关，主 App 设置里开）
-│   ├── punct_popup.h              # 标点长按弹层：符号表、配色与布局
-│   ├── symbol_doubletap.h         # 符号页双击/停留判定
-│   ├── toolbar_layout.h           # 工具栏几何：G 图标锚点、条带高度与对齐
-│   └── toolbar_visibility.h       # 工具栏显隐与遮挡登记（含自家视图豁免）
-├── .github/workflows/
-│   └── build-dylib.yml            # CI 编译流：macOS-15 runner，原生 clang arm64 + ldid 伪签名
+├── dylib/                     # 注入源码（gkx.m 与若干头文件）
 ├── tools/
-│   ├── inject.py                  # 纯 Python Mach-O 注入、App Group 原地改写与 Unix 权限打包
-│   ├── dict_converter.py          # 词库转换器：清洗万象 YAML/文本，精选 6 万词生成紧凑 Protobuf
-│   ├── inspect_signed.py          # 只读元数据自检工具：校验 Mach-O、依赖链与权限
-│   ├── swap_dylib.py              # 在已注入成品里替换 Frameworks/libgkx.dylib（CI 用）
-│   └── publish_release.py         # 发布到 GitHub Release：覆盖资产、刷新 published_at 与正文哈希
-├── tests/                         # 源码契约测试（python -m unittest discover -s tests）
-├── dist/                          # 构建产物与词库生成目录
-│   ├── user_dictionary.db         # 转换生成的紧凑万象词库 (1.61 MB)
-│   ├── libgkx.dylib               # CI 编译产物
-│   └── gboard-ntr-1.0-unsigned.ipa    # 最终交付的未签名 IPA
-├── README.md                      # 本文档与开发规范
-└── agent.md                       # 逆向工程细节与避坑历史记录
+│   ├── inject.py              # Mach-O 注入 + App Group 改写 + 权限打包
+│   ├── dict_converter.py      # 万象词库 → 紧凑 Protobuf
+│   ├── inspect_signed.py      # 只读自检：Mach-O、依赖链、权限
+│   ├── swap_dylib.py          # 在成品 IPA 里替换 libgkx.dylib（CI 用）
+│   └── publish_release.py     # 发 GitHub Release
+├── tests/                     # 源码契约测试
+├── .github/workflows/         # CI：编译 dylib → 换包 → 发布
+├── dist/                      # 构建产物
+├── README.md
+└── agent.md                   # 逆向细节与踩坑记录
 ```
 
 ---
 
-## 🛠️ 构建与出包流程
+## 🛠️ 构建与发布
 
-### 1. 词库构建（如有新词库源）
+**CI 全自动（常规路径）**：push 改动 `dylib/` 即可。CI 编译出新的 `libgkx.dylib`，下载 Release 上那份成品 IPA，替换其中的 dylib 后覆盖上传并刷新正文哈希。
 
-```powershell
-python tools/dict_converter.py `
-  --dir "%APPDATA%\Rime\dicts" `
-  -o "dist/user_dictionary.db" `
-  --max 60000
-```
-
-### 2. 云端编译 `libgkx.dylib` (GitHub Actions)
-
-修改 `dylib/gkx.m` 后，提交并推送到 GitHub：
-```powershell
-git add dylib/gkx.m
-git commit -m "feat/fix: ..."
-git push origin main
-```
-CI 将在 macOS-15 runner 上自动执行 arm64 clang 编译并使用 ldid 伪签名。构建成功后下载产物并放置到 `dist/libgkx.dylib`：
-```powershell
-gh run download <RUN_ID> -n libgkx -D dist/artifact
-Copy-Item dist/artifact/libgkx.dylib dist/libgkx.dylib -Force
-```
-
-### 3. 本地无损注入与打包
-
-原始包默认放在仓库旁的 `ipa/` 目录（`D:\GitHub_Clone\ipa\Gboard_2.3.19.ipa`），路径不同时改 `--ipa` 即可。
+**本地手工出包**（改了词库或注入逻辑时）：
 
 ```powershell
-python tools/inject.py `
-  --ipa "../ipa/Gboard_2.3.19.ipa" `
-  --dylib "dist/libgkx.dylib" `
-  --dict "dist/user_dictionary.db" `
-  --app-group "group.zunbengege.top" `
+# 1. 转换词库（可选）
+python tools/dict_converter.py --dir "%APPDATA%\Rime\dicts" -o "dist/user_dictionary.db" --max 60000
+
+# 2. 注入打包
+python tools/inject.py --ipa "../ipa/Gboard_2.3.19.ipa" --dylib "dist/libgkx.dylib" `
+  --dict "dist/user_dictionary.db" --app-group "group.zunbengege.top" `
   --out "dist/gboard-ntr-1.0-unsigned.ipa"
+
+# 3. 发布
+python tools/publish_release.py --asset dist/gboard-ntr-1.0-unsigned.ipa --refresh-sha
 ```
 
-`--app-group` 是必填参数，漏掉脚本直接退出（exit 2）。真机上漏掉这一步的包会表现为：打开 Gboard 应用闪退、键盘锁在 26 键切不到九键。
+`--app-group` 必填，漏掉会闪退且键盘锁在 26 键。换用你自己的描述文件时，`dylib/gkx.m` 顶部的 `GXKGroup`、`inject.py` 默认值与 `--app-group` 三处必须一致。
 
-> `group.zunbengege.top` 只是本机自签描述文件授权的**示例** App Group。换用你自己的描述文件时必须同步改三处：`dylib/gkx.m` 顶部的 `GXKGroup`、`tools/inject.py` 里的默认 group、以及打包命令的 `--app-group`。三处不一致同样表现为启动闪退或切不到九键。
-
-注入脚本将自动执行：
-1. 解包原 IPA 并解析 Unix 文件权限与时间戳；
-2. 在 `Gboard.appex/Gboard` 的 Mach-O Padding 区写入 `LC_LOAD_DYLIB @rpath/libgkx.dylib`；
-3. 将 `libgkx.dylib` 部署至主 App 的 `Payload/Gboard.app/Frameworks/`（因扩展 `@rpath` 指向主 App）；
-4. 原地改写二进制中 8 处 Google 官方 App Group 为自签描述文件支持的 `group.zunbengege.top`；
-5. 重打包并赋予可执行文件 `0o755` 权限。
-
-### 4. 发布到 GitHub Release（出包后必做，漏了等于没发）
-
-本项目只保留**一条** release（tag `v1.0`），资产名固定为 `gboard-ntr-1.0-unsigned.ipa`，下载地址因此固定：
-
+固定下载地址：
 ```
 https://github.com/IamNewHands/gboard-ntr/releases/latest/download/gboard-ntr-1.0-unsigned.ipa
 ```
 
-**这一步现在由 CI 自动完成**：只要 push 动了 `dylib/`，`build-dylib` 编出新的 `libgkx.dylib` 后会接着跑 `publish` job——把 Release 上那份成品 IPA 下载下来，用 `tools/swap_dylib.py` 换掉 `Frameworks/libgkx.dylib`，再调 `tools/publish_release.py` 覆盖上传并刷新正文哈希。仓库里不含 Google 二进制，所以 CI 不从原始包重新注入；它换的是已经注入好的成品。
-
-本地手工发版（CI 不可用、或改了词库/注入逻辑需要整包重打时）：
-
-```powershell
-python tools/publish_release.py --asset dist/gboard-ntr-1.0-unsigned.ipa --repo IamNewHands/gboard-ntr --refresh-sha
-```
-
-脚本做四件事：`gh release upload --clobber` 覆盖资产（带重试，因为 `--clobber` 是先删后传）→ 置草稿再发布（把 `published_at` 刷新成这次出包时间，否则页面一直显示 tag 首次发布那天）→ 读回校验资产大小 → 打印固定下载地址与远端 SHA-256。加 `--refresh-sha` 会把正文里的体积与 SHA-256 改成本次产物。
-
-**验收口径**：`gh release view v1.0 --json publishedAt,assets` 的 `publishedAt` 是刚才的时间，资产 size 与 `dist/` 里的一致，正文里的 SHA-256 是本包哈希。三者任一不符就是没发成。
-
-> 历史坑：本地 `dist/` 已经重新打包、CI 也出了新 dylib，但 Release 页面上还是上一版（资产 SHA 对不上），原因是发布流程里只有「打包」没有「发 Release」这一步。`tools/publish_release.py` 就是补这一步的。
-
 ---
 
-## 📱 签名安装与真机验证
+## 📱 安装
 
-1. **自签工具安装**：使用 **LCSign**（或 SideInstaller、SideStore、TrollStore）导入 `dist/gboard-ntr-1.0-unsigned.ipa` 进行自签并安装至 iOS 设备。
-2. **完全访问权限**：安装后进入系统 **「设置」→「通用」→「键盘」→「键盘」→「Gboard」**，打开 **「允许完全访问」**（词库与配置读取依赖 App Group 容器）。
-3. **扩展缓存刷新（关键技巧）**：
-   * iOS 拥有强力的键盘扩展常驻缓存机制，覆盖安装后若未生效，建议先在设置中删除 Gboard 键盘，重新添加并重新赋予完全访问权限；或重启宿主 App（如微信、备忘录）。
-4. **功能验收点**：
-   * **词库测试**：拼音输入 `aerjinshan`（阿尔金山）、`wanxiang`（万象），候选栏前列能准确出现万象专有词。
-   * **九键重输/收起/换行**：切换到九键，空闲时回车键上方为「换行」，点击插入换行符；输入拼音（如 `22`）时按键即刻切换为「重输」，点击立即清空拼音；只出候选不组字时按键为「收起」，点击直接收起键盘。
-   * **滑行输入**：在九键或全键盘上单手滑行划线，轨迹流畅自然，无任何断触卡顿。
+1. 用 **LCSign** / SideStore / TrollStore 等工具自签安装。
+2. 到「设置 → 通用 → 键盘 → 键盘 → Gboard」打开**允许完全访问**（词库与配置依赖 App Group）。
+3. 覆盖安装后若未生效，删除键盘重新添加，或重启宿主 App。
 
 ---
 
