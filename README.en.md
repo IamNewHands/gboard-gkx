@@ -120,9 +120,12 @@ Copy-Item dist/artifact/libgkx.dylib dist/libgkx.dylib -Force
 ```
 
 ### 3. Inject and repack locally
+
+The original IPA is expected at `../ipa/Gboard_2.3.19.ipa` next to the repo; adjust `--ipa` if yours lives elsewhere.
+
 ```powershell
 python tools/inject.py `
-  --ipa "Gboard_2.3.19.ipa" `
+  --ipa "../ipa/Gboard_2.3.19.ipa" `
   --dylib "dist/libgkx.dylib" `
   --dict "dist/user_dictionary.db" `
   --app-group "group.zunbengege.top" `

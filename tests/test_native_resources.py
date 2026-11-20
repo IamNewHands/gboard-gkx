@@ -12,7 +12,16 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IPA = Path(os.environ.get("GXK_TEST_IPA", str(ROOT.parent / "Gboard_2.3.19.ipa")))
+
+
+def _default_ipa():
+    for candidate in (ROOT.parent / "ipa" / "Gboard_2.3.19.ipa", ROOT.parent / "Gboard_2.3.19.ipa"):
+        if candidate.is_file():
+            return candidate
+    return ROOT.parent / "ipa" / "Gboard_2.3.19.ipa"
+
+
+IPA = Path(os.environ.get("GXK_TEST_IPA", str(_default_ipa())))
 BUNDLE = "Payload/Gboard.app/PlugIns/Gboard.appex/GKBKeyboardResources.bundle/"
 EMOJI = "key_pos_9keys_emoji"
 RETURN = "key_pos_9keys_return"

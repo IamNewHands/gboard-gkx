@@ -172,9 +172,11 @@ Copy-Item dist/artifact/libgkx.dylib dist/libgkx.dylib -Force
 
 ### 3. 本地无损注入与打包
 
+原始包默认放在仓库旁的 `ipa/` 目录（`D:\GitHub_Clone\ipa\Gboard_2.3.19.ipa`），路径不同时改 `--ipa` 即可。
+
 ```powershell
 python tools/inject.py `
-  --ipa "Gboard_2.3.19.ipa" `
+  --ipa "../ipa/Gboard_2.3.19.ipa" `
   --dylib "dist/libgkx.dylib" `
   --dict "dist/user_dictionary.db" `
   --app-group "group.zunbengege.top" `

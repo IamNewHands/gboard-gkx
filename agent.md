@@ -146,7 +146,7 @@ Copy-Item dist/artifact/libgkx.dylib dist/libgkx.dylib -Force
 
 # 4. 一键注入打包未签名 IPA（--app-group 必填，漏掉脚本直接退出；--dict 漏掉词库不生效）
 python tools/inject.py `
-  --ipa "Gboard_2.3.19.ipa" `
+  --ipa "../ipa/Gboard_2.3.19.ipa" `
   --dylib "dist/libgkx.dylib" `
   --dict "dist/user_dictionary.db" `
   --app-group "group.zunbengege.top" `
