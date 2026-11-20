@@ -7,8 +7,9 @@ dist/
 # 解包中间产物
 _work/
 Payload/
-# 官方 IPA 解包工作区（含 79MB Google 官方二进制，不随仓库分发）
-gkxwork/
+
+# 临时工作区（工作区规范见 ../AGENTS.md，任务结束整体删除）
+_scratch/
 
 # 系统
 .DS_Store
